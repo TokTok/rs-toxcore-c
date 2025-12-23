@@ -1,0 +1,7 @@
+#include "tox/tox.h"
+#include "tox/toxav.h"
+#include "tox/toxencryptsave.h"
+#include "tox/tox_log_level.h"
+#include "tox/tox_events.h"
+#include "tox/tox_options.h"
+#include "tox/tox_private.h"

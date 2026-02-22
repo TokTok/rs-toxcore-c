@@ -1,12 +1,13 @@
 use crate::dag::{
-    ConversationId, DelegationCertificate, Ed25519Signature, LogicalIdentityPk, Permissions,
-    PhysicalDevicePk,
+    ConversationId, DelegationCertificate, Ed25519Signature, LogicalIdentityPk, NodeHash,
+    Permissions, PhysicalDevicePk,
 };
 use ed25519_dalek::{Signature as DalekSignature, Signer, SigningKey, Verifier, VerifyingKey};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tox_proto::ToxProto;
-use tox_proto::constants::MAX_AUTH_DEPTH;
+use tox_proto::constants::{MAX_AUTH_DEPTH, MAX_DEVICES_PER_IDENTITY};
+use tracing::{debug, trace, warn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
@@ -20,6 +21,8 @@ pub enum IdentityError {
     ChainTooDeep,
     #[error("Permission escalation: device requested permissions it does not possess")]
     PermissionEscalation,
+    #[error("Too many devices for this identity (max {0})")]
+    TooManyDevices(usize),
 }
 
 #[derive(ToxProto)]
@@ -29,7 +32,7 @@ pub struct DelegationSignData {
     pub expires_at: i64,
 }
 
-/// Signs a delegation certificate using a signing key.
+/// Signs delegation certificate.
 pub fn sign_delegation(
     signing_key: &SigningKey,
     device_pk: PhysicalDevicePk,
@@ -52,14 +55,14 @@ pub fn sign_delegation(
     }
 }
 
-/// Verifies a delegation certificate against an issuer's public key.
+/// Verifies delegation certificate against issuer's public key.
 pub fn verify_delegation<P: AsRef<[u8; 32]>>(
     cert: &DelegationCertificate,
     issuer_pk: P,
     now_ms: i64,
 ) -> Result<(), IdentityError> {
     if cert.expires_at < now_ms {
-        tracing::debug!("Cert expired: {} < {}", cert.expires_at, now_ms);
+        debug!("Cert expired: {} < {}", cert.expires_at, now_ms);
         return Err(IdentityError::Expired(cert.expires_at, now_ms));
     }
 
@@ -92,23 +95,60 @@ pub fn verify_delegation<P: AsRef<[u8; 32]>>(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthRecord {
     pub logical_pk: LogicalIdentityPk,
-    pub issuer_pk: PhysicalDevicePk, // Used for both master and devices in this context
+    pub issuer_pk: PhysicalDevicePk, // Used for master and devices
     pub permissions: Permissions,
     pub expires_at: i64,
     pub auth_rank: u64,
+    pub auth_hash: NodeHash,
 }
 
-/// A cache of verified trust paths from Physical Device PKs to Logical Identities.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevocationRecord {
+    pub rank: u64,
+    pub revoker_seniority: (u64, NodeHash),
+    pub revocation_hash: NodeHash,
+}
+
+pub struct CausalContext {
+    pub evaluating_node_hash: NodeHash,
+    pub admin_ancestor_hashes: HashSet<NodeHash>,
+}
+
+impl CausalContext {
+    /// Returns global causal context. Bypasses specific node-ancestry checks
+    /// and should only be used for proactive self-checks (e.g., UI, background tasks)
+    /// to determine active permissions across all DAG heads.
+    pub fn global() -> Self {
+        let mut admin_ancestor_hashes = HashSet::new();
+        admin_ancestor_hashes.insert(NodeHash::from([0u8; 32]));
+        Self {
+            evaluating_node_hash: NodeHash::from([0u8; 32]),
+            admin_ancestor_hashes,
+        }
+    }
+}
+
+/// Cache of verified trust paths from Physical Device PKs to Logical Identities.
 pub struct IdentityManager {
-    /// Mapping of (ConversationID, Device PK) -> List of Authorization Records
+    /// Mapping of (ConversationID, Device PK) to List of Authorization Records
     authorized_devices: HashMap<(ConversationId, PhysicalDevicePk), Vec<AuthRecord>>,
-    /// Mapping of (ConversationID, Logical PK) -> (Role, JoinedAt)
+    /// Mapping of (ConversationID, Logical PK) to (Role, JoinedAt)
     logical_members: HashMap<(ConversationId, LogicalIdentityPk), (u8, i64)>,
-    /// Mapping of (ConversationID, Revoked Device PK) -> RevocationRank
-    revoked_devices: HashMap<(ConversationId, PhysicalDevicePk), u64>,
+    /// Mapping of (ConversationID, Revoked Device PK) to List of Revocation Records
+    revoked_devices: HashMap<(ConversationId, PhysicalDevicePk), Vec<RevocationRecord>>,
     /// Cache of verified paths to avoid redundant recursive checks.
-    /// (ConversationID, Device PK, Logical PK, Rank) -> min_expires_at
-    path_cache: Mutex<HashMap<(ConversationId, PhysicalDevicePk, LogicalIdentityPk, u64), i64>>,
+    /// (ConversationID, Device PK, Logical PK, EvaluatingNodeHash) -> min_expires_at
+    path_cache: Mutex<
+        lru::LruCache<
+            (
+                ConversationId,
+                PhysicalDevicePk,
+                LogicalIdentityPk,
+                NodeHash,
+            ),
+            i64,
+        >,
+    >,
 }
 
 impl Default for IdentityManager {
@@ -123,11 +163,53 @@ impl IdentityManager {
             authorized_devices: HashMap::new(),
             logical_members: HashMap::new(),
             revoked_devices: HashMap::new(),
-            path_cache: Mutex::new(HashMap::new()),
+            path_cache: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(1000).unwrap(),
+            )),
         }
     }
 
-    /// Records a new logical member.
+    /// Returns true when devices MUTUALLY revoked each other (MAD scenario).
+    /// The `(rank, auth_hash)` tuple tiebreaker selects survivor;
+    /// one-sided revocations use simpler rank-only check.
+    fn is_mutual_revocation(
+        &self,
+        conversation_id: ConversationId,
+        revoker_auth_hash: NodeHash,
+        target_auth_hash: NodeHash,
+    ) -> bool {
+        // Zero-hash means master-key or bootstrap revocation, not subject to MAD.
+        if revoker_auth_hash == NodeHash::from([0u8; 32])
+            || target_auth_hash == NodeHash::from([0u8; 32])
+        {
+            return false;
+        }
+        // Find device_pk owning revoker_auth_hash.
+        let revoker_pk = self
+            .authorized_devices
+            .iter()
+            .find_map(|((cid, pk), records)| {
+                if *cid == conversation_id
+                    && records.iter().any(|r| r.auth_hash == revoker_auth_hash)
+                {
+                    Some(*pk)
+                } else {
+                    None
+                }
+            });
+        // Check whether device was revoked by target
+        // (i.e., target's auth_hash appears as revoker in those records).
+        revoker_pk.is_some_and(|rk| {
+            self.revoked_devices
+                .get(&(conversation_id, rk))
+                .is_some_and(|revs| {
+                    revs.iter()
+                        .any(|r| r.revoker_seniority.1 == target_auth_hash)
+                })
+        })
+    }
+
+    /// Records logical member.
     pub fn add_member(
         &mut self,
         conversation_id: ConversationId,
@@ -139,15 +221,20 @@ impl IdentityManager {
             .insert((conversation_id, logical_pk), (role, joined_at));
     }
 
-    /// Removes a logical member at a specific rank.
+    /// Removes logical member at specific rank.
+    #[allow(clippy::too_many_arguments)]
     pub fn remove_member(
         &mut self,
         conversation_id: ConversationId,
+        revoker_pk: PhysicalDevicePk,
+        revoker_logical_pk: LogicalIdentityPk,
         logical_pk: LogicalIdentityPk,
         rank: u64,
+        now_ms: i64,
+        revocation_hash: NodeHash,
     ) {
         self.logical_members.remove(&(conversation_id, logical_pk));
-        // Also revoke all their devices
+        // Also revoke their devices
         let devices_to_remove: Vec<_> = self
             .authorized_devices
             .iter()
@@ -157,11 +244,19 @@ impl IdentityManager {
             .map(|((_, d), _)| *d)
             .collect();
         for d in devices_to_remove {
-            self.revoke_device(conversation_id, d, rank);
+            self.revoke_device(
+                conversation_id,
+                revoker_pk,
+                revoker_logical_pk,
+                d,
+                rank,
+                now_ms,
+                revocation_hash,
+            );
         }
     }
 
-    /// Returns a list of all logical members for a conversation, sorted by PK for determinism.
+    /// Returns list of logical members for conversation, sorted by PK for determinism.
     pub fn list_members(
         &self,
         conversation_id: ConversationId,
@@ -174,6 +269,19 @@ impl IdentityManager {
             .collect();
         members.sort_by_key(|m| m.0);
         members
+    }
+
+    /// Returns founder's LogicalIdentityPk for conversation.
+    pub fn get_founder(&self, conversation_id: &ConversationId) -> Option<LogicalIdentityPk> {
+        self.logical_members
+            .iter()
+            .find_map(|(&(cid, pk), &(role, _))| {
+                if cid == *conversation_id && role == 0 {
+                    Some(pk)
+                } else {
+                    None
+                }
+            })
     }
 
     fn get_auth_depth(
@@ -223,39 +331,74 @@ impl IdentityManager {
         None
     }
 
-    /// Revokes a device at a specific rank.
+    /// Revokes device at specific rank.
+    #[allow(clippy::too_many_arguments)]
     pub fn revoke_device(
         &mut self,
         conversation_id: ConversationId,
-        device_pk: PhysicalDevicePk,
+        revoker_pk: PhysicalDevicePk,
+        revoker_logical_pk: LogicalIdentityPk,
+        target_device_pk: PhysicalDevicePk,
         rank: u64,
+        now_ms: i64,
+        revocation_hash: NodeHash,
     ) {
-        // Only update if the new revocation is at an earlier or same rank (though unlikely)
+        let mut revoker_seniority = (u64::MAX, NodeHash::from([0xFF; 32]));
+
+        if revoker_pk == revoker_logical_pk.to_physical() {
+            revoker_seniority = (0, NodeHash::from([0u8; 32]));
+        } else if let Some(records) = self.authorized_devices.get(&(conversation_id, revoker_pk)) {
+            // Find oldest explicitly granted ADMIN record
+            for record in records {
+                if record.logical_pk == revoker_logical_pk
+                    && record.expires_at > now_ms
+                    && record.auth_rank <= rank
+                    && record.permissions.contains(Permissions::ADMIN)
+                {
+                    let seniority = (record.auth_rank, record.auth_hash);
+                    if seniority < revoker_seniority {
+                        revoker_seniority = seniority;
+                    }
+                }
+            }
+        }
+
+        let new_rec = RevocationRecord {
+            rank,
+            revoker_seniority,
+            revocation_hash,
+        };
         self.revoked_devices
-            .entry((conversation_id, device_pk))
-            .and_modify(|r| *r = (*r).min(rank))
-            .or_insert(rank);
-        self.path_cache.lock().clear(); // Clear cache on any revocation
+            .entry((conversation_id, target_device_pk))
+            .and_modify(|list| {
+                list.push(new_rec.clone());
+            })
+            .or_insert_with(|| vec![new_rec]);
+
+        self.path_cache.lock().clear(); // Clear cache on revocation
     }
 
-    /// Authorizes a device using a delegation certificate at a specific rank.
-    /// The issuer of the certificate must be either the Logical Identity (Master Seed)
-    /// or another already authorized device with ADMIN permissions.
+    /// Authorizes device using delegation certificate at specific rank.
+    /// Certificate issuer must be Logical Identity (Master Seed)
+    /// or another authorized device with ADMIN permissions.
+    #[allow(clippy::too_many_arguments)]
     pub fn authorize_device(
         &mut self,
+        ctx: &CausalContext,
         conversation_id: ConversationId,
         logical_pk: LogicalIdentityPk,
         cert: &DelegationCertificate,
         now_ms: i64,
         rank: u64,
+        auth_hash: NodeHash,
     ) -> Result<(), IdentityError> {
-        self.path_cache.lock().clear(); // Clear cache on any new authorization
+        self.path_cache.lock().clear(); // Clear cache on authorization
 
-        // 1. If the issuer is the logical_pk itself (Master Seed), it's a Level 1 delegation.
+        // 1. Level 1 delegation if issuer is logical_pk (Master Seed).
         if let Err(e) = verify_delegation(cert, logical_pk, now_ms) {
-            tracing::debug!("Level 1 auth failed for {:?}: {:?}", cert.device_pk, e);
+            debug!("Level 1 auth failed for {:?}: {:?}", cert.device_pk, e);
         } else {
-            tracing::debug!("Level 1 auth success for {:?}", cert.device_pk);
+            debug!("Level 1 auth success for {:?}", cert.device_pk);
             let records = self
                 .authorized_devices
                 .entry((conversation_id, cert.device_pk))
@@ -267,6 +410,7 @@ impl IdentityManager {
                 permissions: cert.permissions,
                 expires_at: cert.expires_at,
                 auth_rank: rank,
+                auth_hash,
             };
 
             if !records.contains(&record) {
@@ -275,7 +419,7 @@ impl IdentityManager {
             return Ok(());
         }
 
-        // 2. Otherwise, check if the issuer is an existing authorized ADMIN device.
+        // 2. Check if issuer is existing authorized ADMIN device.
         let mut issuer_pk = None;
         let mut issuer_perms = Permissions::NONE;
         tracing::debug!(
@@ -285,23 +429,23 @@ impl IdentityManager {
             self.authorized_devices.len()
         );
 
-        // We need to find the issuer and check their effective permissions.
+        // Find issuer and check effective permissions.
         for ((cid, dev_pk), records) in &self.authorized_devices {
             if cid != &conversation_id {
                 continue;
             }
 
             for record in records {
-                // The issuer must have been authorized for the correct logical identity
-                // at a rank <= the current authorization node's rank.
+                // Issuer must be authorized for correct logical identity
+                // at rank <= current authorization node's rank.
                 if record.logical_pk == logical_pk
                     && record.expires_at > now_ms
                     && record.auth_rank <= rank
                 {
-                    // Preliminary check for ADMIN permission in the certificate record itself
-                    // (Optimization: don't do full recursive lookup if the cert doesn't even claim ADMIN)
+                    // Preliminary check for ADMIN permission in certificate record
+                    // (Optimization: skip full recursive lookup if cert doesn't claim ADMIN)
                     if !record.permissions.contains(Permissions::ADMIN) {
-                        tracing::trace!("Candidate issuer {:?} lacks ADMIN in cert", dev_pk);
+                        trace!("Candidate issuer {:?} lacks ADMIN in cert", dev_pk);
                         continue;
                     }
 
@@ -310,8 +454,9 @@ impl IdentityManager {
                             "Candidate issuer {:?} signed the certificate, checking effective perms",
                             dev_pk
                         );
-                        // Check effective permissions of the issuer
+                        // Check effective permissions of issuer
                         if let Some(effective) = self.get_permissions_recursive(
+                            ctx,
                             conversation_id,
                             dev_pk,
                             &logical_pk,
@@ -320,19 +465,18 @@ impl IdentityManager {
                             0,
                         ) {
                             if effective.contains(Permissions::ADMIN) {
-                                tracing::debug!("Level 2+ auth success via issuer {:?}", dev_pk);
+                                debug!("Level 2+ auth success via issuer {:?}", dev_pk);
                                 issuer_pk = Some(*dev_pk);
                                 issuer_perms = effective;
                                 break;
                             } else {
-                                tracing::trace!(
+                                trace!(
                                     "Candidate issuer {:?} has NO effective ADMIN: {:?}",
-                                    dev_pk,
-                                    effective
+                                    dev_pk, effective
                                 );
                             }
                         } else {
-                            tracing::trace!(
+                            trace!(
                                 "Candidate issuer {:?} has no valid trust path at this rank",
                                 dev_pk
                             );
@@ -347,14 +491,11 @@ impl IdentityManager {
 
         if let Some(issuer) = issuer_pk {
             // Permission Escalation Protection:
-            // A device cannot delegate permissions it does not possess.
+            // Device cannot delegate permissions it lacks.
             if !issuer_perms.contains(cert.permissions) {
-                tracing::warn!(
+                warn!(
                     "Device {:?} authorization REJECTED: escalation detected. Issuer {:?} has {:?}, tried to delegate {:?}",
-                    cert.device_pk,
-                    issuer,
-                    issuer_perms,
-                    cert.permissions
+                    cert.device_pk, issuer, issuer_perms, cert.permissions
                 );
                 return Err(IdentityError::PermissionEscalation);
             }
@@ -365,6 +506,20 @@ impl IdentityManager {
                 .unwrap_or(0);
             if depth + 1 > MAX_AUTH_DEPTH {
                 return Err(IdentityError::ChainTooDeep);
+            }
+
+            // Device Count Protection:
+            // Count distinct devices authorized for this
+            // logical identity in conversation.
+            let device_count = self
+                .authorized_devices
+                .iter()
+                .filter(|((cid, _), records)| {
+                    *cid == conversation_id && records.iter().any(|r| r.logical_pk == logical_pk)
+                })
+                .count();
+            if device_count >= MAX_DEVICES_PER_IDENTITY {
+                return Err(IdentityError::TooManyDevices(MAX_DEVICES_PER_IDENTITY));
             }
 
             let records = self
@@ -378,6 +533,7 @@ impl IdentityManager {
                 permissions: cert.permissions,
                 expires_at: cert.expires_at,
                 auth_rank: rank,
+                auth_hash,
             };
 
             if !records.contains(&record) {
@@ -389,7 +545,7 @@ impl IdentityManager {
         }
     }
 
-    /// Returns true if we have an authorization record for this device, regardless of whether it is currently valid.
+    /// Returns true if authorization record exists for device, regardless of validity.
     pub fn has_authorization_record(
         &self,
         conversation_id: ConversationId,
@@ -401,6 +557,7 @@ impl IdentityManager {
 
     pub fn is_authorized(
         &self,
+        ctx: &CausalContext,
         conversation_id: ConversationId,
         device_pk: &PhysicalDevicePk,
         logical_pk: &LogicalIdentityPk,
@@ -411,29 +568,45 @@ impl IdentityManager {
             return true;
         }
 
-        if let Some(&expires_at) =
-            self.path_cache
-                .lock()
-                .get(&(conversation_id, *device_pk, *logical_pk, rank))
-            && expires_at > now_ms
+        if let Some(&expires_at) = self.path_cache.lock().get(&(
+            conversation_id,
+            *device_pk,
+            *logical_pk,
+            ctx.evaluating_node_hash,
+        )) && expires_at > now_ms
         {
             return true;
         }
 
-        let res =
-            self.is_authorized_recursive(conversation_id, device_pk, logical_pk, now_ms, rank, 0);
+        let res = self.is_authorized_recursive(
+            ctx,
+            conversation_id,
+            device_pk,
+            logical_pk,
+            now_ms,
+            rank,
+            0,
+        );
         if let Some(expires_at) = res {
-            self.path_cache
-                .lock()
-                .insert((conversation_id, *device_pk, *logical_pk, rank), expires_at);
+            self.path_cache.lock().push(
+                (
+                    conversation_id,
+                    *device_pk,
+                    *logical_pk,
+                    ctx.evaluating_node_hash,
+                ),
+                expires_at,
+            );
             true
         } else {
             false
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn is_authorized_recursive(
         &self,
+        ctx: &CausalContext,
         conversation_id: ConversationId,
         device_pk: &PhysicalDevicePk,
         logical_pk: &LogicalIdentityPk,
@@ -454,16 +627,7 @@ impl IdentityManager {
             return Some(i64::MAX);
         }
 
-        if let Some(revocation_rank) = self.revoked_devices.get(&(conversation_id, *device_pk))
-            && *revocation_rank <= rank
-        {
-            tracing::trace!(
-                "Device {:?} is revoked at rank {}",
-                device_pk,
-                revocation_rank
-            );
-            return None;
-        }
+        let revocations = self.revoked_devices.get(&(conversation_id, *device_pk));
 
         if let Some(records) = self.authorized_devices.get(&(conversation_id, *device_pk)) {
             let mut max_expires = None;
@@ -476,16 +640,47 @@ impl IdentityManager {
                     continue;
                 }
 
-                // Check if the issuer itself was revoked BEFORE or AT this rank.
-                if let Some(issuer_rev_rank) = self
-                    .revoked_devices
-                    .get(&(conversation_id, record.issuer_pk))
-                    && *issuer_rev_rank <= rank
+                if ctx.evaluating_node_hash != NodeHash::from([0u8; 32])
+                    && record.auth_hash != NodeHash::from([0u8; 32])
+                    && !ctx.admin_ancestor_hashes.contains(&record.auth_hash)
                 {
                     continue;
                 }
 
-                // If it's a Level 1 device (issued by Master), we have a valid path.
+                let my_seniority = (record.auth_rank, record.auth_hash);
+                let mut is_revoked = false;
+                if let Some(revs) = revocations {
+                    for rev in revs {
+                        let in_history = rev.revocation_hash == NodeHash::from([0u8; 32])
+                            || ctx.evaluating_node_hash == NodeHash::from([0u8; 32])
+                            || ctx.admin_ancestor_hashes.contains(&rev.revocation_hash);
+                        if in_history && rev.rank <= rank {
+                            // For mutual (MAD) revocations use full (rank, hash) tuple so
+                            // senior admin survives. One-sided revocations use
+                            // simpler rank-only check so any admin can revoke at equal
+                            // or lower seniority.
+                            let is_mad = self.is_mutual_revocation(
+                                conversation_id,
+                                rev.revoker_seniority.1,
+                                record.auth_hash,
+                            );
+                            let can_revoke = if is_mad {
+                                rev.revoker_seniority <= my_seniority
+                            } else {
+                                rev.revoker_seniority.0 <= my_seniority.0
+                            };
+                            if can_revoke {
+                                is_revoked = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if is_revoked {
+                    continue;
+                }
+
+                // Level 1 device (issued by Master) provides valid path.
                 if record.issuer_pk == logical_pk.to_physical() {
                     max_expires = Some(
                         max_expires
@@ -494,8 +689,9 @@ impl IdentityManager {
                     continue;
                 }
 
-                // Otherwise, recursively check if the issuer is still authorized.
+                // Recursively check if issuer remains authorized.
                 if let Some(issuer_expires) = self.is_authorized_recursive(
+                    ctx,
                     conversation_id,
                     &record.issuer_pk,
                     logical_pk,
@@ -515,14 +711,22 @@ impl IdentityManager {
 
     pub fn get_permissions(
         &self,
+        ctx: &CausalContext,
         conversation_id: ConversationId,
         device_pk: &PhysicalDevicePk,
         logical_pk: &LogicalIdentityPk,
         now_ms: i64,
         rank: u64,
     ) -> Option<Permissions> {
-        let perms =
-            self.get_permissions_recursive(conversation_id, device_pk, logical_pk, now_ms, rank, 0);
+        let perms = self.get_permissions_recursive(
+            ctx,
+            conversation_id,
+            device_pk,
+            logical_pk,
+            now_ms,
+            rank,
+            0,
+        );
         tracing::trace!(
             "Permissions for {:?} in {:?}: {:?}",
             device_pk,
@@ -532,8 +736,10 @@ impl IdentityManager {
         perms
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn get_permissions_recursive(
         &self,
+        ctx: &CausalContext,
         conversation_id: ConversationId,
         device_pk: &PhysicalDevicePk,
         logical_pk: &LogicalIdentityPk,
@@ -549,11 +755,7 @@ impl IdentityManager {
             return Some(Permissions::ALL);
         }
 
-        if let Some(revocation_rank) = self.revoked_devices.get(&(conversation_id, *device_pk))
-            && *revocation_rank <= rank
-        {
-            return None;
-        }
+        let revocations = self.revoked_devices.get(&(conversation_id, *device_pk));
 
         if let Some(records) = self.authorized_devices.get(&(conversation_id, *device_pk)) {
             let mut effective_perms = None;
@@ -563,19 +765,58 @@ impl IdentityManager {
                     || record.expires_at <= now_ms
                     || record.auth_rank > rank
                 {
+                    trace!(
+                        "Skipping record because logical_pk mismatch or expired or rank > auth_rank. log_pk: {}, expires: {}, now_ms: {}, auth_rank: {}, rank: {}",
+                        record.logical_pk == *logical_pk,
+                        record.expires_at <= now_ms,
+                        now_ms,
+                        record.auth_rank,
+                        rank
+                    );
                     continue;
                 }
 
-                // Check if the issuer itself was revoked BEFORE or AT this rank.
-                if let Some(issuer_rev_rank) = self
-                    .revoked_devices
-                    .get(&(conversation_id, record.issuer_pk))
-                    && *issuer_rev_rank <= rank
+                if ctx.evaluating_node_hash != NodeHash::from([0u8; 32])
+                    && record.auth_hash != NodeHash::from([0u8; 32])
+                    && !ctx.admin_ancestor_hashes.contains(&record.auth_hash)
                 {
+                    trace!(
+                        "Skipping record because auth_hash not in admin_ancestor_hashes! record.auth_hash: {:?}",
+                        record.auth_hash
+                    );
                     continue;
                 }
 
-                // If it's a Level 1 device (issued by Master), its permissions are direct.
+                let my_seniority = (record.auth_rank, record.auth_hash);
+                let mut is_revoked = false;
+                if let Some(revs) = revocations {
+                    for rev in revs {
+                        let in_history = rev.revocation_hash == NodeHash::from([0u8; 32])
+                            || ctx.evaluating_node_hash == NodeHash::from([0u8; 32])
+                            || ctx.admin_ancestor_hashes.contains(&rev.revocation_hash);
+                        if in_history && rev.rank <= rank {
+                            let is_mad = self.is_mutual_revocation(
+                                conversation_id,
+                                rev.revoker_seniority.1,
+                                record.auth_hash,
+                            );
+                            let can_revoke = if is_mad {
+                                rev.revoker_seniority <= my_seniority
+                            } else {
+                                rev.revoker_seniority.0 <= my_seniority.0
+                            };
+                            if can_revoke {
+                                is_revoked = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if is_revoked {
+                    continue;
+                }
+
+                // Level 1 device (issued by Master) has direct permissions.
                 if record.issuer_pk == logical_pk.to_physical() {
                     effective_perms = Some(
                         effective_perms
@@ -584,8 +825,9 @@ impl IdentityManager {
                     continue;
                 }
 
-                // Otherwise, recursively check the issuer's permissions and intersect.
+                // Recursively check issuer's permissions and intersect.
                 if let Some(issuer_perms) = self.get_permissions_recursive(
+                    ctx,
                     conversation_id,
                     &record.issuer_pk,
                     logical_pk,
@@ -611,7 +853,7 @@ impl IdentityManager {
         None
     }
 
-    /// Returns a list of all authorized device PKs for a conversation, sorted for determinism.
+    /// Returns list of authorized device PKs for conversation, sorted for determinism.
     pub fn list_authorized_devices(
         &self,
         conversation_id: ConversationId,
@@ -626,9 +868,10 @@ impl IdentityManager {
         pks
     }
 
-    /// Returns a list of all authorized device PKs for a conversation that are NOT revoked at the given rank/time.
+    /// Returns list of authorized device PKs for conversation NOT revoked at given rank/time.
     pub fn list_active_authorized_devices(
         &mut self,
+        ctx: &CausalContext,
         conversation_id: ConversationId,
         now_ms: i64,
         rank: u64,
@@ -636,20 +879,27 @@ impl IdentityManager {
         let members = self.list_members(conversation_id);
         let mut active_devices = Vec::new();
 
-        // Get all device candidates for this conversation
-        let candidates: Vec<PhysicalDevicePk> = self
+        // Explicitly authorized device candidates from cert chains.
+        let explicit_candidates: Vec<PhysicalDevicePk> = self
             .authorized_devices
             .keys()
             .filter(|(cid, _)| cid == &conversation_id)
             .map(|(_, pk)| *pk)
             .collect();
 
-        for device_pk in candidates {
-            for (logical_pk, _, _) in &members {
-                if self.is_authorized(conversation_id, &device_pk, logical_pk, now_ms, rank) {
+        // Check if explicit device is authorized for each logical member.
+        // Otherwise include implicit device (logical_pk.to_physical())
+        // authorized via is_authorized shortcut (identity-IS-the-device).
+        for (logical_pk, _, _) in &members {
+            let mut has_explicit_device = false;
+            for &device_pk in &explicit_candidates {
+                if self.is_authorized(ctx, conversation_id, &device_pk, logical_pk, now_ms, rank) {
                     active_devices.push(device_pk);
-                    break;
+                    has_explicit_device = true;
                 }
+            }
+            if !has_explicit_device {
+                active_devices.push(logical_pk.to_physical());
             }
         }
 
@@ -658,7 +908,7 @@ impl IdentityManager {
         active_devices
     }
 
-    /// Resolves a physical Device PK to its Logical PK (Master PK) for a specific conversation.
+    /// Resolves physical Device PK to Logical PK (Master PK) for conversation.
     pub fn resolve_logical_pk(
         &self,
         conversation_id: ConversationId,
@@ -677,17 +927,45 @@ impl IdentityManager {
 
     pub fn is_admin(
         &self,
+        ctx: &CausalContext,
         conversation_id: ConversationId,
         device_pk: &PhysicalDevicePk,
         logical_pk: &LogicalIdentityPk,
         now_ms: i64,
         rank: u64,
     ) -> bool {
-        self.get_permissions(conversation_id, device_pk, logical_pk, now_ms, rank)
+        self.get_permissions(ctx, conversation_id, device_pk, logical_pk, now_ms, rank)
             .is_some_and(|p| p.contains(Permissions::ADMIN))
     }
 
-    /// Returns a list of all authorized device PKs for a specific logical identity in a conversation.
+    /// All (device, logical) pairs authorized in conversation.
+    pub fn list_all_authorized_sender_pairs(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Vec<(PhysicalDevicePk, LogicalIdentityPk)> {
+        let mut pairs = Vec::new();
+        for ((cid, device_pk), records) in &self.authorized_devices {
+            if *cid == conversation_id {
+                for record in records {
+                    pairs.push((*device_pk, record.logical_pk));
+                }
+            }
+        }
+        // Include logical members where device == logical.to_physical()
+        for (cid, logical_pk) in self.logical_members.keys() {
+            if *cid == conversation_id {
+                let phys = logical_pk.to_physical();
+                if !pairs.iter().any(|(d, l)| *d == phys && *l == *logical_pk) {
+                    pairs.push((phys, *logical_pk));
+                }
+            }
+        }
+        pairs.sort_unstable();
+        pairs.dedup();
+        pairs
+    }
+
+    /// Returns list of authorized device PKs for logical identity in conversation.
     pub fn list_authorized_devices_for_author(
         &self,
         conversation_id: ConversationId,
@@ -701,7 +979,7 @@ impl IdentityManager {
             })
             .map(|((_, pk), _)| *pk)
             .collect();
-        // Always include the author's own device PK (Level 0/1)
+        // Always include author's own device PK (Level 0/1)
         if !pks.contains(&logical_pk.to_physical()) {
             pks.push(logical_pk.to_physical());
         }

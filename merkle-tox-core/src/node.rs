@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tox_sequenced::{MessageType, Packet, SequenceSession, SessionEvent};
 use tracing::{debug, error};
 
-/// Status snapshot of a node for observability.
+/// Node status snapshot for observability.
 pub struct NodeStatus {
     pub pk: PhysicalDevicePk,
     pub heads: Vec<NodeHash>,
@@ -29,7 +29,7 @@ pub struct SessionStatus {
     pub retransmit_count: u64,
 }
 
-/// A transport-agnostic Merkle-Tox node that orchestrates engine, reliability, and storage.
+/// Transport-agnostic Merkle-Tox node orchestrating engine, reliability, and storage.
 pub struct MerkleToxNode<T: Transport, S: NodeStore + BlobStore> {
     pub engine: MerkleToxEngine,
     pub transport: T,
@@ -60,7 +60,7 @@ impl<T: Transport, S: NodeStore + BlobStore> MerkleToxNode<T, S> {
                     SessionStatus {
                         cwnd: s.cwnd(),
                         in_flight_bytes: s.in_flight(),
-                        rtt: s.current_rto(), // Close enough for UI
+                        rtt: s.current_rto(), // UI approximation
                         retransmit_count: s.retransmit_count(),
                     },
                 )
@@ -74,7 +74,7 @@ impl<T: Transport, S: NodeStore + BlobStore> MerkleToxNode<T, S> {
             speculative_count: spec_count,
             max_rank,
             authorized_devices: self.engine.get_authorized_devices(conversation_id).len(),
-            current_epoch: self.engine.get_current_epoch(conversation_id),
+            current_epoch: self.engine.get_current_generation(conversation_id),
             db_size_bytes: self.store.size_bytes(),
             sessions,
         }
@@ -100,7 +100,7 @@ impl<T: Transport, S: NodeStore + BlobStore> MerkleToxNode<T, S> {
         self.event_handler = Some(handler);
     }
 
-    /// Handles an incoming raw packet from a peer.
+    /// Handles incoming raw packet.
     pub fn handle_packet(&mut self, from: PhysicalDevicePk, data: &[u8]) {
         let now = self.time_provider.now_instant();
         match tox_proto::deserialize::<Packet>(data) {
@@ -211,13 +211,13 @@ impl<T: Transport, S: NodeStore + BlobStore> MerkleToxNode<T, S> {
     }
 
     /// Background polling for retransmissions and pacing.
-    /// Returns the next scheduled wakeup time.
+    /// Returns next scheduled wakeup time.
     pub fn poll(&mut self) -> Instant {
         let now = self.time_provider.now_instant();
         let now_ms = self.time_provider.now_system_ms() as u64;
         let mut next_wakeup = now + Duration::from_secs(3600);
 
-        // 1. Poll Engine for background tasks (e.g. CAS swarm requests)
+        // 1. Poll Engine for background tasks (e.g., CAS swarm requests)
         let engine_effects = match self.engine.poll(now, &self.store) {
             Ok(res) => res,
             Err(e) => {
@@ -232,17 +232,26 @@ impl<T: Transport, S: NodeStore + BlobStore> MerkleToxNode<T, S> {
 
         // 2. Poll Sessions for outgoing packets
         for (peer_pk, session) in &mut self.sessions {
-            let packets = session.get_packets_to_send(now, now_ms);
-            for p in packets {
-                if let Ok(data) = tox_proto::serialize(&p)
-                    && let Err(e) = self.transport.send_raw(*peer_pk, data)
-                {
-                    error!(
-                        "Failed to send transport packet to {:?} in poll: {:?}",
-                        peer_pk, e
-                    );
-                }
+            let pk = *peer_pk;
+            let transport = &self.transport;
+            session.flush_packets(
+                now,
+                now_ms,
+                &mut |packet| match tox_proto::serialize(&packet) {
+                    Ok(data) => transport.send_raw(pk, data).is_ok(),
+                    Err(e) => {
+                        error!("Failed to serialize packet for {:?}: {}", pk, e);
+                        false
+                    }
+                },
+            );
+
+            // Update consensus clock offset from transport PING/PONG.
+            let offset = session.clock_offset();
+            if offset != 0 {
+                self.engine.clock.update_peer_offset(*peer_pk, offset);
             }
+
             session.cleanup(now);
             let session_wakeup = session.next_wakeup(now);
             if session_wakeup <= now {
@@ -294,8 +303,8 @@ impl<T: Transport, S: NodeStore + BlobStore> MerkleToxNode<T, S> {
                     && let Err(e) = session.send_message(mtype, &payload, now)
                 {
                     error!("Failed to queue engine message: {:?}", e);
-                    // Transport queuing failure is usually not fatal for the DAG state.
-                    // Execution continues after logging the failure.
+                    // Transport queuing failure is usually non-fatal for DAG state.
+                    // Execution continues after logging.
                 }
             }
             Effect::WriteStore(cid, node, verified) => {
@@ -345,7 +354,7 @@ impl<T: Transport, S: NodeStore + BlobStore> MerkleToxNode<T, S> {
         Ok(())
     }
 
-    /// Explicitly sends a message to a peer.
+    /// Explicitly sends message to peer.
     pub fn send_message(&mut self, to: PhysicalDevicePk, msg: ProtocolMessage) {
         let now = self.time_provider.now_instant();
         if !self.sessions.contains_key(&to) {
@@ -364,8 +373,8 @@ impl<T: Transport, S: NodeStore + BlobStore> MerkleToxNode<T, S> {
         }
     }
 
-    /// Communicates peer availability to the node and engine.
-    /// When a peer goes offline, its transient reliability session is removed.
+    /// Updates peer availability.
+    /// Removes transient reliability session when peer goes offline.
     pub fn set_peer_available(&mut self, peer: PhysicalDevicePk, available: bool) {
         if !available {
             self.sessions.remove(&peer);
@@ -388,7 +397,11 @@ fn get_message_type(msg: &ProtocolMessage) -> MessageType {
         ProtocolMessage::SyncSketch(_) => MessageType::SyncSketch,
         ProtocolMessage::SyncReconFail { .. } => MessageType::SyncReconFail,
         ProtocolMessage::SyncShardChecksums { .. } => MessageType::SyncShardChecksums,
+        ProtocolMessage::SyncRateLimited { .. } => MessageType::SyncRateLimited,
+        ProtocolMessage::KeywrapAck { .. } => MessageType::KeywrapAck,
         ProtocolMessage::ReconPowChallenge { .. } => MessageType::ReconPowChallenge,
         ProtocolMessage::ReconPowSolution { .. } => MessageType::ReconPowSolution,
+        ProtocolMessage::ReinclusionRequest { .. } => MessageType::ReinclusionRequest,
+        ProtocolMessage::ReinclusionResponse { .. } => MessageType::ReinclusionResponse,
     }
 }

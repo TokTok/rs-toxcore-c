@@ -68,6 +68,32 @@ fn test_convergence_simple() {
             .unwrap();
     }
 
+    // 3.5. Transfer Node 0's ephemeral signing keys to peers so they can
+    // verify the DARE signature on the content node.  In production this
+    // would happen via SenderKeyDistribution nodes.
+    {
+        let node0_pk = model.nodes[0].node.engine.self_pk;
+        let keys: Vec<_> = model.nodes[0]
+            .node
+            .engine
+            .self_ephemeral_signing_keys
+            .iter()
+            .map(|(epoch, sk)| (*epoch, sk.verifying_key().to_bytes()))
+            .collect();
+        for i in 1..model.nodes.len() {
+            for &(epoch, ref vk) in &keys {
+                model.nodes[i]
+                    .node
+                    .engine
+                    .peer_ephemeral_signing_keys
+                    .insert(
+                        (node0_pk, epoch),
+                        merkle_tox_core::dag::EphemeralSigningPk::from(*vk),
+                    );
+            }
+        }
+    }
+
     // 4. Run simulation until converged
     let mut converged = false;
     for _ in 0..100 {

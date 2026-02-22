@@ -1,10 +1,9 @@
 use ed25519_dalek::{Signer, SigningKey};
 use merkle_tox_core::dag::{
     Content, ControlAction, ConversationId, Ed25519Signature, EphemeralX25519Pk, LogicalIdentityPk,
-    MAX_METADATA_SIZE, MAX_PARENTS, MerkleNode, NodeAuth, NodeHash, NodeMac, PhysicalDevicePk,
-    SignedPreKey,
+    MAX_METADATA_SIZE, MAX_PARENTS, MerkleNode, NodeAuth, NodeHash, PhysicalDevicePk, SignedPreKey,
 };
-use merkle_tox_core::testing::{InMemoryStore, sign_admin_node, test_node};
+use merkle_tox_core::testing::{InMemoryStore, TestIdentity, TestRoom, sign_admin_node, test_node};
 
 #[test]
 fn test_validate_max_parents() {
@@ -224,6 +223,7 @@ fn test_validate_content_parent_to_admin_v1_rule() {
         }),
         metadata: vec![],
         authentication: NodeAuth::Signature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
 
     sign_admin_node(&mut admin_node, &conv_id, &sk);
@@ -245,7 +245,7 @@ fn test_validate_auth_mismatch() {
     // Content node with Signature -> Fail
     let mut node = test_node();
     node.sender_pk = PhysicalDevicePk::from(sk.verifying_key().to_bytes());
-    let sig = sk.sign(&node.serialize_for_auth(&conv_id)).to_bytes();
+    let sig = sk.sign(&node.serialize_for_auth()).to_bytes();
     node.authentication = NodeAuth::Signature(Ed25519Signature::from(sig));
     let res = node.validate(&conv_id, &lookup);
     assert!(matches!(
@@ -256,7 +256,7 @@ fn test_validate_auth_mismatch() {
     // Admin node with MAC -> Fail
     let mut admin_node = test_node();
     admin_node.content = Content::Control(ControlAction::SetTitle("Admin".to_string()));
-    admin_node.authentication = NodeAuth::Mac(NodeMac::from([0u8; 32]));
+    admin_node.authentication = NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64]));
     let res = admin_node.validate(&conv_id, &lookup);
     assert!(matches!(
         res,
@@ -394,6 +394,139 @@ fn test_validate_extreme_rank_difference() {
             }
         )
     ));
+}
+
+/// DARE: Content nodes must use "merkle-tox v1 content-sig" domain separator.
+/// Admin nodes must use "merkle-tox v1 admin-sig\0". A signature made with the
+/// wrong separator must not verify.
+#[test]
+fn test_content_sig_domain_separator() {
+    use merkle_tox_core::dag::{MerkleNode, NodeAuth, NodeType};
+
+    let room = TestRoom::new(2);
+    let alice = &room.identities[0];
+
+    // Create a content node
+    let content_node = MerkleNode {
+        parents: vec![],
+        author_pk: alice.master_pk,
+        sender_pk: alice.device_pk,
+        sequence_number: 1,
+        topological_rank: 0,
+        network_timestamp: 1000,
+        content: Content::Text("hello".to_string()),
+        metadata: vec![],
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
+    };
+
+    // Create an admin node
+    let admin_node = MerkleNode {
+        parents: vec![],
+        author_pk: alice.master_pk,
+        sender_pk: alice.device_pk,
+        sequence_number: 1,
+        topological_rank: 0,
+        network_timestamp: 1000,
+        content: Content::Control(ControlAction::HandshakePulse),
+        metadata: vec![],
+        authentication: NodeAuth::Signature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
+    };
+
+    assert_eq!(content_node.node_type(), NodeType::Content);
+    assert_eq!(admin_node.node_type(), NodeType::Admin);
+
+    let content_auth = content_node.serialize_for_auth();
+    let admin_auth = admin_node.serialize_for_auth();
+
+    // Content nodes use "merkle-tox v1 content-sig" (25 bytes, no null terminator)
+    assert!(
+        content_auth.starts_with(b"merkle-tox v1 content-sig"),
+        "Content node must use content-sig separator"
+    );
+    assert!(
+        !content_auth.starts_with(b"merkle-tox v1 admin-sig\0"),
+        "Content node must NOT use admin-sig separator"
+    );
+
+    // Admin nodes use "merkle-tox v1 admin-sig" (23 bytes, no null terminator)
+    assert!(
+        admin_auth.starts_with(b"merkle-tox v1 admin-sig"),
+        "Admin node must use admin-sig separator"
+    );
+    assert!(
+        !admin_auth.starts_with(b"merkle-tox v1 content-sig"),
+        "Admin node must NOT use content-sig separator"
+    );
+
+    // Cross-type: sign content data with admin separator -> must NOT match content
+    // (They have different separators so the auth data bytes differ.)
+    assert_ne!(
+        &content_auth[..25],
+        &admin_auth[..23],
+        "Separators must differ between content and admin nodes"
+    );
+}
+
+/// Nodes whose serialized size exceeds the maximum message size must fail
+/// validation. A 1 MB+ text message must be rejected.
+#[test]
+fn test_max_message_size_enforced() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let alice = TestIdentity::new();
+    let conv_id = ConversationId::from([11u8; 32]);
+    let store = InMemoryStore::new();
+
+    // Create a node with content exceeding 1 MB
+    let big_text = "x".repeat(1_048_577); // > 1MB
+    let big_node = merkle_tox_core::dag::MerkleNode {
+        parents: vec![],
+        author_pk: alice.master_pk,
+        sender_pk: alice.device_pk,
+        sequence_number: 1,
+        topological_rank: 0,
+        network_timestamp: 1000,
+        content: Content::Text(big_text),
+        metadata: vec![],
+        authentication: NodeAuth::Signature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
+    };
+
+    let result = big_node.validate(&conv_id, &store);
+    assert!(result.is_err(), "Oversized message should fail validation");
+    let err = result.unwrap_err();
+    assert!(
+        format!("{err}").contains("too large") || format!("{err}").contains("Message"),
+        "Error should mention message size, got: {err}"
+    );
+
+    // A small message should pass the size check (may fail other checks like auth)
+    let small_node = merkle_tox_core::dag::MerkleNode {
+        parents: vec![],
+        author_pk: alice.master_pk,
+        sender_pk: alice.device_pk,
+        sequence_number: 1,
+        topological_rank: 0,
+        network_timestamp: 1000,
+        content: Content::Text("hello".to_string()),
+        metadata: vec![],
+        authentication: NodeAuth::Signature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
+    };
+
+    // This should NOT fail with MaxMessageSizeExceeded (it may fail with signature check)
+    let result = small_node.validate(&conv_id, &store);
+    match result {
+        Ok(_) => {} // fine
+        Err(ref e) => {
+            assert!(
+                !format!("{e}").contains("Message size"),
+                "Small message should not fail size check"
+            );
+        }
+    }
 }
 
 // end of file

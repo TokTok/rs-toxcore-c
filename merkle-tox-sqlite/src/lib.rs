@@ -78,18 +78,18 @@ impl Storage {
                 .flags
                 .contains(merkle_tox_core::dag::WireFlags::ENCRYPTED)
             {
-                let mut payload = wire.encrypted_payload.clone();
-                if merkle_tox_core::dag::remove_padding(&mut payload).is_ok() {
+                let mut payload_data = wire.payload_data.clone();
+                if merkle_tox_core::dag::remove_padding(&mut payload_data).is_ok() {
                     if wire
                         .flags
                         .contains(merkle_tox_core::dag::WireFlags::COMPRESSED)
-                        && let Ok(decompressed) = zstd::decode_all(&payload[..])
+                        && let Ok(decompressed) = zstd::decode_all(&payload_data[..])
                     {
-                        payload = decompressed;
+                        payload_data = decompressed;
                     }
 
-                    if payload.len() >= 40 {
-                        let mut cursor = std::io::Cursor::new(&payload[40..]);
+                    if payload_data.len() >= 8 {
+                        let mut cursor = std::io::Cursor::new(&payload_data[8..]);
                         if let Ok(content) =
                             <merkle_tox_core::dag::Content as tox_proto::ToxDeserialize>::deserialize(
                                 &mut cursor,
@@ -177,11 +177,23 @@ impl NodeLookup for Storage {
         let mut stmt = conn
             .prepare_cached("SELECT topological_rank FROM nodes WHERE hash = ?1")
             .ok()?;
-        let res: Option<i64> = stmt
+        let res: i64 = stmt
             .query_row(params![hash.as_bytes()], |r| r.get(0))
             .optional()
+            .ok()??;
+        Some((res ^ i64::MIN) as u64)
+    }
+
+    fn get_admin_distance(&self, hash: &NodeHash) -> Option<u64> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare_cached("SELECT admin_distance FROM nodes WHERE hash = ?1")
             .ok()?;
-        res.map(|r| (r ^ i64::MIN) as u64)
+        let res: i64 = stmt
+            .query_row(params![hash.as_bytes()], |r| r.get(0))
+            .optional()
+            .ok()??;
+        Some(res as u64)
     }
 
     fn contains_node(&self, hash: &NodeHash) -> bool {
@@ -317,13 +329,30 @@ impl NodeStore for Storage {
         node: MerkleNode,
         verified: bool,
     ) -> MerkleToxResult<()> {
-        let mut conn = self.conn.lock().unwrap();
         let hash = node.hash();
         let node_type = if node.node_type() == NodeType::Admin {
             0
         } else {
             1
         };
+
+        let mut admin_distance = 0;
+        if node_type == 1 {
+            // Content Node: Calculate distance from parents
+            let mut min_dist = u64::MAX;
+            for parent_hash in &node.parents {
+                if let Some(dist) = self.get_admin_distance(parent_hash) {
+                    min_dist = min_dist.min(dist);
+                }
+            }
+            if min_dist != u64::MAX {
+                admin_distance = min_dist + 1;
+            } else {
+                admin_distance = u64::MAX;
+            }
+        }
+
+        let mut conn = self.conn.lock().unwrap();
         let raw_data = tox_proto::serialize(&node).map_err(MerkleToxError::Protocol)?;
         let parents_data = tox_proto::serialize(&node.parents).map_err(MerkleToxError::Protocol)?;
         let status = if verified { 1 } else { 0 };
@@ -335,8 +364,8 @@ impl NodeStore for Storage {
         tx.execute(
             "INSERT OR REPLACE INTO nodes (
                 hash, conversation_id, node_type, author_pk, sender_pk, network_timestamp,
-                sequence_number, topological_rank, parents, verification_status, raw_data
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                sequence_number, topological_rank, admin_distance, parents, verification_status, raw_data
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 hash.as_bytes(),
                 conversation_id.as_bytes(),
@@ -346,6 +375,7 @@ impl NodeStore for Storage {
                 node.network_timestamp,
                 (node.sequence_number as i64) ^ i64::MIN,
                 (node.topological_rank as i64) ^ i64::MIN,
+                admin_distance as i64,
                 parents_data,
                 status,
                 raw_data,
@@ -772,6 +802,7 @@ impl BlobStore for Storage {
                 bao_root: bao_root.and_then(|b| b.try_into().ok()),
                 status,
                 received_mask,
+                decryption_key: None,
             })
         })
         .optional()
@@ -1105,12 +1136,11 @@ impl ReconciliationStore for Storage {
     ) -> MerkleToxResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO reconciliation_sketches (conversation_id, epoch, min_rank, max_rank, sketch)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(conversation_id, epoch, min_rank, max_rank) DO UPDATE SET sketch = ?5",
+            "INSERT INTO reconciliation_sketches (conversation_id, min_rank, max_rank, sketch)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(conversation_id, min_rank, max_rank) DO UPDATE SET sketch = ?4",
             params![
                 conversation_id.as_bytes(),
-                (range.epoch as i64) ^ i64::MIN,
                 (range.min_rank as i64) ^ i64::MIN,
                 (range.max_rank as i64) ^ i64::MIN,
                 sketch
@@ -1128,15 +1158,14 @@ impl ReconciliationStore for Storage {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare_cached(
-                "SELECT sketch FROM reconciliation_sketches 
-                 WHERE conversation_id = ?1 AND epoch = ?2 AND min_rank = ?3 AND max_rank = ?4",
+                "SELECT sketch FROM reconciliation_sketches
+                 WHERE conversation_id = ?1 AND min_rank = ?2 AND max_rank = ?3",
             )
             .map_err(|e| MerkleToxError::Storage(e.to_string()))?;
 
         stmt.query_row(
             params![
                 conversation_id.as_bytes(),
-                (range.epoch as i64) ^ i64::MIN,
                 (range.min_rank as i64) ^ i64::MIN,
                 (range.max_rank as i64) ^ i64::MIN
             ],

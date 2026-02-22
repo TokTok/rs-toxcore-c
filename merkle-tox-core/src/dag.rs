@@ -1,14 +1,14 @@
-use crate::crypto::ConversationKeys;
 use crate::error::MerkleToxError;
 use bitflags::bitflags;
 use ed25519_dalek::{Signature as DalekSignature, Verifier, VerifyingKey};
 use std::collections::HashSet;
 use std::io::Cursor;
 pub use tox_proto::{
-    ChainKey, ConversationId, Ed25519Signature, EncryptionKey, EphemeralX25519Pk,
-    EphemeralX25519Sk, KConv, LogicalIdentityPk, LogicalIdentitySk, MacKey, MessageKey, NodeHash,
-    NodeMac, PhysicalDeviceDhSk, PhysicalDevicePk, PhysicalDeviceSk, PowNonce, ShardHash,
-    SharedSecretKey, ToxDeserialize, ToxProto, ToxSerialize,
+    ChainKey, ConversationId, Ed25519Signature, EncryptionKey, EphemeralSigningPk,
+    EphemeralSigningSk, EphemeralX25519Pk, EphemeralX25519Sk, HeaderKey, KConv, LogicalIdentityPk,
+    LogicalIdentitySk, MacKey, MessageKey, NodeHash, NodeMac, PhysicalDeviceDhSk, PhysicalDevicePk,
+    PhysicalDeviceSk, PowNonce, SenderKey, ShardHash, SharedSecretKey, ToxDeserialize, ToxProto,
+    ToxSerialize,
 };
 
 bitflags! {
@@ -44,20 +44,13 @@ pub type Signature = [u8; 64];
 
 #[derive(Debug, Clone, ToxProto, PartialEq, Eq)]
 pub enum NodeAuth {
-    /// For content nodes: Blake3-MAC(K_mac, NodeData).
-    Mac(NodeMac),
+    /// For content nodes: Ed25519-Sig(EphemeralSigning_SK, NodeData).
+    EphemeralSignature(Ed25519Signature),
     /// For administrative nodes: Ed25519-Sig(Sender_SK, NodeData).
     Signature(Ed25519Signature),
 }
 
-impl NodeAuth {
-    pub fn mac(&self) -> Option<&NodeMac> {
-        match self {
-            NodeAuth::Mac(mac) => Some(mac),
-            _ => None,
-        }
-    }
-}
+impl NodeAuth {}
 
 #[derive(Debug, Clone, ToxProto, PartialEq, Eq)]
 pub enum EmojiSource {
@@ -96,11 +89,26 @@ pub struct SignedPreKey {
 #[derive(Debug, Clone, ToxProto, PartialEq, Eq)]
 pub struct WrappedKey {
     pub recipient_pk: PhysicalDevicePk,
+    pub opk_id: NodeHash,
     pub ciphertext: Vec<u8>,
 }
 
 #[derive(Debug, Clone, ToxProto, PartialEq, Eq)]
+pub struct SnapshotData {
+    pub basis_hash: NodeHash,
+    pub members: Vec<MemberInfo>,
+    pub last_seq_numbers: Vec<(PhysicalDevicePk, u64)>,
+}
+
+#[derive(Debug, Clone, ToxProto, PartialEq, Eq)]
 pub enum ControlAction {
+    Genesis {
+        title: String,
+        creator_pk: LogicalIdentityPk,
+        permissions: Permissions,
+        flags: u64,
+        created_at: i64,
+    },
     SetTitle(String),
     SetTopic(String),
     Invite(InviteAction),
@@ -117,27 +125,49 @@ pub enum ControlAction {
         last_resort_key: SignedPreKey,
     },
     HandshakePulse,
-    Snapshot {
+    Snapshot(SnapshotData),
+    AnchorSnapshot {
+        data: SnapshotData,
+        cert: DelegationCertificate,
+    },
+    SoftAnchor {
         basis_hash: NodeHash,
-        members: Vec<MemberInfo>,
-        last_seq_numbers: Vec<(PhysicalDevicePk, u64)>,
-    },
-    Rekey {
-        new_epoch: u64,
-    },
-    Genesis {
-        title: String,
-        creator_pk: LogicalIdentityPk,
-        permissions: Permissions,
-        flags: u64,
-        created_at: i64,
-        pow_nonce: u64,
+        cert: DelegationCertificate,
     },
 }
 
 #[derive(Debug, Clone, ToxProto, PartialEq)]
 pub enum Content {
+    // 0: Custom (was Other)
+    Custom {
+        tag_id: u32,
+        data: Vec<u8>,
+    },
+    // 1: KeyWrap
+    KeyWrap {
+        generation: u64,
+        anchor_hash: NodeHash,
+        ephemeral_pk: EphemeralX25519Pk,
+        wrapped_keys: Vec<WrappedKey>,
+    },
+    // 2: SenderKeyDistribution
+    SenderKeyDistribution {
+        ephemeral_pk: EphemeralX25519Pk,
+        wrapped_keys: Vec<WrappedKey>,
+        ephemeral_signing_pk: EphemeralSigningPk,
+        disclosed_keys: Vec<EphemeralSigningSk>,
+    },
+    // 3: HistoryExport
+    HistoryExport {
+        blob_hash: NodeHash,
+        ephemeral_pk: EphemeralX25519Pk,
+        wrapped_keys: Vec<WrappedKey>,
+    },
+    // 4: Control
+    Control(ControlAction),
+    // 5: Text
     Text(String),
+    // 6: Blob
     Blob {
         hash: NodeHash,
         name: String,
@@ -145,39 +175,37 @@ pub enum Content {
         size: u64,
         metadata: Vec<u8>,
     },
-    Reaction {
-        target_hash: NodeHash,
-        emoji: EmojiSource,
-    },
+    // 7: Location
     Location {
         latitude: f64,
         longitude: f64,
         title: Option<String>,
     },
-    Control(ControlAction),
+    // 8: Edit
+    Edit {
+        target_hash: NodeHash,
+        new_text: String,
+    },
+    // 9: Reaction
+    Reaction {
+        target_hash: NodeHash,
+        emoji: EmojiSource,
+    },
+    // 10: Redaction
     Redaction {
         target_hash: NodeHash,
         reason: String,
     },
-    Other {
-        tag_id: u32,
-        data: Vec<u8>,
-    },
-    KeyWrap {
-        epoch: u64,
-        wrapped_keys: Vec<WrappedKey>,
-        /// The Alice's ephemeral PK used for X3DH.
-        ephemeral_pk: Option<EphemeralX25519Pk>,
-        /// The Bob's signed pre-key PK Alice used for X3DH.
-        pre_key_pk: Option<EphemeralX25519Pk>,
-    },
-    RatchetSnapshot {
-        epoch: u64,
-        ciphertext: Vec<u8>,
+    // 11: LegacyBridge
+    LegacyBridge {
+        source_pk: PhysicalDevicePk,
+        text: String,
+        message_type: u8,
+        dedup_id: NodeHash,
     },
 }
 
-/// The logical representation of a Merkle node.
+/// Logical representation of Merkle node.
 #[derive(Debug, Clone, ToxProto, PartialEq)]
 pub struct MerkleNode {
     pub parents: Vec<NodeHash>,
@@ -189,30 +217,64 @@ pub struct MerkleNode {
     pub content: Content,
     pub metadata: Vec<u8>,
     pub authentication: NodeAuth,
+    /// PoW nonce for Genesis nodes. External to serialized content so
+    /// node hash remains stable regardless of mining effort.
+    #[tox(skip)]
+    pub pow_nonce: u64,
 }
 
-/// The wire format for a Merkle node, used for Content nodes to obfuscate metadata.
+/// Wire format for Merkle node, used for Content nodes to obfuscate metadata.
 #[derive(Debug, Clone, ToxProto, PartialEq)]
 pub struct WireNode {
     pub parents: Vec<NodeHash>,
-    pub author_pk: LogicalIdentityPk,
-    pub encrypted_payload: Vec<u8>,
+    pub sender_hint: [u8; 4],
+    pub encrypted_routing: Vec<u8>,
+    pub payload_data: Vec<u8>,
     pub topological_rank: u64,
-    pub network_timestamp: i64,
     pub flags: WireFlags,
     pub authentication: NodeAuth,
+}
+
+impl WireNode {
+    /// Serializes wire-format fields 1 to 6 with domain separator for signing.
+    ///
+    /// Used for encrypt-then-sign: content nodes signed post-encryption
+    /// against actual wire bytes.
+    pub fn serialize_for_auth(&self) -> Vec<u8> {
+        let wire_auth = WireAuthData {
+            parents: self.parents.clone(),
+            sender_hint: self.sender_hint,
+            encrypted_routing: self.encrypted_routing.clone(),
+            payload_data: self.payload_data.clone(),
+            topological_rank: self.topological_rank,
+            flags: self.flags,
+        };
+        let serialized =
+            tox_proto::serialize(&wire_auth).expect("Failed to serialize wire auth data");
+        let separator: &[u8] = if self.flags.contains(WireFlags::ENCRYPTED) {
+            b"merkle-tox v1 content-sig"
+        } else {
+            b"merkle-tox v1 admin-sig"
+        };
+        let mut bytes = Vec::with_capacity(separator.len() + serialized.len());
+        bytes.extend_from_slice(separator);
+        bytes.extend_from_slice(&serialized);
+        bytes
+    }
 }
 
 pub trait NodeLookup {
     fn get_node_type(&self, hash: &NodeHash) -> Option<NodeType>;
     fn get_rank(&self, hash: &NodeHash) -> Option<u64>;
+    fn get_admin_distance(&self, hash: &NodeHash) -> Option<u64>;
     fn contains_node(&self, hash: &NodeHash) -> bool;
     fn has_children(&self, hash: &NodeHash) -> bool;
 }
 
-pub const POW_DIFFICULTY: u32 = 12; // Adjusted as per design update
+pub const POW_DIFFICULTY: u32 = 20; // Spec: BASELINE_POW_DIFFICULTY = 20 bits
 
 pub const MAX_PARENTS: usize = 16;
+pub const MAX_ANCESTRY_HOPS: u64 = 500;
 pub const MAX_METADATA_SIZE: usize = 32 * 1024; // 32KB
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -231,6 +293,8 @@ pub enum ValidationError {
     EmptyDag,
     #[error("Invalid wire payload size: {actual} (expected at least {expected_min})")]
     InvalidWirePayloadSize { actual: usize, expected_min: usize },
+    #[error("Node has exceeded the ancestry trust cap: {actual} (max {max})")]
+    AncestryCapExceeded { actual: u64, max: u64 },
     #[error("Topological rank violation: actual {actual}, expected {expected}")]
     TopologicalRankViolation { actual: u64, expected: u64 },
     #[error("Missing parents: {0:?}")]
@@ -255,41 +319,64 @@ pub enum ValidationError {
     DecompressionFailed(String),
     #[error("MAC mismatch")]
     MacMismatch,
+    #[error("Message too large: {actual} bytes (max {max})")]
+    MaxMessageSizeExceeded { actual: usize, max: usize },
 }
 
+/// Wire-format fields 1 to 6 of WireNode, used as signature input.
+/// Signatures cover wire encoding (encrypt-then-sign) rather than
+/// plaintext MerkleNode fields.
 #[derive(ToxSerialize)]
-struct AuthData<'a> {
-    conversation_id: &'a ConversationId,
-    parents: &'a Vec<NodeHash>,
-    author_pk: &'a LogicalIdentityPk,
-    sender_pk: &'a PhysicalDevicePk,
-    sequence_number: u64,
+struct WireAuthData {
+    parents: Vec<NodeHash>,
+    sender_hint: [u8; 4],
+    encrypted_routing: Vec<u8>,
+    payload_data: Vec<u8>,
     topological_rank: u64,
-    network_timestamp: i64,
-    content: &'a Content,
-    metadata: &'a Vec<u8>,
+    flags: WireFlags,
+}
+
+/// Counts leading zero bits of a 32-byte hash.
+fn count_leading_zeros(hash: &[u8; 32]) -> u32 {
+    let mut leading_zeros = 0;
+    for &byte in hash.iter() {
+        if byte == 0 {
+            leading_zeros += 8;
+        } else {
+            leading_zeros += byte.leading_zeros();
+            break;
+        }
+    }
+    leading_zeros
+}
+
+/// Validates Genesis Proof-of-Work.
+///
+/// PoW input is `creator_pk || node_hash || nonce` where `node_hash` is
+/// Blake3 hash of serialized MerkleNode (excluding `pow_nonce`
+/// due to `#[tox(skip)]`).
+pub fn validate_pow(creator_pk: &[u8; 32], node_hash: &NodeHash, nonce: u64) -> bool {
+    let mut input = Vec::with_capacity(72);
+    input.extend_from_slice(creator_pk);
+    input.extend_from_slice(node_hash.as_bytes());
+    input.extend_from_slice(&nonce.to_le_bytes());
+    let hash = blake3::hash(&input);
+    count_leading_zeros(hash.as_bytes()) >= POW_DIFFICULTY
 }
 
 impl MerkleNode {
-    /// Validates the Proof-of-Work for a Genesis node.
+    /// Validates Proof-of-Work for Genesis node using external
+    /// `pow_nonce` field.
     pub fn validate_pow(&self) -> bool {
-        if let Content::Control(ControlAction::Genesis { .. }) = &self.content {
-            // EXCEPTION: 1-on-1 Genesis nodes use MAC and don't require PoW.
-            if matches!(self.authentication, NodeAuth::Mac(_)) {
+        if let Content::Control(ControlAction::Genesis { creator_pk, .. }) = &self.content {
+            // EXCEPTION: 1-on-1 Genesis nodes use EphemeralSignature (MAC-derived pseudo-sig)
+            // and don't require PoW.
+            if matches!(self.authentication, NodeAuth::EphemeralSignature(_)) {
                 return true;
             }
 
-            let hash = self.hash();
-            let mut leading_zeros = 0;
-            for &byte in hash.as_bytes().iter() {
-                if byte == 0 {
-                    leading_zeros += 8;
-                } else {
-                    leading_zeros += byte.leading_zeros();
-                    break;
-                }
-            }
-            leading_zeros >= POW_DIFFICULTY
+            let node_hash = self.hash();
+            validate_pow(creator_pk.as_bytes(), &node_hash, self.pow_nonce)
         } else {
             true // Non-genesis nodes don't need PoW
         }
@@ -300,49 +387,51 @@ impl MerkleNode {
         NodeHash::from(*blake3::hash(&data).as_bytes())
     }
 
-    /// Serializes the node data for authentication (MAC or Signature).
-    /// This excludes the authentication field itself.
-    pub fn serialize_for_auth(&self, conversation_id: &ConversationId) -> Vec<u8> {
-        let empty_conv_id = ConversationId::from([0u8; 32]);
-        let auth_conv_id = if matches!(
-            self.content,
-            Content::Control(ControlAction::Genesis { .. })
-        ) {
-            tracing::debug!("Serializing Genesis node for auth, using empty conv ID");
-            &empty_conv_id
-        } else {
-            tracing::debug!(
-                "Serializing non-Genesis node for auth, using conv ID: {}",
-                hex::encode(conversation_id.as_bytes())
-            );
-            conversation_id
-        };
+    /// Serializes node data for authentication (Signature or EphemeralSignature).
+    ///
+    /// Produces wire-format bytes (encrypt-then-sign): signature input is
+    /// ToxProto encoding of `WireAuthData` (WireNode fields 1 to 6) prepended
+    /// with domain separator.
+    ///
+    /// For exception nodes (admin, KeyWrap, SKD, HistoryExport), wire
+    /// encoding is deterministic and computed from MerkleNode alone
+    /// (no encryption randomness). Content nodes should use
+    /// `WireNode::serialize_for_auth()` on actual encrypted wire node
+    /// instead.
+    pub fn serialize_for_auth(&self) -> Vec<u8> {
+        // Build payload: [timestamp(8B) || serialize(content) || metadata]
+        let mut payload_data = Vec::new();
+        payload_data.extend_from_slice(&self.network_timestamp.to_be_bytes());
+        let content_data =
+            tox_proto::serialize(&self.content).expect("Failed to serialize content");
+        payload_data.extend_from_slice(&content_data);
+        payload_data.extend_from_slice(&self.metadata);
+        // ISO 7816-4 padding (no compression for auth bytes)
+        apply_padding(&mut payload_data);
 
-        tracing::debug!("AuthData fields:");
-        tracing::debug!("  conv_id: {}", hex::encode(auth_conv_id.as_bytes()));
-        tracing::debug!("  parents: {:?}", self.parents);
-        tracing::debug!("  author_pk: {}", hex::encode(self.author_pk.as_bytes()));
-        tracing::debug!("  sender_pk: {}", hex::encode(self.sender_pk.as_bytes()));
-        tracing::debug!("  seq_num: {}", self.sequence_number);
-        tracing::debug!("  rank: {}", self.topological_rank);
-        tracing::debug!("  timestamp: {}", self.network_timestamp);
-        tracing::debug!("  content: {:?}", self.content);
-        tracing::debug!("  metadata len: {}", self.metadata.len());
+        // Cleartext routing: [sender_pk(32B) || seq_number(8B BE)]
+        let mut routing = Vec::with_capacity(40);
+        routing.extend_from_slice(self.sender_pk.as_bytes());
+        routing.extend_from_slice(&self.sequence_number.to_be_bytes());
 
-        let data = AuthData {
-            conversation_id: auth_conv_id,
-            parents: &self.parents,
-            author_pk: &self.author_pk,
-            sender_pk: &self.sender_pk,
-            sequence_number: self.sequence_number,
+        let wire_auth = WireAuthData {
+            parents: self.parents.clone(),
+            sender_hint: [0, 0, 0, 0],
+            encrypted_routing: routing,
+            payload_data,
             topological_rank: self.topological_rank,
-            network_timestamp: self.network_timestamp,
-            content: &self.content,
-            metadata: &self.metadata,
+            flags: WireFlags::NONE,
         };
 
-        let bytes = tox_proto::serialize(&data).expect("Failed to serialize auth data");
-        tracing::debug!("serialize_for_auth bytes: {}", hex::encode(&bytes));
+        let serialized =
+            tox_proto::serialize(&wire_auth).expect("Failed to serialize wire auth data");
+        let separator: &[u8] = match self.node_type() {
+            NodeType::Admin => b"merkle-tox v1 admin-sig",
+            NodeType::Content => b"merkle-tox v1 content-sig",
+        };
+        let mut bytes = Vec::with_capacity(separator.len() + serialized.len());
+        bytes.extend_from_slice(separator);
+        bytes.extend_from_slice(&serialized);
         bytes
     }
 
@@ -353,14 +442,27 @@ impl MerkleNode {
         }
     }
 
+    /// Returns true if node is "exception" type using cleartext
+    /// wire encoding (no per-message encryption). Admin nodes, KeyWrap,
+    /// HistoryExport, and SenderKeyDistribution are exception nodes.
+    pub fn is_exception_node(&self) -> bool {
+        self.node_type() == NodeType::Admin
+            || matches!(
+                self.content,
+                Content::KeyWrap { .. }
+                    | Content::HistoryExport { .. }
+                    | Content::SenderKeyDistribution { .. }
+            )
+    }
+
     /// Verifies the signature of an Admin node.
-    pub fn verify_admin_signature(&self, conversation_id: &ConversationId) -> bool {
+    pub fn verify_admin_signature(&self) -> bool {
         if let NodeAuth::Signature(sig) = &self.authentication {
             let Ok(verifying_key) = VerifyingKey::from_bytes(self.sender_pk.as_bytes()) else {
                 return false;
             };
             let signature = DalekSignature::from_bytes(sig.as_ref());
-            let auth_data = self.serialize_for_auth(conversation_id);
+            let auth_data = self.serialize_for_auth();
 
             verifying_key.verify(&auth_data, &signature).is_ok()
         } else {
@@ -377,7 +479,7 @@ impl MerkleNode {
     /// Validates the node against the protocol rules.
     pub fn validate<L: NodeLookup + ?Sized>(
         &self,
-        conversation_id: &ConversationId,
+        _conversation_id: &ConversationId,
         lookup: &L,
     ) -> Result<(), ValidationError> {
         // 0. Hard Limits
@@ -403,17 +505,43 @@ impl MerkleNode {
             });
         }
 
+        // Message size check: metadata + serialized content must not exceed MAX_MESSAGE_SIZE.
+        let content_size = tox_proto::serialize(&self.content)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let total_size = self.metadata.len() + content_size;
+        if total_size > tox_proto::constants::MAX_MESSAGE_SIZE {
+            return Err(ValidationError::MaxMessageSizeExceeded {
+                actual: total_size,
+                max: tox_proto::constants::MAX_MESSAGE_SIZE,
+            });
+        }
+
         let node_type = self.node_type();
 
-        // 1. Authentication Rule: Admin nodes MUST use Signature. Content nodes MUST use MAC.
-        match (&self.authentication, node_type) {
-            (NodeAuth::Signature(_), NodeType::Admin) => {}
-            (NodeAuth::Mac(_), NodeType::Content) => {}
-            (NodeAuth::Signature(_), NodeType::Content) => {
+        // KeyWrap always requires Ed25519 Signature.
+        // SenderKeyDistribution: epoch 0 uses Signature, epoch n>0 uses EphemeralSignature (DARE §2).
+        let is_key_wrap = matches!(self.content, Content::KeyWrap { .. });
+        let is_skd = matches!(self.content, Content::SenderKeyDistribution { .. });
+
+        // 1. Authentication Rule: Admin nodes and KeyWrap MUST use Signature.
+        //    SKD accepts either Signature (epoch 0) or EphemeralSignature (epoch n>0).
+        //    Other content nodes MUST use EphemeralSignature.
+        match (&self.authentication, node_type, is_key_wrap, is_skd) {
+            (NodeAuth::Signature(_), NodeType::Admin, _, _) => {}
+            (NodeAuth::EphemeralSignature(_), NodeType::Content, false, false) => {}
+            (NodeAuth::Signature(_), NodeType::Content, true, _) => {}
+            // SKD allows both Signature and EphemeralSignature
+            (NodeAuth::Signature(_), NodeType::Content, false, true) => {}
+            (NodeAuth::EphemeralSignature(_), NodeType::Content, false, true) => {}
+            (NodeAuth::Signature(_), NodeType::Content, false, false) => {
                 return Err(ValidationError::ContentNodeShouldUseMac);
             }
-            (NodeAuth::Mac(_), NodeType::Admin) => {
-                // EXCEPTION: 1-on-1 Genesis nodes use MAC.
+            (NodeAuth::EphemeralSignature(_), NodeType::Content, true, _) => {
+                return Err(ValidationError::AdminNodeShouldUseSignature);
+            }
+            (NodeAuth::EphemeralSignature(_), NodeType::Admin, _, _) => {
+                // EXCEPTION: 1-on-1 Genesis nodes use EphemeralSignature (MAC-derived pseudo-sig).
                 if let Content::Control(ControlAction::Genesis { .. }) = &self.content {
                     if !self.parents.is_empty() {
                         return Err(ValidationError::GenesisMacWithParents);
@@ -424,15 +552,18 @@ impl MerkleNode {
             }
         }
 
-        // 2. Admin Authenticity
-        if node_type == NodeType::Admin {
+        // 2. Admin Authenticity: applies to Admin nodes, KeyWrap, and
+        //    Signature-authed SKD (epoch 0). EphemeralSignature SKD (epoch n>0)
+        //    is verified via the ephemeral key path in the engine.
+        let is_signature_skd = is_skd && matches!(self.authentication, NodeAuth::Signature(_));
+        if node_type == NodeType::Admin || is_key_wrap || is_signature_skd {
             // 0. PoW check for Genesis
             if !self.validate_pow() {
                 return Err(ValidationError::PoWInvalid);
             }
 
             // 1. Signature check
-            if !self.verify_admin_signature(conversation_id) {
+            if !self.verify_admin_signature() {
                 return Err(ValidationError::InvalidAdminSignature);
             }
         }
@@ -467,7 +598,8 @@ impl MerkleNode {
             });
         }
 
-        // 4. Chain Isolation: Admin nodes MUST ONLY reference other Admin nodes as parents.
+        // 4. Chain Isolation: Admin and SoftAnchor nodes MUST ONLY reference other
+        //    Admin or SoftAnchor nodes as parents (merkle-tox-dag.md §3.2).
         if node_type == NodeType::Admin {
             for parent_hash in &self.parents {
                 match lookup.get_node_type(parent_hash) {
@@ -482,89 +614,202 @@ impl MerkleNode {
             }
         }
 
+        // 5. Ancestry Trust Cap: Content nodes must be within MAX_ANCESTRY_HOPS of an Admin node.
+        if node_type == NodeType::Content && !self.parents.is_empty() {
+            let mut min_distance = u64::MAX;
+            for parent_hash in &self.parents {
+                if let Some(dist) = lookup.get_admin_distance(parent_hash) {
+                    min_distance = min_distance.min(dist);
+                } else {
+                    return Err(ValidationError::MissingParents(vec![*parent_hash]));
+                }
+            }
+
+            if min_distance >= MAX_ANCESTRY_HOPS {
+                return Err(ValidationError::AncestryCapExceeded {
+                    actual: min_distance + 1,
+                    max: MAX_ANCESTRY_HOPS,
+                });
+            }
+        }
+
         Ok(())
     }
 
-    /// Converts the logical MerkleNode to its wire representation.
-    /// Content nodes have their sensitive metadata (sender_pk, sequence_number, content, metadata) encrypted.
+    /// Converts logical MerkleNode to wire representation.
+    ///
+    /// Content nodes use per-message encryption: payload encrypted with K_msg,
+    /// routing encrypted with K_header AEAD, and 4-byte sender_hint for fast
+    /// sender identification.
+    ///
+    /// Exception nodes (Admin, KeyWrap, HistoryExport, SKD) use cleartext.
     pub fn pack_wire(
         &self,
-        keys: &ConversationKeys,
+        keys: &crate::crypto::PackKeys,
         use_compression: bool,
     ) -> Result<WireNode, MerkleToxError> {
-        let node_type = self.node_type();
-        let is_key_wrap = matches!(self.content, Content::KeyWrap { .. });
-
-        let mut payload = Vec::new();
-        payload.extend_from_slice(self.sender_pk.as_bytes());
-        payload.extend_from_slice(&self.sequence_number.to_be_bytes());
+        // Build the payload: [timestamp || content || metadata]
+        let mut payload_data = Vec::new();
+        payload_data.extend_from_slice(&self.network_timestamp.to_be_bytes());
         let content_data = tox_proto::serialize(&self.content)?;
-        payload.extend_from_slice(&content_data);
-        payload.extend_from_slice(&self.metadata);
+        payload_data.extend_from_slice(&content_data);
+        payload_data.extend_from_slice(&self.metadata);
 
         let mut flags = WireFlags::NONE;
         if use_compression
-            && let Ok(compressed) = zstd::encode_all(&payload[..], 3)
-            && compressed.len() < payload.len()
+            && let Ok(compressed) = zstd::encode_all(&payload_data[..], 3)
+            && compressed.len() < payload_data.len()
         {
-            payload = compressed;
+            payload_data = compressed;
             flags |= WireFlags::COMPRESSED;
         }
 
-        apply_padding(&mut payload);
+        apply_padding(&mut payload_data);
 
-        if node_type == NodeType::Admin || is_key_wrap {
-            Ok(WireNode {
-                parents: self.parents.clone(),
-                author_pk: self.author_pk,
-                encrypted_payload: payload,
-                topological_rank: self.topological_rank,
-                network_timestamp: self.network_timestamp,
-                flags,
-                authentication: self.authentication.clone(),
-            })
-        } else {
-            let mut nonce = [0u8; 12];
-            if let Some(mac) = self.authentication.mac() {
-                nonce.copy_from_slice(&mac.as_bytes()[0..12]);
+        match keys {
+            crate::crypto::PackKeys::Exception => {
+                // Exception nodes: cleartext routing and payload
+                let mut routing = Vec::new();
+                routing.extend_from_slice(self.sender_pk.as_bytes());
+                routing.extend_from_slice(&self.sequence_number.to_be_bytes());
+
+                Ok(WireNode {
+                    parents: self.parents.clone(),
+                    sender_hint: [0, 0, 0, 0],
+                    encrypted_routing: routing,
+                    payload_data,
+                    topological_rank: self.topological_rank,
+                    flags,
+                    authentication: self.authentication.clone(),
+                })
             }
+            crate::crypto::PackKeys::Content(ck) => {
+                // 1. Encrypt payload with K_msg directly (ChaCha20, stream cipher)
+                use chacha20::ChaCha20;
+                use chacha20::cipher::{KeyIvInit, StreamCipher as _};
+                let mut cipher =
+                    ChaCha20::new(ck.k_msg.as_bytes().into(), (&ck.payload_nonce).into());
+                cipher.apply_keystream(&mut payload_data);
 
-            tracing::debug!(
-                "Encrypting wire node with k_enc prefix: {}",
-                hex::encode(&keys.k_enc.as_bytes()[..8])
-            );
-            keys.encrypt(&nonce, &mut payload);
-            flags |= WireFlags::ENCRYPTED;
+                // Prepend payload nonce
+                let mut encrypted_payload = Vec::with_capacity(12 + payload_data.len());
+                encrypted_payload.extend_from_slice(&ck.payload_nonce);
+                encrypted_payload.extend_from_slice(&payload_data);
 
-            Ok(WireNode {
-                parents: self.parents.clone(),
-                author_pk: self.author_pk,
-                encrypted_payload: payload,
-                topological_rank: self.topological_rank,
-                network_timestamp: self.network_timestamp,
-                flags,
-                authentication: self.authentication.clone(),
-            })
+                // 2. Compute payload_hash = Blake3(encrypted_payload) for AEAD AAD
+                let payload_hash = *blake3::hash(&encrypted_payload).as_bytes();
+
+                // 3. Encrypt routing with K_header AEAD
+                let aead_ct = crate::crypto::encrypt_routing_aead(
+                    &ck.k_header,
+                    &ck.routing_nonce,
+                    self.sequence_number,
+                    &payload_hash,
+                );
+
+                // Prepend routing nonce → 12 + 24 = 36 bytes total
+                let mut encrypted_routing = Vec::with_capacity(12 + aead_ct.len());
+                encrypted_routing.extend_from_slice(&ck.routing_nonce);
+                encrypted_routing.extend_from_slice(&aead_ct);
+
+                // 4. Compute sender_hint
+                let sender_hint = crate::crypto::compute_sender_hint(&ck.k_msg);
+
+                flags |= WireFlags::ENCRYPTED;
+
+                Ok(WireNode {
+                    parents: self.parents.clone(),
+                    sender_hint,
+                    encrypted_routing,
+                    payload_data: encrypted_payload,
+                    topological_rank: self.topological_rank,
+                    flags,
+                    authentication: self.authentication.clone(),
+                })
+            }
         }
     }
 
-    /// Reconstructs a logical MerkleNode from its wire representation.
-    pub fn unpack_wire(wire: &WireNode, keys: &ConversationKeys) -> Result<Self, MerkleToxError> {
-        let mut payload = wire.encrypted_payload.clone();
+    /// Try to decrypt routing with candidate K_header.
+    /// Returns sequence number on success, None on AEAD tag mismatch.
+    pub fn try_decrypt_routing(wire: &WireNode, k_header: &HeaderKey) -> Option<u64> {
+        if wire.encrypted_routing.len() != 36 {
+            return None;
+        }
+        let routing_nonce: [u8; 12] = wire.encrypted_routing[0..12].try_into().ok()?;
+        let aead_ct = &wire.encrypted_routing[12..];
+        let payload_hash = *blake3::hash(&wire.payload_data).as_bytes();
+        crate::crypto::decrypt_routing_aead(k_header, &routing_nonce, aead_ct, &payload_hash)
+    }
 
-        if wire.flags.contains(WireFlags::ENCRYPTED) {
-            let mut nonce = [0u8; 12];
-            if let Some(mac) = wire.authentication.mac() {
-                nonce.copy_from_slice(&mac.as_bytes()[0..12]);
-            }
-            tracing::debug!(
-                "Decrypting wire node with k_enc prefix: {}",
-                hex::encode(&keys.k_enc.as_bytes()[..8])
-            );
-            keys.decrypt(&nonce, &mut payload);
+    /// Decrypt payload once sender is identified. Returns MerkleNode.
+    pub fn unpack_wire_content(
+        wire: &WireNode,
+        sender_pk: PhysicalDevicePk,
+        author_pk: LogicalIdentityPk,
+        sequence_number: u64,
+        k_msg: &MessageKey,
+    ) -> Result<Self, MerkleToxError> {
+        if wire.payload_data.len() < 12 {
+            return Err(MerkleToxError::Validation(
+                ValidationError::InvalidWirePayloadSize {
+                    actual: wire.payload_data.len(),
+                    expected_min: 12,
+                },
+            ));
         }
 
-        if let Err(e) = remove_padding(&mut payload) {
+        let payload_nonce: [u8; 12] = wire.payload_data[0..12].try_into().unwrap();
+        let mut payload_data = wire.payload_data[12..].to_vec();
+
+        // Decrypt payload with K_msg directly
+        use chacha20::ChaCha20;
+        use chacha20::cipher::{KeyIvInit, StreamCipher as _};
+        let mut cipher = ChaCha20::new(k_msg.as_bytes().into(), (&payload_nonce).into());
+        cipher.apply_keystream(&mut payload_data);
+
+        Self::decode_payload(wire, sender_pk, author_pk, sequence_number, payload_data)
+    }
+
+    /// Unpack exception nodes (cleartext routing/payload).
+    pub fn unpack_wire_exception(wire: &WireNode) -> Result<Self, MerkleToxError> {
+        let routing = &wire.encrypted_routing;
+
+        if routing.len() < 40 {
+            return Err(MerkleToxError::Validation(
+                ValidationError::InvalidWirePayloadSize {
+                    actual: routing.len(),
+                    expected_min: 40,
+                },
+            ));
+        }
+
+        let sender_pk_bytes: [u8; 32] = routing[0..32].try_into().unwrap();
+        let sender_pk = PhysicalDevicePk::from(sender_pk_bytes);
+        let sequence_number = u64::from_be_bytes(routing[32..40].try_into().unwrap());
+
+        // For exception nodes, author_pk is resolved from the sender_pk (best effort).
+        // The caller should resolve the logical identity separately.
+        let author_pk = LogicalIdentityPk::from(*sender_pk.as_bytes());
+
+        Self::decode_payload(
+            wire,
+            sender_pk,
+            author_pk,
+            sequence_number,
+            wire.payload_data.clone(),
+        )
+    }
+
+    /// Common payload decoding: remove padding, decompress, deserialize.
+    fn decode_payload(
+        wire: &WireNode,
+        sender_pk: PhysicalDevicePk,
+        author_pk: LogicalIdentityPk,
+        sequence_number: u64,
+        mut payload_data: Vec<u8>,
+    ) -> Result<Self, MerkleToxError> {
+        if let Err(e) = remove_padding(&mut payload_data) {
             tracing::debug!("Padding removal failed: {}", e);
             return Err(MerkleToxError::Validation(ValidationError::InvalidPadding(
                 format!("Invalid padding: {}", e),
@@ -572,7 +817,7 @@ impl MerkleNode {
         }
 
         if wire.flags.contains(WireFlags::COMPRESSED) {
-            payload = zstd::decode_all(&payload[..]).map_err(|e| {
+            payload_data = zstd::decode_all(&payload_data[..]).map_err(|e| {
                 tracing::debug!("Decompression failed: {}", e);
                 MerkleToxError::Validation(ValidationError::DecompressionFailed(format!(
                     "Decompression failed: {}",
@@ -581,22 +826,19 @@ impl MerkleNode {
             })?;
         }
 
-        if payload.len() < 32 + 8 {
-            tracing::debug!("Invalid wire payload size: {}", payload.len());
+        if payload_data.len() < 8 {
+            tracing::debug!("Invalid wire payload size: {}", payload_data.len());
             return Err(MerkleToxError::Validation(
                 ValidationError::InvalidWirePayloadSize {
-                    actual: payload.len(),
-                    expected_min: 32 + 8,
+                    actual: payload_data.len(),
+                    expected_min: 8,
                 },
             ));
         }
 
-        let sender_pk_bytes: [u8; 32] = payload[0..32].try_into().unwrap();
-        let sender_pk = PhysicalDevicePk::from(sender_pk_bytes);
-        let sequence_number = u64::from_be_bytes(payload[32..40].try_into().unwrap());
+        let network_timestamp = i64::from_be_bytes(payload_data[0..8].try_into().unwrap());
 
-        // Use a Cursor to track how many bytes are consumed by Content deserialization.
-        let mut cursor = Cursor::new(&payload[40..]);
+        let mut cursor = Cursor::new(&payload_data[8..]);
         let content: Content =
             match Content::deserialize(&mut cursor, &tox_proto::ToxContext::empty()) {
                 Ok(c) => c,
@@ -607,27 +849,20 @@ impl MerkleNode {
             };
 
         let consumed = cursor.position() as usize;
-        let metadata = payload[40 + consumed..].to_vec();
+        let metadata = payload_data[8 + consumed..].to_vec();
 
-        tracing::debug!("Unpacked node fields:");
-        tracing::debug!("  sender_pk: {}", hex::encode(sender_pk.as_bytes()));
-        tracing::debug!("  seq_num: {}", sequence_number);
-        tracing::debug!("  content: {:?}", content);
-        tracing::debug!("  metadata len: {}", metadata.len());
-
-        let node = MerkleNode {
+        Ok(MerkleNode {
             parents: wire.parents.clone(),
-            author_pk: wire.author_pk,
+            author_pk,
             sender_pk,
             sequence_number,
             topological_rank: wire.topological_rank,
-            network_timestamp: wire.network_timestamp,
+            network_timestamp,
             content,
             metadata,
             authentication: wire.authentication.clone(),
-        };
-
-        Ok(node)
+            pow_nonce: 0,
+        })
     }
 }
 

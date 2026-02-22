@@ -17,7 +17,7 @@ fn test_pack_index_build_lookup() {
         payload_length: 60,
         node_type: 2,
         status: 1,
-        flags: 0,
+        admin_distance: 0,
     });
     records.push(IndexRecord {
         hash: h1,
@@ -26,7 +26,7 @@ fn test_pack_index_build_lookup() {
         payload_length: 50,
         node_type: 1,
         status: 1,
-        flags: 0,
+        admin_distance: 0,
     });
     records.push(IndexRecord {
         hash: h3,
@@ -35,7 +35,7 @@ fn test_pack_index_build_lookup() {
         payload_length: 70,
         node_type: 2,
         status: 1,
-        flags: 0,
+        admin_distance: 0,
     });
 
     let index = PackIndex::build(records, 8, 2);
@@ -76,7 +76,7 @@ fn test_pack_index_save_load() {
             payload_length: 100,
             node_type: 1,
             status: 1,
-            flags: 0,
+            admin_distance: 0,
         },
         IndexRecord {
             hash: h2,
@@ -85,7 +85,7 @@ fn test_pack_index_save_load() {
             payload_length: 200,
             node_type: 2,
             status: 1,
-            flags: 0,
+            admin_distance: 0,
         },
     ];
 

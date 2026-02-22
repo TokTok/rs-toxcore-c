@@ -1,7 +1,7 @@
 use merkle_tox_core::cas::{BlobInfo, BlobStatus, CHUNK_SIZE};
 use merkle_tox_core::dag::{
-    ChainKey, Content, ConversationId, KConv, LogicalIdentityPk, MerkleNode, NodeAuth, NodeHash,
-    NodeMac, NodeType, PhysicalDevicePk, WireFlags, WireNode,
+    ChainKey, Content, ConversationId, Ed25519Signature, KConv, LogicalIdentityPk, MerkleNode,
+    NodeAuth, NodeHash, NodeType, PhysicalDevicePk, WireFlags, WireNode,
 };
 use merkle_tox_core::sync::SyncRange;
 use merkle_tox_core::testing::{ManagedStore, delegate_store};
@@ -58,7 +58,6 @@ enum LogicalOp {
         node_idx: usize,
     },
     PutSketch {
-        epoch: u64,
         min_rank: u64,
         max_rank: u64,
         sketch: Vec<u8>,
@@ -128,7 +127,7 @@ fn any_logical_op(weights: SwarmWeights) -> impl Strategy<Value = LogicalOp> {
                 epoch_id,
             }),
             (0..100usize).prop_map(|node_idx| LogicalOp::RemoveRatchetKey { node_idx }),
-            (any::<u64>(), any::<u64>(), any::<u64>(), prop::collection::vec(any::<u8>(), 1..64)).prop_map(|(epoch, min_rank, max_rank, sketch)| LogicalOp::PutSketch { epoch, min_rank, max_rank, sketch }),
+            (any::<u64>(), any::<u64>(), prop::collection::vec(any::<u8>(), 1..64)).prop_map(|(min_rank, max_rank, sketch)| LogicalOp::PutSketch { min_rank, max_rank, sketch }),
             (0..5usize, any::<u32>(), any::<i64>()).prop_map(
                 |(conv_idx, count, time)| LogicalOp::UpdateMeta { conv_idx, count, time }
             ),
@@ -292,12 +291,12 @@ impl StoreTester {
                 fill_random(&mut payload, &mut self.rng);
                 let wire = WireNode {
                     parents: vec![],
-                    author_pk: LogicalIdentityPk::from([0u8; 32]),
-                    encrypted_payload: payload,
+                    sender_hint: [0u8; 4],
+                    encrypted_routing: vec![0u8; 40],
+                    payload_data: payload,
                     topological_rank: 0,
-                    network_timestamp: 0,
                     flags: WireFlags::NONE,
-                    authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+                    authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
                 };
                 for store in &self.stores {
                     let _ = store.put_wire_node(&cid, &hash, wire.clone());
@@ -339,18 +338,13 @@ impl StoreTester {
                 }
             }
             LogicalOp::PutSketch {
-                epoch,
                 min_rank,
                 max_rank,
                 sketch,
             } => {
                 let c_idx = step % self.conv_ids.len();
                 let cid = self.conv_ids[c_idx];
-                let range = SyncRange {
-                    epoch,
-                    min_rank,
-                    max_rank,
-                };
+                let range = SyncRange { min_rank, max_rank };
                 for store in &self.stores {
                     let _ = store.put_sketch(&cid, &range, &sketch);
                 }
@@ -387,6 +381,7 @@ impl StoreTester {
                     bao_root: None,
                     status: BlobStatus::Pending,
                     received_mask: None,
+                    decryption_key: None,
                 };
                 let mut all_ok = true;
                 for store in &self.stores {
@@ -462,7 +457,8 @@ impl StoreTester {
             network_timestamp: 1000 + step as i64,
             content: Content::Text(format!("Node {}", step)),
             metadata: vec![],
-            authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+            authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+            pow_nonce: 0,
         }
     }
 
@@ -730,7 +726,6 @@ impl StoreTester {
                 let r1 = all_nodes[step % all_nodes.len()].topological_rank;
                 let r2 = all_nodes[(step / 2) % all_nodes.len()].topological_rank;
                 let range = SyncRange {
-                    epoch: 0,
                     min_rank: r1.min(r2),
                     max_rank: r1.max(r2),
                 };

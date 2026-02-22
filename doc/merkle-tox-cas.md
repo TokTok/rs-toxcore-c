@@ -2,26 +2,24 @@
 
 ## Overview
 
-Content-Addressable Storage (CAS) handles large binary assets (images, videos,
-files) that are too large to be embedded directly in a Merkle node. Blobs are
-identified by their **Blake3** hash and synchronized lazily.
+Content-Addressable Storage (CAS) handles binary assets too large for direct
+embedding in a Merkle node. Blobs are identified by their **Bao root hash** and
+synchronized lazily.
 
 ## 1. Storage Strategy
 
--   **Deduplication**: Since blobs are keyed by their hash, multiple references
-    to the same file across different conversations only result in a single copy
-    on disk.
--   **SQLite Index**: The `cas_blobs` table tracks the status of each blob
-    (Pending, Downloading, Available) and its location (In-DB vs On-Disk).
+-   **Deduplication**: Blobs are keyed by their hash. Multiple references to the
+    same file result in a single copy on disk.
+-   **SQLite Index**: The `cas_blobs` table tracks status (Pending, Downloading,
+    Available) and location (In-DB vs On-Disk).
 
 ## 2. Blob Synchronization Protocol
 
-Unlike Merkle nodes, which are small and synced immediately, blobs are synced
-**lazily** and via a **Multi-Source Swarm Protocol**.
+Blobs sync lazily via a **Multi-Source Swarm Protocol**.
 
 ### `BLOB_QUERY` (Message Type 0x06)
 
-Used to check if a peer has a specific blob.
+Checks if a peer has a specific blob.
 
 -   Peer A sends `BLOB_QUERY(hash)`.
 -   Peer B responds with `BLOB_AVAIL(hash, size, bao_root)` if they have it.
@@ -39,36 +37,31 @@ Used to check if a peer has a specific blob.
 Peer B confirms possession and provides:
 
 -   `size`: Total size in bytes.
--   `bao_root`: (Optional) The Blake3-Merkle root of the Bao-style internal
-    tree, allowing for incremental verification of chunks.
-    -   **Security Rule (Anti-Download Bombing)**: If a peer provides a
-        `bao_root`, the client MUST strictly verify that it is **byte-for-byte
-        identical** to the authoritative `hash` from the verified `MerkleNode`
-        before initiating any `BLOB_REQ` downloads. (Because Blake3 natively
-        structures its hash as a Merkle tree, the root of the Bao outboard is
-        exactly equal to the final Blake3 hash of the file). If a peer provides
-        a mismatching root, they are attempting to stream a fake file and MUST
+-   `bao_root`: The Bao root hash for incremental verification of chunks.
+    -   **Security Rule (Anti-Download Bombing)**: The client MUST verify the
+        peer's `bao_root` is **byte-for-byte identical** to the authoritative
+        `hash` from the verified `MerkleNode` before initiating `BLOB_REQ`
+        downloads. `Blob.hash` in the DAG is the Bao root hash (distinct from
+        `blake3::hash()` due to tree construction), ensuring incremental
+        verification of every 64KB chunk. Peers providing mismatching roots MUST
         be immediately blacklisted.
 
 ### `BLOB_REQ` (Message Type 0x08)
 
 Requests a specific slice of the file.
 
--   `hash`: Blake3 of the full blob.
+-   `bao_root`: The Bao root hash of the blob (from the DAG).
 -   `offset`: Starting byte.
 -   `length`: Requested size (typically 64KB).
 
 ### `BLOB_DATA` (Message Type 0x09)
 
-Carries the payload of the requested chunk plus the **Bao proof** (the
-intermediate hashes from the outboard) needed to verify the chunk against the
-`bao_root`.
+Carries the requested chunk payload plus the **Bao proof** (intermediate hashes
+from the outboard) needed to verify the chunk against the `bao_root`.
 
 ## 3. Swarm Sync & Chunk Aggregation
 
-To maximize download speed, especially when joining a large group:
-
--   **Discovery**: Peer A queries all connected members of a conversation using
+-   **Discovery**: Peer A queries connected conversation members using
     `BLOB_QUERY`.
 -   **Aggregation**: Peer A maintains a "Wanted Chunks" bitmask. It sends
     requests for different chunks to different peers simultaneously (e.g., Chunk
@@ -82,26 +75,21 @@ To maximize download speed, especially when joining a large group:
 
 ## 4. Streaming & Direct-to-Disk I/O
 
-To support large files (e.g., 1GB+) without high memory usage:
-
--   **Chunked Reassembly**: The `merkle-tox-sqlite` layer provides a streaming
-    writer with random-access support for non-sequential chunk arrival.
--   As `tox-sequenced` completes the reassembly of a 64KB `BLOB_DATA` message,
-    the logic layer validates the Bao proof and writes it directly to the
-    correct offset in the temporary file in the `vault/`.
--   **In-DB Optimization**: Small blobs are stored directly in SQLite for
-    performance. See **`merkle-tox-persistence.md`** for details.
--   **Finalization**: Once all chunks are received and verified, the file is
-    marked "Available". The full-file Blake3 hash is computed as a final
-    integrity check.
+-   **Chunked Reassembly**: `merkle-tox-sqlite` provides a streaming writer with
+    random-access support for non-sequential chunks.
+-   Upon `BLOB_DATA` reassembly, the logic layer validates the Bao proof and
+    writes directly to the file offset.
+-   **In-DB Optimization**: Small blobs are stored directly in SQLite. See
+    **`merkle-tox-persistence.md`**.
+-   **Finalization**: Once all chunks are Bao-verified, the file is marked
+    "Available". No additional full-file hash check is needed.
 
 ## 5. Privacy & Selective Downloading
 
--   Clients do not automatically download every blob they see in the history.
+-   Clients do not automatically download every blob.
 -   **Thumbnails**: For images, a small (`MAX_THUMBNAIL_SIZE = 32768` bytes)
-    thumbnail can be embedded in the `MerkleNode`'s `metadata` or as a separate
-    small blob that *is* auto-downloaded.
--   **User-Initiated**: Large blobs are only downloaded when the user interacts
-    with the message (e.g., clicking "Download Image").
--   **Status Tracking**: The UI uses the blob status (**Pending, Downloading,
-    Available, Error**) to display appropriate progress bars or retry buttons.
+    thumbnail can be embedded in `MerkleNode` `metadata` or as a separate
+    auto-downloaded small blob.
+-   **User-Initiated**: Large blobs are downloaded upon user interaction.
+-   **Status Tracking**: UI uses blob status (**Pending, Downloading, Available,
+    Error**) for rendering.

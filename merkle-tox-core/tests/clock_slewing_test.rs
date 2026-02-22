@@ -146,15 +146,21 @@ fn test_clock_hard_jump() {
     clock.update_peer_offset(peer, 0);
     assert_eq!(clock.consensus_offset(), 0);
 
-    // 11 minutes offset (exceeds 10 min threshold)
+    // 11 minutes offset (exceeds 10 min threshold before clamp).
+    // The ±5min consensus clamp caps this to 300,000ms.
     let large_offset = 11 * 60 * 1000;
     clock.update_peer_offset(peer, large_offset);
 
-    // Should jump immediately because it exceeds threshold
-    assert_eq!(clock.consensus_offset(), large_offset);
+    // Target is clamped to 300,000ms (5 minutes).
+    // Initial jump applies since single identity (peer_offsets.len() == 1).
+    assert_eq!(clock.consensus_offset(), 300_000);
+    assert_eq!(clock.consensus_target_offset(), 300_000);
 
     let t1 = clock.network_time_ms();
-    assert!(t1 >= 1000000 + large_offset);
+    assert!(
+        t1 >= 1000000 + 300_000,
+        "Network time should reflect clamped offset"
+    );
 }
 
 // end of file

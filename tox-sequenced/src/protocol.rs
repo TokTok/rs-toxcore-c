@@ -196,8 +196,12 @@ pub enum MessageType {
     SyncReconFail = 0x0B,
     SyncShardChecksums = 0x0C,
     HandshakeError = 0x0D,
-    ReconPowChallenge = 0x0E,
-    ReconPowSolution = 0x0F,
+    SyncRateLimited = 0x0E,
+    KeywrapAck = 0x0F,
+    ReinclusionRequest = 0x10,
+    ReinclusionResponse = 0x11,
+    ReconPowChallenge = 0x12,
+    ReconPowSolution = 0x13,
 }
 
 impl MessageType {
@@ -208,12 +212,14 @@ impl MessageType {
             MessageType::SyncSketch
             | MessageType::SyncReconFail
             | MessageType::SyncShardChecksums
+            | MessageType::SyncRateLimited
             | MessageType::ReconPowChallenge
             | MessageType::ReconPowSolution => Priority::High,
-            MessageType::HandshakeError => Priority::High,
+            MessageType::HandshakeError | MessageType::KeywrapAck => Priority::High,
             MessageType::MerkleNode => Priority::Standard,
             MessageType::BlobQuery | MessageType::BlobAvail | MessageType::BlobReq => Priority::Low,
             MessageType::BlobData => Priority::Bulk,
+            MessageType::ReinclusionRequest | MessageType::ReinclusionResponse => Priority::High,
         }
     }
 }

@@ -53,10 +53,10 @@ fn test_opaque_anchor_preservation() {
     // 1. Put an Admin node (Anchor) in the first segment
     let admin_wire = WireNode {
         parents: vec![],
-        author_pk: merkle_tox_core::dag::LogicalIdentityPk::from([0u8; 32]),
-        encrypted_payload: vec![0x80], // Padded empty
+        sender_hint: [0u8; 4],
+        encrypted_routing: vec![0u8; 40],
+        payload_data: vec![0x80], // Padded empty
         topological_rank: 0,
-        network_timestamp: 0,
         flags: WireFlags::NONE,
         authentication: NodeAuth::Signature(merkle_tox_core::dag::Ed25519Signature::from(
             [1u8; 64],

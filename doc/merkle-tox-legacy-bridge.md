@@ -2,20 +2,20 @@
 
 ## Overview
 
-The Legacy Bridge enables synchronization of history from standard Tox (legacy)
-1:1 and Group chats into the Merkle-Tox DAG. It ensures that users in a
-multi-device setup maintain a consistent, persistent history even when
-interacting with peers who have not yet upgraded to Merkle-Tox.
+The Legacy Bridge synchronizes history from standard Tox (legacy) 1:1 and Group
+chats into the Merkle-Tox DAG, ensuring users in a multi-device setup maintain
+consistent history when interacting with peers using legacy clients.
 
 ## 1. Content Definition
 
 Legacy messages are wrapped in a `MerkleNode` using the `Content::LegacyBridge`
-variant (**ID 9**). To maintain **Principle #1 (Deniability)**, these nodes use
-a **Symmetric MAC** for authentication, exactly like native content nodes.
+variant (**ID 11**). To maintain **Principle #1 (Deniability)**, these nodes use
+an **Ephemeral Signature** for authentication, exactly like native content
+nodes.
 
 *   **Bridging Identity**: The signature of the bridging event belongs to the
-    **bridging device** (via its participation in the DARE MAC chain), but is
-    cryptographically deniable to third parties.
+    **bridging device** (via its ephemeral signing key), and is
+    cryptographically deniable after epoch rotation (key disclosure).
 *   **Privacy**: Although the `source_pk` is stored in the payload, it remains
     **encrypted at rest** and **blinded on the wire** (Principle #2), as it is
     contained within the encrypted `WireNode` payload.
@@ -23,7 +23,7 @@ a **Symmetric MAC** for authentication, exactly like native content nodes.
 ```rust
 pub enum Content {
     // ...
-    /// ID 9: Bridged from legacy Tox transport.
+    /// ID 11: Bridged from legacy Tox transport.
     LegacyBridge {
         /// The original stable Tox Public Key of the legacy sender.
         source_pk: PublicKey,
@@ -61,12 +61,12 @@ automatically synchronize their witnessed history into the same DAG.
 ## 2. Deterministic Deduplication
 
 In a multi-device setup, multiple devices may receive the same legacy message
-(specifically in legacy Group Chats/Conferences). To prevent flooding the DAG
-with redundant nodes, devices use a deterministic `dedup_id`.
+(specifically in legacy Group Chats/Conferences). Devices use a deterministic
+`dedup_id` to prevent flooding the DAG with redundant nodes.
 
 ### The Dedup Hash
 
-The `dedup_id` is calculated using the following fields, serialized in their
+The `dedup_id` is calculated using **content-only** fields, serialized in their
 canonical `ToxProto` binary format in order:
 
 1.  **Conversation ID** (32 bytes).
@@ -74,34 +74,34 @@ canonical `ToxProto` binary format in order:
 3.  **Text Length** (u32-BE).
 4.  **Text** (UTF-8 bytes).
 5.  **Message Type** (u8).
-6.  **Windowed Network Time** (u64-BE): The current **Merkle-Tox Network Time**
-    rounded to a 10-second window.
 
 ```rust
-// Rounding to 10s buckets accounts for network jitter and minor clock skew.
-let window_bucket = network_time_ms / 10_000;
-let dedup_id = blake3::hash(conversation_id + source_pk + text + message_type + window_bucket);
+let dedup_id = blake3::hash(conversation_id + source_pk + text + message_type);
 ```
 
-### 2.1 Bucket Boundary Races
+**No time component is included.** Legacy Tox messages lack timestamps, so any
+time value would be the receiver's subjective network time at the moment of
+arrival. Because network latency and bridging delays vary across devices, two
+devices routinely receive the same message seconds or minutes apart. Any
+time-bucketing scheme produces different `dedup_id`s, breaking deterministic
+deduplication.
 
-If a message is received by two devices right at the edge of a 10-second bucket
-(e.g., Device A at 09:999 and Device B at 10:001), they will generate different
-`dedup_id`s.
+### 2.1 Content Collisions (Known Limitation)
 
-*   **Safe Failure**: This results in a duplicate message appearing in the UI. A
-    10-second window is chosen to balance **Collision Risk** (identical messages
-    from the same user) against **Skew Tolerance** (disagreement on the bucket).
-*   **Fuzzy UI Matching**: To further mitigate bucket splits, UIs SHOULD perform
-    fuzzy deduplication during display. If two `LegacyBridge` nodes from the
-    same `source_pk` have identical `text` and their timestamps are within **±12
-    seconds**, the UI should treat them as duplicates and only display one.
+If a sender transmits multiple messages with identical content and type (e.g.,
+"ok" sent twice five minutes apart), they produce the same `dedup_id`. Only the
+first is recorded; subsequent identical messages from the same sender are
+treated as duplicates.
 
-### 2.2 Content Collisions
-
-If a sender transmits multiple messages with identical content and type within
-the same 10-second window, the bridge will treat them as duplicates and only
-record the first one.
+*   **Scope**: This limitation affects only `LegacyBridge` nodes. Native
+    Merkle-Tox messages have proper sequence numbers and are not affected.
+*   **Practical Impact**: Legacy Tox itself provides no way to distinguish two
+    identical messages from the same sender: there is no message ID or sequence
+    number in the legacy protocol. The collapsed duplicates were
+    indistinguishable at the transport level to begin with.
+*   **Mitigation**: Senders who need to repeat identical content can append a
+    distinguishing character or rely on native Merkle-Tox messaging where
+    sequence numbers ensure uniqueness.
 
 ## 3. The Notary Workflow
 
@@ -109,8 +109,8 @@ The client acts as a "Notary" for legacy events, promoting them from the
 ephemeral legacy transport into the persistent Merkle DAG.
 
 1.  **Intercept**: A legacy message is received by the Tox transport layer.
-2.  **Calculate**: The client generates the `dedup_id` using the current
-    consensus network time.
+2.  **Calculate**: The client generates the `dedup_id` from the message content
+    (see §2, The Dedup Hash).
 3.  **Pre-emptive Check**: The client queries the local `NodeStore` for any
     existing `LegacyBridge` node containing this `dedup_id`.
 4.  **Author**:
@@ -125,7 +125,7 @@ If two devices are partitioned or sync is delayed, they may both author a
 `LegacyBridge` node for the same legacy event before seeing each other's work.
 
 *   **DAG Structure**: The DAG will temporarily contain two distinct nodes with
-    the same `dedup_id`. This is topologically valid.
+    the same `dedup_id` (topologically valid).
 *   **UI Projection**: The materialized view (`ChatState`) MUST track processed
     `dedup_id`s for the current session. It displays only the first node
     encountered for a specific `dedup_id` and suppresses subsequent "witnesses."
@@ -134,7 +134,8 @@ If two devices are partitioned or sync is delayed, they may both author a
 
 ### Verification
 
-A `LegacyBridge` node is authenticated via MAC by the **bridging device**.
+A `LegacyBridge` node is authenticated via **Ephemeral Signature** by the
+**bridging device**.
 
 *   **`MerkleNode.author_pk`**: The Logical Identity of the user who bridged the
     message.
@@ -147,7 +148,7 @@ Members of a conversation trust `LegacyBridge` nodes because the bridging author
 is a **verified member** of the Merkle-Tox room.
 
 *   **Collective Witnessing**: In groups, multiple members may bridge the same
-    legacy message. This creates a distributed "notary" record. UIs MAY use the
+    legacy message, creating a distributed "notary" record. UIs MAY use the
     count of distinct witnesses to indicate the "veracity" of a bridged event.
 
 ### UI Representation & Identity
@@ -176,7 +177,7 @@ To ensure the user's other devices see messages they send via legacy clients:
         originating device updates the node's status to `Sent`.
 *   **Legacy-Only Clients**: If a user sends a message from a legacy client
     (e.g., uTox) to a Merkle-Tox-capable recipient, the recipient's bridge node
-    will sync back to the user's other Merkle-Tox devices. This provides a
+    will sync back to the user's other Merkle-Tox devices, providing a
     "best-effort" history sync even for software that has not been upgraded.
 
 ## 7. Advanced Bridging Features
@@ -204,9 +205,8 @@ protocol, they can be "upgraded" upon completion:
 *   **Promotion**: If a legacy file transfer completes successfully on a
     bridging device, that device SHOULD author a standard `Content::Blob` node
     referencing the file's hash in its local CAS store.
-*   **Swarm Availability**: This allows the user's other devices to download the
-    file using the native Merkle-Tox CAS protocol, even though it was originally
-    received via legacy Tox.
+*   **Swarm Availability**: This allows other devices to download the file via
+    the CAS protocol.
 
 ## 8. Limitations & Exclusions
 
@@ -218,8 +218,7 @@ protocol, they can be "upgraded" upon completion:
 
 ### Exclusions (Not Bridged)
 
-To maintain DAG performance and avoid complexity, the following legacy events
-are **NOT** bridged into the Merkle DAG:
+The following legacy events are **NOT** bridged:
 
 *   **Typing Indicators**: Ephemeral and high-frequency.
 *   **Read Receipts**: Handled natively by Merkle-Tox for native messages.

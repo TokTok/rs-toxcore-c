@@ -7,10 +7,12 @@ use merkle_tox_core::engine::{
     Conversation, ConversationData, MerkleToxEngine, VerificationStatus, conversation,
 };
 use merkle_tox_core::sync::NodeStore;
-use merkle_tox_core::testing::{InMemoryStore, apply_effects, create_signed_content_node};
+use merkle_tox_core::testing::{
+    InMemoryStore, apply_effects, create_signed_content_node, register_test_ephemeral_key,
+};
 use rand::{SeedableRng, rngs::StdRng};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[test]
 fn test_quarantine_future_node() {
@@ -23,7 +25,7 @@ fn test_quarantine_future_node() {
         self_pk,
         self_sk,
         StdRng::seed_from_u64(0),
-        tp,
+        tp.clone(),
     );
     let store = InMemoryStore::new();
     let conv_id = ConversationId::from([0xAAu8; 32]);
@@ -42,9 +44,13 @@ fn test_quarantine_future_node() {
         )),
     );
 
+    // Register the test ephemeral signing key so DARE verification succeeds
+    let conv_keys = ConversationKeys::derive(&k_conv);
+    register_test_ephemeral_key(&mut engine, &conv_keys, &self_device_pk);
+
     let now_ms = engine.clock.network_time_ms();
 
-    // Create a node 25 minutes in the future
+    // Create a node 14 minutes in the future (> 10min quarantine threshold).
     let future_node = create_signed_content_node(
         &conv_id,
         &ConversationKeys::derive(&k_conv),
@@ -54,7 +60,7 @@ fn test_quarantine_future_node() {
         Content::Text("Future".to_string()),
         0,
         1,
-        now_ms + 25 * 60 * 1000,
+        now_ms + 14 * 60 * 1000,
     );
 
     let effects = engine
@@ -72,20 +78,17 @@ fn test_quarantine_future_node() {
         "Future node should be quarantined (speculative)"
     );
 
-    // Advance clock by 10 minutes (not enough, threshold is 10 mins)
-    engine
-        .clock
-        .update_peer_offset(PhysicalDevicePk::from([2u8; 32]), 10 * 60 * 1000);
+    // Advance wall clock by 2 minutes (not enough: node is 14min ahead, need > 4min)
+    tp.advance(Duration::from_millis(2 * 60 * 1000));
     let reverified = engine.reverify_speculative_for_conversation(conv_id, &store);
     assert!(
         !merkle_tox_core::testing::has_verified_in_effects(&reverified),
         "Node should still be quarantined"
     );
 
-    // Advance clock by another 15 minutes (total 25 mins, enough)
-    engine
-        .clock
-        .update_peer_offset(PhysicalDevicePk::from([2u8; 32]), 25 * 60 * 1000);
+    // Advance wall clock by another 3 minutes (total 5min). Node is 14min ahead,
+    // now = now+5min, so node is 9min ahead: within the 10min quarantine threshold.
+    tp.advance(Duration::from_millis(3 * 60 * 1000));
     let reverified = engine.reverify_speculative_for_conversation(conv_id, &store);
     assert!(
         merkle_tox_core::testing::has_verified_in_effects(&reverified),
@@ -140,7 +143,8 @@ fn test_quarantine_earlier_than_parent() {
         .unwrap();
     apply_effects(effects, &store);
 
-    // Child with timestamp EARLIER than parent
+    // Child with timestamp more than 10 minutes earlier than parent
+    // Spec: quarantine if ts < oldest_parent_ts - 10min (600_000ms)
     let child = create_signed_content_node(
         &conv_id,
         &keys,
@@ -150,7 +154,7 @@ fn test_quarantine_earlier_than_parent() {
         Content::Text("Child".to_string()),
         1,
         2,
-        5000, // < 10000
+        10000 - 600_001, // just beyond the 10-minute tolerance
     );
 
     let effects = engine
@@ -165,6 +169,6 @@ fn test_quarantine_earlier_than_parent() {
     assert_eq!(
         status,
         VerificationStatus::Speculative,
-        "Child node earlier than parent should be quarantined"
+        "Child node >10min earlier than parent should be quarantined"
     );
 }

@@ -1,21 +1,22 @@
-use merkle_tox_core::crypto::ConversationKeys;
+use merkle_tox_core::crypto::{ConversationKeys, PackKeys};
 use merkle_tox_core::dag::{
     Content, ConversationId, KConv, LogicalIdentityPk, MerkleNode, PhysicalDevicePk,
 };
-use merkle_tox_core::testing::create_signed_content_node;
+use merkle_tox_core::testing::{create_signed_content_node, test_pack_content_keys};
 
 #[test]
 fn test_metadata_padding_uniformity() {
     let k_conv = KConv::from([0x42u8; 32]);
     let keys = ConversationKeys::derive(&k_conv);
     let conv_id = ConversationId::from([0xEEu8; 32]);
+    let sender_pk = PhysicalDevicePk::from([1u8; 32]);
 
     // Scenario: Small message vs Larger message
     let node_small = create_signed_content_node(
         &conv_id,
         &keys,
         LogicalIdentityPk::from([1u8; 32]),
-        PhysicalDevicePk::from([1u8; 32]),
+        sender_pk,
         vec![],
         Content::Text("Hi".to_string()),
         0,
@@ -27,7 +28,7 @@ fn test_metadata_padding_uniformity() {
         &conv_id,
         &keys,
         LogicalIdentityPk::from([1u8; 32]),
-        PhysicalDevicePk::from([1u8; 32]),
+        sender_pk,
         vec![],
         Content::Text(
             "This is a much longer message that still fits in the same padding bin".to_string(),
@@ -37,18 +38,27 @@ fn test_metadata_padding_uniformity() {
         1001,
     );
 
-    let wire_small = node_small.pack_wire(&keys, false).unwrap();
-    let wire_larger = node_larger.pack_wire(&keys, false).unwrap();
+    let ck_small = test_pack_content_keys(&keys, &sender_pk, 1);
+    let ck_larger = test_pack_content_keys(&keys, &sender_pk, 2);
 
-    // Verify both are padded to the same bin (e.g. 128 bytes)
-    // The encrypted_payload contains [sender_pk(32), seq(8), content, metadata, padding]
+    let wire_small = node_small
+        .pack_wire(&PackKeys::Content(ck_small), false)
+        .unwrap();
+    let wire_larger = node_larger
+        .pack_wire(&PackKeys::Content(ck_larger), false)
+        .unwrap();
+
+    // Verify both are padded to the same bin.
+    // payload_data contains [nonce(12) || encrypted(padded_payload)]
+    // The padded_payload part should be the same size for both.
     assert_eq!(
-        wire_small.encrypted_payload.len(),
-        wire_larger.encrypted_payload.len()
+        wire_small.payload_data.len(),
+        wire_larger.payload_data.len()
     );
+    // 12 bytes nonce + MIN_PADDING_BIN bytes encrypted payload
     assert_eq!(
-        wire_small.encrypted_payload.len(),
-        tox_proto::constants::MIN_PADDING_BIN
+        wire_small.payload_data.len(),
+        12 + tox_proto::constants::MIN_PADDING_BIN
     );
 }
 
@@ -57,12 +67,14 @@ fn test_padding_malleability_attack() {
     let k_conv = KConv::from([0x42u8; 32]);
     let keys = ConversationKeys::derive(&k_conv);
     let conv_id = ConversationId::from([0xEEu8; 32]);
+    let sender_pk = PhysicalDevicePk::from([1u8; 32]);
+    let author_pk = LogicalIdentityPk::from([1u8; 32]);
 
     let node = create_signed_content_node(
         &conv_id,
         &keys,
-        LogicalIdentityPk::from([1u8; 32]),
-        PhysicalDevicePk::from([1u8; 32]),
+        author_pk,
+        sender_pk,
         vec![],
         Content::Text("Authentic".to_string()),
         0,
@@ -70,25 +82,23 @@ fn test_padding_malleability_attack() {
         1000,
     );
 
-    let mut wire = node.pack_wire(&keys, false).unwrap();
+    let ck = test_pack_content_keys(&keys, &sender_pk, 1);
+    let k_msg = ck.k_msg.clone();
+    let mut wire = node.pack_wire(&PackKeys::Content(ck), false).unwrap();
 
-    // 1. Corrupt the padding byte (0x80)
-    // We need to decrypt first because padding is INSIDE the encryption.
-    let mac = wire.authentication.mac().unwrap();
+    // The payload is: nonce(12) || ChaCha20(K_enc, nonce, padded_payload)
+    // ChaCha20 is a stream cipher, so bit-flipping works (no tag on payload).
+    // We'll flip a byte in the encrypted payload to corrupt the padding.
+    // After decryption, the padding will be invalid → unpack should fail.
 
-    let mut payload = wire.encrypted_payload.clone();
-    keys.decrypt_payload_with_mac(mac, &mut payload);
+    // 1. Corrupt a byte near the end of the payload (padding area)
+    let last = wire.payload_data.len() - 1;
+    wire.payload_data[last] ^= 0xFF;
 
-    // Find the 0x80 byte and change it
-    if let Some(pos) = payload.iter().rposition(|&x| x == 0x80) {
-        payload[pos] = 0x81;
-    }
-
-    keys.encrypt_payload_with_mac(mac, &mut payload);
-    wire.encrypted_payload = payload;
-
-    // Unpacking MUST fail
-    let res = MerkleNode::unpack_wire(&wire, &keys);
+    // Note: Since we corrupted the payload, the AEAD routing tag will no longer
+    // match (payload_hash changed), so try_decrypt_routing will fail first.
+    // Test that unpack_wire_content with the right keys but corrupted payload fails.
+    let res = MerkleNode::unpack_wire_content(&wire, sender_pk, author_pk, 1, &k_msg);
     assert!(
         matches!(
             res,
@@ -96,30 +106,19 @@ fn test_padding_malleability_attack() {
                 merkle_tox_core::dag::ValidationError::InvalidPadding(_)
             ))
         ),
-        "Unpacking with corrupted padding byte should fail with InvalidPadding"
+        "Unpacking with corrupted padding byte should fail with InvalidPadding, got: {:?}",
+        res
     );
 
-    // 2. Corrupt the trailing zeroes
-    let mut wire2 = node.pack_wire(&keys, false).unwrap();
-    let mut payload2 = wire2.encrypted_payload.clone();
-    keys.decrypt_payload_with_mac(mac, &mut payload2);
-
-    // Change the very last byte from 0x00 to 0x01
-    let last = payload2.len() - 1;
-    payload2[last] = 0x01;
-
-    keys.encrypt_payload_with_mac(mac, &mut payload2);
-    wire2.encrypted_payload = payload2;
-
-    let res2 = MerkleNode::unpack_wire(&wire2, &keys);
+    // 2. Test that routing AEAD also rejects the tampered payload
+    let sender_key = merkle_tox_core::dag::SenderKey::from(
+        *merkle_tox_core::crypto::ratchet_init_sender(&keys.k_conv, &sender_pk).as_bytes(),
+    );
+    let k_header = merkle_tox_core::crypto::derive_k_header_epoch(&keys.k_conv, &sender_key);
+    let routing_result = MerkleNode::try_decrypt_routing(&wire, &k_header);
     assert!(
-        matches!(
-            res2,
-            Err(merkle_tox_core::error::MerkleToxError::Validation(
-                merkle_tox_core::dag::ValidationError::InvalidPadding(_)
-            ))
-        ),
-        "Unpacking with corrupted trailing zeroes should fail with InvalidPadding"
+        routing_result.is_none(),
+        "AEAD routing should reject tampered payload (AAD mismatch)"
     );
 }
 
@@ -145,7 +144,8 @@ fn test_sender_pk_metadata_privacy() {
         1000,
     );
 
-    let wire_node = node.pack_wire(&keys, false).unwrap();
+    let ck = test_pack_content_keys(&keys, &sender_pk, 1);
+    let wire_node = node.pack_wire(&PackKeys::Content(ck), false).unwrap();
 
     let proto_msg = ProtocolMessage::MerkleNode {
         conversation_id: conv_id,

@@ -175,7 +175,6 @@ fn test_sync_sketch_serialization() {
         conversation_id: ConversationId::from([1u8; 32]),
         cells: cells.clone(),
         range: SyncRange {
-            epoch: 10,
             min_rank: 100,
             max_rank: 200,
         },

@@ -4,15 +4,19 @@ use crate::dag::{
 };
 use crate::error::{MerkleToxError, MerkleToxResult};
 use crate::sync::{FullStore, SyncRange};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
 /// A thread-safe in-memory store for protocol nodes and blobs.
 #[derive(Default)]
 pub struct InMemoryStore {
     pub nodes: RwLock<HashMap<NodeHash, (MerkleNode, bool)>>,
+    pub speculative_nodes: RwLock<HashSet<NodeHash>>,
+    pub opaque_nodes: RwLock<HashSet<NodeHash>>,
     pub wire_nodes: RwLock<HashMap<NodeHash, (ConversationId, crate::dag::WireNode)>>,
     pub children: RwLock<HashMap<NodeHash, Vec<NodeHash>>>,
+    pub admin_distance_cache: RwLock<HashMap<NodeHash, u64>>,
+    pub last_sequence_numbers: RwLock<HashMap<PhysicalDevicePk, u64>>,
     pub heads: RwLock<HashMap<ConversationId, Vec<NodeHash>>>,
     pub admin_heads: RwLock<HashMap<ConversationId, Vec<NodeHash>>>,
     pub blobs: RwLock<HashMap<NodeHash, (BlobInfo, Vec<u8>)>>,
@@ -43,6 +47,38 @@ impl crate::dag::NodeLookup for InMemoryStore {
             .unwrap()
             .get(hash)
             .map(|(n, _)| n.topological_rank)
+    }
+    fn get_admin_distance(&self, hash: &NodeHash) -> Option<u64> {
+        if let Some(&dist) = self.admin_distance_cache.read().unwrap().get(hash) {
+            return Some(dist);
+        }
+
+        // For testing, calculate it on the fly recursively
+        let node = self
+            .nodes
+            .read()
+            .unwrap()
+            .get(hash)
+            .map(|(n, _)| n.clone())?;
+        if node.node_type() == crate::dag::NodeType::Admin {
+            self.admin_distance_cache.write().unwrap().insert(*hash, 0);
+            return Some(0);
+        }
+        let mut min_dist = u64::MAX;
+        for parent in &node.parents {
+            if let Some(dist) = self.get_admin_distance(parent) {
+                min_dist = min_dist.min(dist);
+            }
+        }
+        let result = if min_dist == u64::MAX {
+            Some(10) // For unit tests, assume isolated nodes have a valid distance.
+        } else {
+            Some(min_dist + 1)
+        };
+        if let Some(d) = result {
+            self.admin_distance_cache.write().unwrap().insert(*hash, d);
+        }
+        result
     }
     fn contains_node(&self, hash: &NodeHash) -> bool {
         self.nodes.read().unwrap().contains_key(hash)
@@ -119,6 +155,27 @@ impl crate::sync::NodeStore for InMemoryStore {
         verified: bool,
     ) -> MerkleToxResult<()> {
         let hash = node.hash();
+
+        let mut min_dist = u64::MAX;
+        if node.node_type() == crate::dag::NodeType::Admin {
+            self.admin_distance_cache.write().unwrap().insert(hash, 0);
+        } else {
+            for parent in &node.parents {
+                if let Some(&dist) = self.admin_distance_cache.read().unwrap().get(parent) {
+                    min_dist = min_dist.min(dist);
+                }
+            }
+            let dist = if min_dist == u64::MAX {
+                10
+            } else {
+                min_dist + 1
+            };
+            self.admin_distance_cache
+                .write()
+                .unwrap()
+                .insert(hash, dist);
+        }
+
         for parent in &node.parents {
             self.children
                 .write()
@@ -127,6 +184,17 @@ impl crate::sync::NodeStore for InMemoryStore {
                 .or_default()
                 .push(hash);
         }
+        if verified {
+            self.speculative_nodes.write().unwrap().remove(&hash);
+            let mut lsn = self.last_sequence_numbers.write().unwrap();
+            let current = lsn.entry(node.sender_pk).or_insert(0);
+            if node.sequence_number > *current {
+                *current = node.sequence_number;
+            }
+        } else {
+            self.speculative_nodes.write().unwrap().insert(hash);
+        }
+        self.opaque_nodes.write().unwrap().remove(&hash);
         self.nodes.write().unwrap().insert(hash, (node, verified));
         Ok(())
     }
@@ -140,38 +208,49 @@ impl crate::sync::NodeStore for InMemoryStore {
             .write()
             .unwrap()
             .insert(*hash, (*conv_id, node));
+        if !self.nodes.read().unwrap().contains_key(hash) {
+            self.opaque_nodes.write().unwrap().insert(*hash);
+        }
         Ok(())
     }
     fn remove_wire_node(&self, _conv_id: &ConversationId, hash: &NodeHash) -> MerkleToxResult<()> {
         self.wire_nodes.write().unwrap().remove(hash);
+        self.opaque_nodes.write().unwrap().remove(hash);
         Ok(())
     }
     fn get_opaque_node_hashes(
         &self,
-        conversation_id: &ConversationId,
+        _conversation_id: &ConversationId,
     ) -> MerkleToxResult<Vec<NodeHash>> {
-        let wire_keys = self.wire_nodes.read().unwrap();
-        let nodes = self.nodes.read().unwrap();
-        Ok(wire_keys
-            .iter()
-            .filter(|(h, (cid, _))| cid == conversation_id && !nodes.contains_key(h))
-            .map(|(h, _)| *h)
-            .collect())
+        let opaque = self.opaque_nodes.read().unwrap();
+        Ok(opaque.iter().cloned().collect())
     }
 
     fn get_speculative_nodes(&self, _conv_id: &ConversationId) -> Vec<MerkleNode> {
-        self.nodes
-            .read()
-            .unwrap()
-            .values()
-            .filter(|(_, v)| !*v)
-            .map(|(n, _)| n.clone())
-            .collect()
+        let speculative = self.speculative_nodes.read().unwrap();
+        let nodes = self.nodes.read().unwrap();
+        let mut result = Vec::new();
+        for hash in speculative.iter() {
+            if let Some((node, _)) = nodes.get(hash) {
+                result.push(node.clone());
+            }
+        }
+        result
     }
     fn mark_verified(&self, _conv_id: &ConversationId, hash: &NodeHash) -> MerkleToxResult<()> {
-        if let Some((_, v)) = self.nodes.write().unwrap().get_mut(hash) {
+        let mut sender_seq = None;
+        if let Some((node, v)) = self.nodes.write().unwrap().get_mut(hash) {
             *v = true;
+            sender_seq = Some((node.sender_pk, node.sequence_number));
         }
+        if let Some((sender_pk, seq)) = sender_seq {
+            let mut lsn = self.last_sequence_numbers.write().unwrap();
+            let current = lsn.entry(sender_pk).or_insert(0);
+            if seq > *current {
+                *current = seq;
+            }
+        }
+        self.speculative_nodes.write().unwrap().remove(hash);
         Ok(())
     }
     fn get_last_sequence_number(
@@ -179,14 +258,12 @@ impl crate::sync::NodeStore for InMemoryStore {
         _conv_id: &ConversationId,
         sender_pk: &PhysicalDevicePk,
     ) -> u64 {
-        self.nodes
+        *self
+            .last_sequence_numbers
             .read()
             .unwrap()
-            .values()
-            .filter(|(n, v)| &n.sender_pk == sender_pk && *v)
-            .map(|(n, _)| n.sequence_number)
-            .max()
-            .unwrap_or(0)
+            .get(sender_pk)
+            .unwrap_or(&0)
     }
     fn get_node_counts(&self, _cid: &ConversationId) -> (usize, usize) {
         let nodes = self.nodes.read().unwrap();
@@ -444,6 +521,9 @@ macro_rules! __delegate_store {
             }
             fn get_rank(&self, hash: &$crate::dag::NodeHash) -> Option<u64> {
                 self.$field.get_rank(hash)
+            }
+            fn get_admin_distance(&self, hash: &$crate::dag::NodeHash) -> Option<u64> {
+                self.$field.get_admin_distance(hash)
             }
             fn contains_node(&self, hash: &$crate::dag::NodeHash) -> bool {
                 self.$field.contains_node(hash)

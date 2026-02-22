@@ -34,8 +34,11 @@ fn test_revalidation_preserves_history() {
     }
 
     let (verified_before, _) = store.get_node_counts(&room.conv_id);
-    // 100 messages + 1 genesis = 101 verified nodes
-    assert_eq!(verified_before, 101);
+    assert_eq!(
+        verified_before, 103,
+        "Expected 103 verified nodes, got {}",
+        verified_before
+    );
 
     // 2. Trigger re-validation by authorizing a new device
     let new_device = TestIdentity::new();
@@ -48,14 +51,15 @@ fn test_revalidation_preserves_history() {
 
     let admin_heads = store.get_admin_heads(&room.conv_id);
 
+    // Get the current node's sequence number from epoch
     let auth_node = merkle_tox_core::testing::create_admin_node(
         &room.conv_id,
         identity.master_pk,
         &identity.master_sk,
         admin_heads,
         ControlAction::AuthorizeDevice { cert },
-        1,     // topological_rank
-        200,   // sequence_number
+        2,     // topological_rank (1 was used by setup_engine)
+        2,     // sequence_number (1 was used in setup_engine)
         20000, // timestamp
     );
 
@@ -67,13 +71,14 @@ fn test_revalidation_preserves_history() {
 
     let (verified_after, _) = store.get_node_counts(&room.conv_id);
 
-    // This assertion is EXPECTED to FAIL if the bug exists.
-    // History should be preserved, so verified nodes should be 101 + 1 = 102.
+    // History should be preserved, so verified nodes should be 103 + 1 = 104.
     // If bug 1 exists, it will be much lower (~66).
     assert_eq!(
-        verified_after, 102,
+        verified_after,
+        verified_before + 1,
         "History was purged during re-validation! Before: {}, After: {}",
-        verified_before, verified_after
+        verified_before,
+        verified_after
     );
 }
 
@@ -151,6 +156,13 @@ fn test_historical_authorization_verification() {
     engine
         .load_conversation_state(room.conv_id, &store)
         .unwrap();
+
+    // Register the historical device's ephemeral key so its content nodes can be verified
+    merkle_tox_core::testing::register_test_ephemeral_key(
+        &mut engine,
+        &room.keys,
+        &historical_device.device_pk,
+    );
 
     // 3. Process the historical auth node.
     let res = engine.handle_node(room.conv_id, auth_node, &store, None);

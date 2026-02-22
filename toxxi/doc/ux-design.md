@@ -1,20 +1,20 @@
 # Toxxi UX Design Specification
 
 ## 1. Introduction
-Toxxi is a modern, high-performance TUI (Terminal User Interface) chat client for the Tox protocol, written in Rust. This document outlines the user experience (UX) and user interface (UI) design principles, layout structures, and interaction models that define the application.
+Toxxi is a TUI chat client for the Tox protocol, written in Rust. This document outlines the UX and UI design principles, layout structures, and interaction models.
 
-The primary goal of Toxxi is to provide a "power-user" experience that is fast, discoverable, and aesthetically modern, while remaining functional over SSH and across different operating systems (Linux, macOS). It prioritizes keyboard-driven navigation, low latency, and a high-information-density display.
+Toxxi aims for a "power-user" experience that is fast, discoverable, and aesthetically modern. It prioritizes keyboard-driven navigation, low latency, and a high-information-density display, remaining functional over SSH across Linux and macOS.
 
 ---
 
 ## 2. Global Layout Structure
-Toxxi uses a multi-pane layout to maximize screen real estate and provide immediate access to information. The layout is managed by a flexible grid system that can adapt to varying terminal sizes.
+Toxxi uses a multi-pane layout managed by a flexible grid system adapting to varying terminal sizes.
 
 ### 2.1 Pane Overview
-1.  **Sidebar (Left):** Context navigation (Friends, Groups, Conferences). Fixed width by default (e.g., 25 chars), but toggleable or resizable.
-2.  **Main Content (Center):** The active conversation, game, or file manager. This is the primary focal point.
-3.  **Info Pane (Right - Optional):** Metadata about the current context (Profile info, member list, shared files).
-4.  **Input Area (Bottom-Center):** The framed, dynamic text entry box that grows vertically.
+1.  **Sidebar (Left):** Context navigation (Friends, Groups, Conferences). Fixed width by default (e.g., 25 chars), toggleable or resizable.
+2.  **Main Content (Center):** Active conversation, game, or file manager.
+3.  **Info Pane (Right - Optional):** Metadata about current context (Profile info, member list, shared files).
+4.  **Input Area (Bottom-Center):** Framed, dynamic text entry box that grows vertically.
 5.  **Status Bar (Bottom-Global):** System-wide status, notifications, and connectivity health.
 
 ### 2.2 Responsive Layout Logic
@@ -52,7 +52,7 @@ The UI adaptively changes based on the terminal width (`W`) and height (`H`):
 ## 3. Navigation: The Sidebar and Quick Switcher
 
 ### 3.1 The Sidebar Structure
-The Sidebar is organized into logical sections. Each section can be collapsed using the arrow keys or specific shortcuts. Conversations are identified by a `ConversationId` (see [doc/merkle-tox-dag.md](../../doc/merkle-tox-dag.md)).
+Sidebar sections can be collapsed using arrow keys or shortcuts. Conversations are identified by `ConversationId` (see [doc/merkle-tox-dag.md](../../doc/merkle-tox-dag.md)).
 
 *   **[F] Friends (1:1)**
     *   `● Alice` (Online, Green)
@@ -66,16 +66,16 @@ The Sidebar is organized into logical sections. Each section can be collapsed us
     *   `& Old-School-Tox`
 
 ### 3.2 The Quick Switcher (Ctrl+P)
-The Quick Switcher is a fuzzy-find modal that allows for instantaneous context switching without leaving the keyboard's home row.
+Quick Switcher is a fuzzy-find modal for instantaneous context switching.
 
 #### 3.2.1 Search Logic
-Using a weighted fuzzy-matching algorithm (like `fzf`'s Smith-Waterman variant):
+Uses a weighted fuzzy-matching algorithm (like `fzf`'s Smith-Waterman variant):
 *   **Exact Matches:** Boosted to the top.
 *   **Prefix Matches:** High priority.
 *   **Acronym Matches:** (e.g., `rd` matches `Rust-Devs`) Medium priority.
 
 #### 3.2.2 Action Prefixes
-The switcher is not just for navigation; it can also trigger actions:
+Switcher triggers actions:
 *   `f: <name>`: Filter for friends only.
 *   `g: <name>`: Filter for groups only.
 *   `h: <text>`: Search message history globally. Selecting a result jumps to that conversation and scrolls to the message.
@@ -86,7 +86,7 @@ The switcher is not just for navigation; it can also trigger actions:
 ## 4. The Message Gutter and Display
 
 ### 4.1 The Gutter (Status Column)
-To the left of every message is a 2-character wide "Gutter". This provides immediate feedback on the message state without cluttering the text.
+A 2-character wide "Gutter" left of every message provides message state feedback.
 
 *   `● ` : Delivered.
 *   `○ ` : Sending (not yet acknowledged by the peer).
@@ -94,10 +94,10 @@ To the left of every message is a 2-character wide "Gutter". This provides immed
 *   `✓ ` : Read (if supported by the client and protocol extensions).
 *   `⚙ ` : System information (e.g., "Alice changed her name").
 
-**Visibility:** The display of timestamps and status indicators in the gutter can be toggled globally via a shortcut or `/set` command to provide a cleaner, "chat-focused" view.
+**Visibility:** Timestamps and status indicators in gutter are globally toggleable via shortcut or `/set` to provide a cleaner, "chat-focused" view.
 
 ### 4.2 Message Grouping
-To reduce visual noise, consecutive messages from the same sender within a short timeframe (e.g., 2 minutes) are grouped.
+Consecutive messages from same sender within short timeframe (e.g., 2 minutes) are grouped.
 *   The first message shows the timestamp and name.
 *   Subsequent messages only show the "Gutter" status and the message body.
 
@@ -105,27 +105,27 @@ To reduce visual noise, consecutive messages from the same sender within a short
 
 ## 5. Input Mechanics: The Framed Box
 
-The input box is a sophisticated line editor wrapped in a Unicode frame.
+Input box is a sophisticated line editor wrapped in a Unicode frame.
 
 ### 5.1 Dynamic Framing
-The box lives at the bottom of the main chat pane.
+Box lives at bottom of main chat pane.
 ```text
 ╭─────────────────────────────────────────────────────────────────────────────╮
 │ > This is a long message that will eventually wrap to the next line. As I   │
 │   continue to type, the box will grow upwards until it reaches its max size.│
 ╰─────────────────────────────────────────────────────────────────────────────╯
 ```
-*   **Max Height:** The input box grows vertically to accommodate text. The maximum height is configurable, with a default of 10 text rows (12 total rows including the top and bottom borders).
-*   **Border Styling:** When the input box is focused, the border color changes (e.g., to Cyan or Bold White). When unfocused, it dims.
-*   **Visual Wrap Marker:** If a line is wrapped by the UI (not a hard newline), a small Unicode arrow (`↳`) or a dimmed vertical line on the right border indicates the continuation, distinguishing it from an intentional newline.
+*   **Max Height:** Input box grows vertically. Maximum height is configurable (default 10 text rows, 12 total including borders).
+*   **Border Styling:** Border color changes when focused, dims when unfocused.
+*   **Visual Wrap Marker:** UI-wrapped lines indicated by Unicode arrow (`↳`) or dimmed vertical line on right border.
 
 ### 5.2 Editing Features
 *   **Multi-line Support:** 
-    *   **Mode A (Default):** `Enter` sends the message, `Shift+Enter` (or `Ctrl+Enter`/`Alt+Enter`) inserts a literal newline.
-    *   **Mode B:** `Enter` inserts a literal newline, `Shift+Enter` sends the message.
-    *   **Toggling:** A keyboard shortcut or command allows users to swap between these modes on the fly.
+    *   **Mode A (Default):** `Enter` sends message, `Shift+Enter` inserts literal newline.
+    *   **Mode B:** `Enter` inserts literal newline, `Shift+Enter` sends message.
+    *   **Toggling:** Configurable shortcut swaps modes.
 *   **Selection:** `Shift+Left/Right` selects characters. `Ctrl+Shift+Left/Right` selects words.
-*   **Clipboard:** `Ctrl+C/V/X` integration with the system clipboard (via `arboard` or similar).
+*   **Clipboard:** `Ctrl+C/V/X` integrates with system clipboard.
 *   **Readline Shortcuts:**
     *   `Ctrl+A`: Home
     *   `Ctrl+E`: End
@@ -137,13 +137,13 @@ The box lives at the bottom of the main chat pane.
 
 ## 6. The Slash Command System
 
-Commands provide a structured way to interact with the Tox protocol and the UI.
+Commands interact with Tox protocol and UI.
 
 ### 6.1 Discoverability
-Typing `/` at the start of the input box triggers the "Command Discovery Overlay".
+Typing `/` at start of input triggers Command Discovery Overlay.
 
 #### 6.1.1 The Suggestion List
-A list of commands appears above the input box, sorted by relevance or frequency of use.
+Command list appears above input box, sorted by relevance or frequency.
 ```text
   /about             Show version info
   /attach            Attach a file to the current chat
@@ -155,7 +155,7 @@ A list of commands appears above the input box, sorted by relevance or frequency
 ```
 
 #### 6.1.2 Fuzzy Argument Completion
-For commands like `/file send`, Toxxi provides fuzzy matching for the local filesystem.
+Fuzzy matching provided for local filesystem paths.
 ```text
   /file send ~/Docu_
   ------------------
@@ -174,7 +174,7 @@ The UI will proactively suggest completions for:
 File transfers are a core part of the Tox experience and require a high-friction-reduction UX.
 
 ### 7.1 Inline Presence
-When a file transfer is offered, it appears as a "Card" in the chat.
+File transfer offers appear as inline cards.
 ```text
 ╭─ 📄 incoming: presentation.zip ─────────────────────────────────────────────╮
 │ Size: 45.2 MB                                                               │
@@ -183,7 +183,7 @@ When a file transfer is offered, it appears as a "Card" in the chat.
 ```
 
 ### 7.2 Progress Visualization
-Once accepted, the card updates with a progress bar and throughput stats.
+Accepted cards update with progress bar and throughput stats.
 ```text
 ╭─ 📄 downloading: presentation.zip ──────────────────────────────────────────╮
 │ [████████████████████░░░░░░░] 72%                                           │
@@ -193,69 +193,69 @@ Once accepted, the card updates with a progress bar and throughput stats.
 ```
 
 ### 7.3 The File Manager Modal
-A global view (accessible via `/file list` or `Ctrl+F`) shows all active, completed, and failed transfers across all profiles and chats. This allows for bulk actions (e.g., "Cancel all active").
+Global view (`/file list` or `Ctrl+F`) shows all active, completed, and failed transfers across all profiles and chats, allowing for bulk actions (e.g., "Cancel all active").
 
 ---
 
 ## 8. Network Games and Extensibility
 
-Toxxi is designed to be a platform for P2P interaction beyond simple text.
+Toxxi supports P2P interaction beyond text.
 
 ### 8.1 Custom Packet Handling
-The `core` logic handles the routing of custom DHT packets. The UI provides "Hooks" for these packets to render specialized views.
+`core` routes custom DHT packets. UI provides hooks for specialized views.
 
 ### 8.2 Game Session Lifecycle
-1.  **Invite:** A game-specific invite box appears.
-2.  **Acceptance:** The UI enters "Game Mode".
-3.  **Split-Screen:** The main area splits. The game UI (e.g., a Chess board or a simple 2D grid) takes the top 70%, and the chat takes the bottom 30%.
-4.  **Input Capturing:** In Game Mode, the terminal is put into "Raw Input" mode for the game pane. The user must hit a specific escape sequence (e.g., `Ctrl+G`) to switch focus back to the chat input.
+1.  **Invite:** Game-specific invite box appears.
+2.  **Acceptance:** UI enters Game Mode.
+3.  **Split-Screen:** Main area splits: game UI top 70%, chat bottom 30%.
+4.  **Input Capturing:** Terminal enters Raw Input mode for game pane. Escape sequence (e.g., `Ctrl+G`) switches focus to chat.
 
 ### 8.3 The "Oscilloscope" Widget
-For audio calls, a real-time visualization helps users know they are being heard and that the peer is sending data.
-*   Uses Braille Unicode characters (`⠇`, `⠏`, `⠹`, etc.) to create a high-resolution waveform in a 1-line or 2-line height box.
+Audio calls use real-time visualization.
+*   Braille Unicode characters create high-resolution waveform in 1-2 line box.
 
 ---
 
 ## 9. Advanced UX Features
 
 ### 9.1 Multi-Profile Support
-Toxxi can run multiple Tox IDs simultaneously.
-*   **Tabs:** If more than one profile is active, a tab bar appears at the very top.
-*   **Shortcuts:** `Alt + [1..9]` jumps to the respective profile.
-*   **Combined View:** An optional "All Messages" view that aggregates mentions and notifications from all profiles into a single stream.
+Supports multiple Tox IDs simultaneously.
+*   **Tabs:** Tab bar appears for multiple active profiles.
+*   **Shortcuts:** `Alt + [1..9]` switches profile.
+*   **Combined View:** Optional "All Messages" view aggregates mentions and notifications from all profiles into a single stream.
 
 ### 9.2 Notifications and Beeps
-*   **In-TUI Visuals:** The sidebar item for a chat flashes or changes color.
-*   **Terminal Bell:** A standard `\a` (ASCII Bell) can be triggered for mentions, configurable in settings.
-*   **External Integration:** Support for `libnotify` (Linux) or `terminal-notifier` (macOS) via optional feature flags.
+*   **In-TUI Visuals:** Sidebar item flashes or changes color.
+*   **Terminal Bell:** Standard `\a` (ASCII Bell) for mentions, configurable.
+*   **External Integration:** Optional `libnotify` or `terminal-notifier` integration.
 
 ### 9.3 Connectivity Health (The Heartbeat)
-A small section in the status bar provides a "Health Check" of the Tox network. Toxxi uses the median-based consensus clock for monotonic time (see [doc/merkle-tox-clock.md](../../doc/merkle-tox-clock.md)).
-*   `Nodes: [ ⠿⠿⠿⠿⠶ ]`: A Braille sparkline showing the number of connected DHT nodes over the last 10 minutes.
-*   `Mode: [ UDP/DHT ]`: Shows if the connection is direct (UDP) or relayed (TCP).
+Status bar provides Tox network health check using median-based consensus clock (see [doc/merkle-tox-clock.md](../../doc/merkle-tox-clock.md)).
+*   `Nodes: [ ⠿⠿⠿⠿⠶ ]`: Braille sparkline of connected DHT nodes over last 10 minutes.
+*   `Mode: [ UDP/DHT ]`: Shows direct (UDP) or relayed (TCP) connection.
 
 ---
 
 ## 10. Design Trade-offs and Rationale
 
 ### 10.1 Why TUI?
-*   **Performance:** Extremely low memory footprint.
-*   **Accessibility:** Works perfectly over SSH/Mosh.
-*   **Focus:** Minimizes distractions compared to GUI applications.
+*   **Performance:** Low memory footprint.
+*   **Accessibility:** SSH/Mosh compatible.
+*   **Focus:** Distraction-free.
 
 ### 10.2 Why Unicode Frames?
-*   Provides a modern look and feel that distinguishes Toxxi from legacy IRC-style clients.
-*   Helps visually separate the input area from the history.
+*   Modern aesthetics.
+*   Visually separates input from history.
 
 ### 10.3 The "Alt" Key Problem
-Terminals often struggle with the `Alt` (Option) key, especially on macOS.
-*   **Rationale:** Toxxi favors `Ctrl` and `Esc` for primary navigation. `Alt` is reserved for "Power User" shortcuts (like profile switching) that can also be performed via slash commands or the quick switcher.
+Terminals often struggle with `Alt` key.
+*   **Rationale:** `Ctrl` and `Esc` preferred for primary navigation. `Alt` reserved for secondary shortcuts.
 
 ---
 
 ## 11. Interaction State Machine (Internal)
 
-To ensure a predictable experience, the UI follows a strict state machine:
+UI follows strict state machine:
 
 1.  **Normal Mode:** Input box is focused. Standard typing.
 2.  **Command Mode:** Triggered by `/`. Tab completion is active.
@@ -268,12 +268,12 @@ To ensure a predictable experience, the UI follows a strict state machine:
 ## 12. Accessibility and Customization
 
 ### 12.1 Themes
-All colors are defined in a `theme.toml` file.
-*   Support for 16-color, 256-color, and TrueColor (RGB) terminals.
-*   "No-Unicode" mode for legacy terminals that can't render the frames or Braille symbols.
+Colors defined in `theme.toml`.
+*   Supports 16-color, 256-color, and TrueColor.
+*   "No-Unicode" mode for legacy terminals.
 
 ### 12.2 Keyboard Mapping
-Every action in Toxxi is bindable. A `keys.toml` allows users to remap the entire interaction model (e.g., for Vim-like navigation).
+Actions bindable via `keys.toml`.
 
 ---
 
@@ -311,21 +311,21 @@ Every action in Toxxi is bindable. A `keys.toml` allows users to remap the entir
 From an implementation standpoint, the UI is built from atomic components that manage their own state and rendering logic.
 
 ### 14.1 The `MessageList` Component
-*   **Virtual Scrolling:** Only calculates the layout for messages that are currently on-screen.
-*   **Reflow Logic:** Recalculates wrapping and column alignment whenever the terminal is resized.
-*   **Search Overlay:** Highlights matched text during history searches.
+*   **Virtual Scrolling:** Calculates layout only for on-screen messages.
+*   **Reflow Logic:** Recalculates layout on terminal resize.
+*   **Search Overlay:** Highlights text during searches.
 
 ### 14.2 The `DynamicInput` Component
-*   **Syntax Highlighting:** Colors `/commands` and `@mentions` in real-time.
-*   **Buffer Management:** Handles multi-line strings and maintains its own undo/redo stack.
+*   **Syntax Highlighting:** Real-time highlighting.
+*   **Buffer Management:** Maintains undo/redo stack.
 
 ### 14.3 The `StatusLine` Component
-*   **Polling:** Updates DHT health and node count on a background timer (every 1-5 seconds).
-*   **Transient Alerts:** Displays temporary messages (e.g., "File saved to ...") which fade out after 3 seconds.
+*   **Polling:** Background timer polls DHT health.
+*   **Transient Alerts:** Displays temporary fading messages.
 
 ---
 
 ## 15. Conclusion
-The Toxxi UX is designed to be "invisible"—staying out of the way of the conversation while providing powerful tools at a moment's notice. By combining traditional IRC-like efficiency with modern IDE-inspired navigation, it sets a new standard for Tox clients.
+Toxxi UX is designed to be "invisible": staying out of the way of the conversation while providing powerful tools at a moment's notice. By combining traditional IRC-like efficiency with modern IDE-inspired navigation, it sets a new standard for Tox clients.
 
 (End of Document)

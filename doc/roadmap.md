@@ -1,13 +1,13 @@
 # Merkle-Tox Production Roadmap
 
-This document outlines the architectural and implementation improvements
-required to bring the Merkle-Tox prototype to production quality.
+Architectural and implementation requirements to bring the Merkle-Tox prototype
+to production quality.
 
 ## 1. Persistence & Storage Architecture
 
-The storage layer must provide abstractions to properly support two primary
-backends: a zero-dependency filesystem backend (`fs`) and a transactional
-database engine (`sqlite`).
+The storage layer MUST provide abstractions supporting two primary backends: a
+zero-dependency filesystem backend (`fs`) and a transactional database engine
+(`sqlite`).
 
 -   **Transactional Consistency:** Redesign the `NodeStore` and
     `process_effects` loop to support atomic multi-operation transactions across
@@ -65,7 +65,7 @@ responsiveness under load.
 
 ## 4. Protocol Evolution & Versioning
 
-The protocol must be able to evolve without breaking the existing network.
+The protocol MUST support evolution without breaking the existing network.
 
 -   **Versioned Wire Format:** Add version fields to `WireNode` and `MerkleNode`
     to support backward-incompatible changes in the future.
@@ -78,7 +78,7 @@ The protocol must be able to evolve without breaking the existing network.
 
 ## 5. State Pruning & Garbage Collection
 
-Manage the long-term growth of the local database to prevent disk exhaustion.
+Manage long-term database growth to prevent disk exhaustion.
 
 -   **Snapshot-Based Pruning:** Implement logic to handle
     `ControlAction::Snapshot` by deleting historical nodes and metadata that
@@ -89,8 +89,7 @@ Manage the long-term growth of the local database to prevent disk exhaustion.
 
 ## 6. Privacy & Metadata Protection
 
-Harden the wire format and sync process against passive and active network
-observers.
+Harden wire format and sync process against network observers.
 
 -   **Obfuscate DAG Structure:** Encrypt or hash the `parents` field in
     `WireNode` to prevent observers from mapping conversation graphs.
@@ -101,9 +100,8 @@ observers.
     onboarding).
 -   **Revert to Linear Ratchets:** Replace the "DAG-based merge ratchet"
     implementation in `conversation.rs` and `crypto.rs` with the documented
-    **Per-Sender Linear Ratchets**. This eliminates the brittle
-    `historical_chains` cache and the risk of becoming "cryptographically stuck"
-    during large forks.
+    **Per-Sender Linear Ratchets**, eliminating the brittle `historical_chains`
+    cache and the risk of becoming "cryptographically stuck" during large forks.
 -   **Metadata-Private Sync:** Investigate Private Information Retrieval (PIR)
     or oblivious synchronization techniques to reduce metadata leakage during
     the IBLT reconciliation process.
@@ -123,8 +121,8 @@ Protect the node against malicious peers and resource exhaustion attacks.
     operation, especially for KeyWrap.
 -   **Opportunistic Handshake Completion (Rationale #6):** Implement the
     `HandshakePulse` authoring logic to ensure 1-on-1 conversations rotate away
-    from "Last Resort" keys immediately upon the peer coming online. This MUST
-    include a debounce mechanism (e.g., ignoring pulses if a `KeyWrap` was
+    from "Last Resort" keys immediately upon the peer coming online. The logic
+    MUST include a debounce mechanism (e.g., ignoring pulses if a `KeyWrap` was
     authored within the last 5 minutes) to prevent "KeyWrap Storms" when
     processing large batches of offline messages.
 -   **Bounded Allocations:** Fix `tox-proto` to enforce maximum limits on
@@ -141,8 +139,7 @@ Protect the node against malicious peers and resource exhaustion attacks.
 
 ## 8. API & Code Quality
 
-Ensure the library is easy to use safely and meets high standards for
-correctness.
+Ensure the library is safe and meets high correctness standards.
 
 -   **Secure Defaults:** Refactor constructors to use secure, entropy-seeded
     RNGs (`OsRng`) by default. Deterministic injection must be a specialized
@@ -156,7 +153,7 @@ correctness.
 
 ## 9. Tooling, Backup & Documentation
 
-Provide the necessary ecosystem for users and developers.
+Provide ecosystem tooling for users and developers.
 
 -   **Documentation Integrity:** Ensure `doc/merkle-tox-ratchet.md` and
     `doc/merkle-tox-design-rationale.md` remain the source of truth for the
@@ -173,8 +170,7 @@ Provide the necessary ecosystem for users and developers.
 
 ## 10. Legacy Interoperability
 
-Bridge the gap between Merkle-Tox and standard Tox to ensure a smooth transition
-for the ecosystem.
+Bridge Merkle-Tox and standard Tox to ensure smooth ecosystem transition.
 
 -   **Legacy Bridge Implementation:** Implement the `Content::LegacyBridge` node
     type and the notary logic in `merkle-tox-tox`.

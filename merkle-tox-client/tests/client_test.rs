@@ -196,10 +196,19 @@ async fn test_client_membership_and_auth() {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&self_sk);
         let cert = sign_delegation(&signing_key, self_device_pk, Permissions::ALL, i64::MAX);
 
+        let ctx = merkle_tox_core::identity::CausalContext::global();
         node_lock
             .engine
             .identity_manager
-            .authorize_device(conversation_id, self_master_pk, &cert, 0, 0)
+            .authorize_device(
+                &ctx,
+                conversation_id,
+                self_master_pk,
+                &cert,
+                0,
+                0,
+                merkle_tox_core::dag::NodeHash::from([0u8; 32]),
+            )
             .unwrap();
     }
 
@@ -470,9 +479,18 @@ async fn test_client_automated_x3dh_onboarding() {
             Permissions::ALL,
             i64::MAX,
         );
+        let ctx = merkle_tox_core::identity::CausalContext::global();
         engine
             .identity_manager
-            .authorize_device(conversation_id, alice_master_pk, &cert, 0, 0)
+            .authorize_device(
+                &ctx,
+                conversation_id,
+                alice_master_pk,
+                &cert,
+                0,
+                0,
+                merkle_tox_core::dag::NodeHash::from([0u8; 32]),
+            )
             .unwrap();
 
         // Give Alice the conversation key

@@ -2,13 +2,11 @@
 
 ## 1. Overview
 
-This document provides an exhaustive analysis of the security properties,
-adversary models, and known trade-offs in the Merkle-Tox system. It bridges the
-gap between the high-level design and the specific cryptographic sub-designs.
+Security analysis of Merkle-Tox.
 
 ## 2. Adversary Models
 
-We categorize attackers based on their capabilities and proximity to the
+Attackers are categorized by their capabilities and proximity to the
 synchronization swarm:
 
 *   **Global Passive Observer (GPO):** Can monitor all network traffic between
@@ -25,47 +23,63 @@ synchronization swarm:
 
 ### 3.1. Key Compromise Impersonation (KCI)
 
-*   **Status**: **Possible (by Design)**
-*   **Description**: If an attacker steals User A's Master Seed, they can derive
-    the shared conversation key $K_{conv}$ for any room A is in. Because
-    Merkle-Tox uses symmetric MACs (DARE) for content nodes, the attacker can
-    use A's own key to craft messages that appear to come from User B.
-*   **Rationale**: This is a fundamental trade-off required for **Plausible
-    Deniability**. For User A to be able to repudiate their own messages ("Bob
-    could have forged this to frame me"), the protocol must allow any
-    participant with $K_{conv}$ to be mathematically capable of forging any
-    message in the room. KCI resistance would require asymmetric signatures on
-    every message, which would destroy deniability. As a direct consequence,
-    Merkle-Tox has no **Internal Accountability** for content nodes; any group
-    member can forge messages appearing to be from any other group member.
-*   **Boundaries**: KCI only applies to **Content Nodes**. **Admin Nodes** (like
-    `RevokeDevice`) require Ed25519 signatures from the specific author and are
-    therefore KCI-resistant.
+*   **Status**: **Mitigated (Ephemeral Signatures)**
+*   **Description**: If an attacker steals User A's Master Seed, they derive the
+    shared $K_{conv}$. However, because Merkle-Tox uses **Ephemeral Signatures**
+    (not symmetric MACs), the attacker cannot forge messages as User B without
+    also compromising User B's current `ephemeral_signing_sk`.
+*   **Active Epoch**: During the active epoch, content nodes are signed with an
+    ephemeral Ed25519 key held exclusively by the sender. An attacker with
+    $K_{conv}$ alone cannot produce a valid signature for another sender,
+    providing **Internal Authentication**.
+*   **After Disclosure**: Once the sender rotates their SenderKey and discloses
+    the old `ephemeral_signing_sk`, signatures from the previous epoch become
+    forgeable by any authorized member, restoring **Plausible Deniability**.
+*   **Residual Risk**: An attacker who compromises a device gains that device's
+    *current* `ephemeral_signing_sk` and can forge content as that device until
+    the next SenderKey rotation (at most 7 days / 5,000 messages).
+*   **Boundaries**: Admin Nodes use permanent Ed25519 signatures from the device
+    key and are always KCI-resistant.
 
 ### 3.2. Denial of Service (DoS) - Speculative Flooding
 
 *   **Status**: **Mitigated**
 *   **Description**: An attacker can flood a peer with validly-hashed but
-    unverified Content nodes. Since these cannot be verified without $K_{conv}$,
-    the peer must store them speculatively.
+    unverified Content nodes. Lacking $K_{conv}$, the peer must store them
+    speculatively.
 *   **Mitigation**:
-    1.  **Authorized Vouching**: Clients only download or store `WireNodes` that
-        are advertised by an **Authorized Peer** (a member verified via the
-        Admin track). This limits the attack surface to members already in the
-        conversation.
-    2.  **Opaque Quotas**: Clients enforce a strict 100MB limit on the `Opaque
-        Store`.
-    3.  **Vouching Logic**: Nodes that are not "vouched for" by a trusted peer's
+    1.  **Authorized Vouching**: Clients only download `WireNodes` advertised by
+        an **Authorized Peer** (verified via the Admin track).
+    2.  **Opaque Quotas**: Clients enforce a 100MB limit on the `Opaque Store`.
+    3.  **Vouching Logic**: Nodes not "vouched for" by a trusted peer's
         authenticated heads are prioritized for deletion.
 
 ### 3.3. Denial of Service (DoS) - IBLT Peeling
 
-*   **Status**: **Mitigated**
+*   **Status**: **Prevented**
 *   **Description**: An attacker sends a "garbage" IBLT sketch designed to
-    trigger worst-case CPU usage during the iterative peeling process.
-*   **Mitigation**: The `tox-reconcile` library enforces a maximum iteration
-    count proportional to the sketch size and validates cell `HashSum` values to
-    detect tampering early.
+    trigger worst-case CPU usage during peeling.
+*   **Mitigation**: The **Queue-Based (Linear) Peeling Algorithm**
+    (`merkle-tox-reconcile.md` §1.C) guarantees O(m) worst-case CPU. The
+    **Extracted Capacity Cap** ($D_{max}$) bounds output size and memory. Cell
+    `HashSum` values (keyed with $K_{iblt}$) detect external tampering on the
+    first extracted element.
+
+### 3.3b. Denial of Service (DoS) - IBLT Sketch Spam (Volume)
+
+*   **Status**: **Mitigated**
+*   **Description**: An authorized attacker floods a peer with a high volume of
+    Medium/Large IBLT sketch requests. The aggregate CPU cost of peeling
+    overwhelms the target.
+*   **Mitigation**: **Per-Peer CPU Budget** (`merkle-tox-reconcile.md` §3.C).
+    Each responder enforces a strict token bucket of `SKETCH_CPU_BUDGET_MS`
+    (500ms) of IBLT decoding time per peer per minute. When the budget exhausts,
+    subsequent sketches are discarded with `SYNC_RATE_LIMITED`. Peers whose
+    sketches consistently fail decoding are subject to exponential blacklist
+    escalation (`merkle-tox-sync.md` §2).
+*   **Design Rationale**: A token bucket provides a hard cap on the receiver's
+    CPU consumption regardless of the attacker's resources, whereas PoW only
+    provides a probabilistic deterrent. No global consensus is needed.
 
 ### 3.4. Traffic Analysis (Metadata Leakage)
 
@@ -82,11 +96,14 @@ synchronization swarm:
 ### 3.5. Clock Manipulation (Nudging)
 
 *   **Status**: **Resistant**
-*   **Description**: Using Sybil identities to skew the Median Consensus Clock,
+*   **Description**: Sybil identities skew the Median Consensus Clock,
     potentially causing legitimate nodes to be quarantined.
-*   **Mitigation**: Only **authorized** peers (those with a valid trust path to
-    the Genesis node) contribute to the median calculation. An attacker must
-    control $>50\%$ of the authorized identities in a room to shift the clock.
+*   **Mitigation**: Only **authorized** peers contribute to the median
+    calculation. Offsets are grouped by **Logical Identity** before the median
+    is computed (see `merkle-tox-clock.md` §1, Step 3), preventing an attacker
+    from amplifying their vote with multiple devices. An attacker must control
+    $>50\%$ of the distinct authorized **identities** in a room to shift the
+    clock.
 
 ### 3.6. Partitioning Attacks
 
@@ -105,51 +122,82 @@ synchronization swarm:
     issuer possesses (e.g., a device with `MESSAGE` trying to authorize an Admin
     with `ADMIN`).
 *   **Mitigation**: Merkle-Tox uses **Dynamic Enforcement**. The sync engine
-    does not blindly trust the claims in a certificate. Instead, it
     re-calculates effective power as the recursive intersection of the trust
     path at use-time. Escalated claims are cryptographically valid (signed) but
-    logically ignored by the protocol.
+    logically ignored.
 
 ## 4. Summary of Trade-offs
 
-| Feature               | Design Choice        | Security Trade-off            |
-| :-------------------- | :------------------- | :---------------------------- |
-| **Authentication**    | Symmetric MAC (DARE) | **Gains**: Plausible          |
-:                       :                      : Deniability. **Loses**\: KCI  :
-:                       :                      : resistance for content.       :
-| **History Sync**      | Authorized Vouching  | **Gains**: Protection against |
-:                       :                      : anonymous DoS. **Loses**\:    :
-:                       :                      : Latency when joining high-    :
-:                       :                      : spam rooms.                   :
-| **Time Sync**         | Weighted Median      | **Gains**: Byzantine fault    |
-:                       :                      : tolerance. **Loses**\:        :
-:                       :                      : Sensitivity to authorized     :
-:                       :                      : Sybils.                       :
-| **Serialization**     | Positional Arrays    | **Gains**: Maximum wire       |
-:                       :                      : efficiency. **Loses**\:       :
-:                       :                      : Schema flexibility.           :
-| **Blob Verification** | Bao (Merkle Tree)    | **Gains**: Incremental 64KB   |
-:                       :                      : verification. **Loses**\: CPU :
-:                       :                      : overhead for proof            :
-:                       :                      : generation.                   :
-| **Permission Eval**   | Dynamic Intersection | **Gains**: Retroactive        |
-:                       :                      : revocation and escalation     :
-:                       :                      : resistance. **Loses**\:       :
-:                       :                      : Complexity in indexing and    :
-:                       :                      : possible UX confusion.        :
+| Feature               | Design Choice          | Security Trade-off          |
+| :-------------------- | :--------------------- | :-------------------------- |
+| **Authentication**    | Ephemeral Signatures + | **Gains**: Internal         |
+:                       : Key Disclosure (DARE)  : authentication AND          :
+:                       :                        : plausible deniability.      :
+:                       :                        : **Loses**\: Deniability is  :
+:                       :                        : delayed until epoch         :
+:                       :                        : rotation (≤7 days).         :
+| **History Sync**      | Authorized Vouching    | **Gains**: Protection       |
+:                       :                        : against anonymous DoS.      :
+:                       :                        : **Loses**\: Latency when    :
+:                       :                        : joining high- spam rooms.   :
+| **Time Sync**         | Weighted Median        | **Gains**: Byzantine fault  |
+:                       :                        : tolerance. **Loses**\:      :
+:                       :                        : Sensitivity to authorized   :
+:                       :                        : Sybils.                     :
+| **Serialization**     | Positional Arrays      | **Gains**: Maximum wire     |
+:                       :                        : efficiency. **Loses**\:     :
+:                       :                        : Schema flexibility.         :
+| **Blob Verification** | Bao (Merkle Tree)      | **Gains**: Incremental 64KB |
+:                       :                        : verification. **Loses**\:   :
+:                       :                        : CPU overhead for proof      :
+:                       :                        : generation.                 :
+| **Permission Eval**   | Dynamic Intersection   | **Gains**: Retroactive      |
+:                       :                        : revocation and escalation   :
+:                       :                        : resistance. **Loses**\:     :
+:                       :                        : Complexity in indexing and  :
+:                       :                        : possible UX confusion.      :
+| **Sketch DoS**        | Per-Peer CPU Budget    | **Gains**: Hard cap on      |
+:                       : (Token Bucket)         : defender CPU, no            :
+:                       :                        : coordination needed, honest :
+:                       :                        : peers unaffected.           :
+:                       :                        : **Loses**\: No room-wide    :
+:                       :                        : awareness of ongoing        :
+:                       :                        : attacks.                    :
 
-### 3.8. Join Deadlock (Shallow Sync)
+### 3.8. OPK Collision History Erasure
+
+*   **Status**: **Prevented**
+*   **Description**: An attacker (Eve) observes a victim's (Alice's) `KeyWrap`
+    node in the DAG, extracts the `opk_id`, and authors a competing `KeyWrap`
+    using the same OPK. If the collision resolution rule uses a grindable value
+    (such as the initiator's ephemeral key $E_a$), Eve can guarantee she wins,
+    orphaning Alice's `KeyWrap` and all content nodes descending from it. This
+    is a targeted retroactive history erasure attack.
+*   **Mitigation**:
+    1.  **Non-Grindable Tie-Breaker**: The collision resolution rule uses
+        **Admin Seniority** (group chats) or **Device Public Key** (1-on-1
+        chats) (immutable historical values that cannot be varied
+        per-collision). See `merkle-tox-handshake-ecies.md` §5.
+    2.  **Per-Entry Collision Scope**: The `opk_id` field is per-`WrappedKey`
+        entry, not per-`KeyWrap` node. A collision only invalidates the specific
+        recipient entry, not the entire `KeyWrap`.
+    3.  **Delivery Confirmation (1-on-1)**: In 1-on-1 chats where the two
+        `KeyWrap` nodes contain different $K_{conv}$ values, the losing
+        initiator's key is never delivered. The `KEYWRAP_ACK` protocol
+        (`merkle-tox-handshake-ecies.md` §2.A) prevents the initiator from
+        authoring content before delivery is confirmed, ensuring no unreadable
+        messages enter the DAG. In group chats, both Admins wrap the same
+        $K_{conv}$, so the collision is harmless.
+
+### 3.9. Join Deadlock (Shallow Sync)
 
 *   **Status**: **Mitigated**
-*   **Description**: A new member receives a `KeyWrap` but cannot verify the
-    sender's authority because they are missing the historical Admin nodes that
-    authorized that device. This creates a deadlock where the user has the key
-    but refuses to use it.
+*   **Description**: A new member receives a `KeyWrap` but lacks the historical
+    Admin nodes that authorized the sender, creating a deadlock.
 *   **Mitigation**: **Speculative Decryption & Identity Pending Status**.
-    1.  The client uses the Admin's `Signature` to verify the integrity of the
-        `KeyWrap`.
-    2.  If the MAC is valid, the client tentatively accepts the key and decrypts
-        the Opaque Store.
-    3.  Messages are displayed with an **"Identity Pending"** warning. This
-        breaks the deadlock by allowing the user to read history immediately
-        while the background sync completes the Admin track verification.
+    1.  The client uses the Admin's `Signature` to verify the `KeyWrap`
+        integrity.
+    2.  If valid, the client tentatively accepts the key and decrypts the Opaque
+        Store.
+    3.  Messages display an **"Identity Pending"** warning, allowing history to
+        be read while background sync completes Admin track verification.

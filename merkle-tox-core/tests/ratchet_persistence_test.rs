@@ -1,6 +1,7 @@
 use merkle_tox_core::clock::ManualTimeProvider;
 use merkle_tox_core::dag::{Content, Permissions, PhysicalDeviceDhSk, PhysicalDeviceSk};
 use merkle_tox_core::engine::MerkleToxEngine;
+use merkle_tox_core::sync::NodeStore;
 use merkle_tox_core::testing::TestRoom;
 use merkle_tox_core::testing::store::InMemoryStore;
 use rand::SeedableRng;
@@ -34,7 +35,7 @@ fn test_ratchet_state_lost_on_restart() {
     room.setup_engine(&mut alice_engine, &*store);
 
     // 3. Alice authors Node 1. This advances her internal ratchet state.
-    // Node 1 is now in the store.
+    // JIT piggybacking may produce an SKD before the text node.
     let effects = alice_engine
         .author_node(
             room.conv_id,
@@ -43,7 +44,7 @@ fn test_ratchet_state_lost_on_restart() {
             &*store,
         )
         .expect("Failed to author node 1");
-    let node1 = merkle_tox_core::testing::get_node_from_effects(effects.clone());
+    let all_nodes1 = merkle_tox_core::testing::get_all_nodes_from_effects(&effects);
     merkle_tox_core::testing::apply_effects(effects, &*store);
 
     // 4. Initialize Bob (Receiver)
@@ -60,12 +61,18 @@ fn test_ratchet_state_lost_on_restart() {
     let bob_store = Arc::new(InMemoryStore::new());
     room.setup_engine(&mut bob_engine, &*bob_store);
 
-    // Bob receives Node 1 and updates his ratchet state to match Alice's (post-Node 1)
-    let effects = bob_engine
-        .handle_node(room.conv_id, node1.clone(), &*bob_store, Some(&*bob_store))
-        .expect("Bob failed to handle node 1");
-    assert!(merkle_tox_core::testing::is_verified_in_effects(&effects));
-    merkle_tox_core::testing::apply_effects(effects, &*bob_store);
+    // Transfer wire nodes from Alice's store to Bob's store (for encrypt-then-sign verification)
+    for (hash, (cid, wire)) in store.wire_nodes.read().unwrap().iter() {
+        let _ = bob_store.put_wire_node(cid, hash, wire.clone());
+    }
+
+    // Bob receives ALL of Alice's nodes (JIT SKD + text) and updates ratchet state
+    for node in &all_nodes1 {
+        let effects = bob_engine
+            .handle_node(room.conv_id, node.clone(), &*bob_store, Some(&*bob_store))
+            .expect("Bob failed to handle node");
+        merkle_tox_core::testing::apply_effects(effects, &*bob_store);
+    }
 
     // 5. Simulate Alice Restart (The "Reload")
     // We create a NEW engine instance for Alice.
@@ -104,6 +111,7 @@ fn test_ratchet_state_lost_on_restart() {
     // 6. Alice (Restarted) authors Node 2.
     // If she recovered her state, she will use the correct chain key derived from Node 1.
     // If she lost her state, she will default to the Epoch Root key.
+    // JIT piggybacking may produce an SKD (restarted Alice has empty shared_keys_sent_to).
     let effects = alice_restarted
         .author_node(
             room.conv_id,
@@ -112,19 +120,26 @@ fn test_ratchet_state_lost_on_restart() {
             &*store,
         )
         .expect("Failed to author node 2");
-    let node2 = merkle_tox_core::testing::get_node_from_effects(effects.clone());
+    let all_nodes2 = merkle_tox_core::testing::get_all_nodes_from_effects(&effects);
+    merkle_tox_core::testing::transfer_wire_nodes(&effects, &*bob_store);
     merkle_tox_core::testing::apply_effects(effects, &*store);
 
-    // 7. Bob attempts to verify Node 2.
+    // 7. Bob attempts to verify all of Alice's authored nodes.
     // Bob has the correct state (he tracked Node 1).
     // If Alice used the wrong key, Bob will reject it.
-    let effects = bob_engine
-        .handle_node(room.conv_id, node2.clone(), &*bob_store, Some(&*bob_store))
-        .expect("Bob failed to handle node 2");
+    let mut any_verified = false;
+    for node in &all_nodes2 {
+        let effects = bob_engine
+            .handle_node(room.conv_id, node.clone(), &*bob_store, Some(&*bob_store))
+            .expect("Bob failed to handle node");
+        if merkle_tox_core::testing::is_verified_in_effects(&effects) {
+            any_verified = true;
+        }
+        merkle_tox_core::testing::apply_effects(effects, &*bob_store);
+    }
 
     assert!(
-        merkle_tox_core::testing::is_verified_in_effects(&effects),
+        any_verified,
         "Bob should have verified the message from restarted Alice, proving that ratchet state was successfully persisted and restored."
     );
-    merkle_tox_core::testing::apply_effects(effects, &*bob_store);
 }

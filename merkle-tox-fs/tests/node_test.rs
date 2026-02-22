@@ -1,6 +1,6 @@
 use merkle_tox_core::dag::{
-    Content, ConversationId, LogicalIdentityPk, MerkleNode, NodeAuth, NodeHash, NodeLookup,
-    NodeMac, PhysicalDevicePk,
+    Content, ConversationId, Ed25519Signature, LogicalIdentityPk, MerkleNode, NodeAuth, NodeHash,
+    NodeLookup, PhysicalDevicePk,
 };
 use merkle_tox_core::sync::NodeStore;
 use merkle_tox_core::vfs::StdFileSystem;
@@ -31,7 +31,8 @@ fn test_fs_store_put_get_node() {
         network_timestamp: 12345,
         content: Content::Text("Hello FS Store".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
     let hash = node.hash();
     let sync_key = ConversationId::from([0u8; 32]);
@@ -65,7 +66,8 @@ fn test_fs_store_sharding_layout() {
         network_timestamp: 100,
         content: Content::Text("test".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
     store.put_node(&sync_key, node, true).unwrap();
 
@@ -102,7 +104,8 @@ fn test_fs_store_persistence_restart() {
             network_timestamp: 100,
             content: Content::Text("Persisted Restart".to_string()),
             metadata: vec![],
-            authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+            authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+            pow_nonce: 0,
         };
         node_hash = node.hash();
         store.put_node(&sync_key, node, true).unwrap();
@@ -142,7 +145,8 @@ fn test_fs_store_speculative_handling() {
         network_timestamp: 100,
         content: Content::Text("Speculative".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
     let hash = node.hash();
 
@@ -185,7 +189,8 @@ fn test_fs_store_conversation_discovery() {
             network_timestamp: 100,
             content: Content::Text("C1 Discovery".to_string()),
             metadata: vec![],
-            authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+            authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+            pow_nonce: 0,
         };
         let node2 = MerkleNode {
             parents: vec![],
@@ -196,7 +201,8 @@ fn test_fs_store_conversation_discovery() {
             network_timestamp: 200,
             content: Content::Text("C2 Discovery".to_string()),
             metadata: vec![],
-            authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+            authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+            pow_nonce: 0,
         };
         hash1 = node1.hash();
         hash2 = node2.hash();
@@ -238,7 +244,8 @@ fn test_fs_store_node_lookup_trait() {
         network_timestamp: 100,
         content: Content::Text("test".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
     let hash = node.hash();
     let node_type = node.node_type();
@@ -271,7 +278,8 @@ fn test_fs_store_corrupt_node_file() {
         network_timestamp: 100,
         content: Content::Text("test".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
     let hash = node.hash();
     store.put_node(&sync_key, node, true).unwrap();
@@ -340,7 +348,8 @@ fn test_fs_store_get_node_across_conversations() {
         network_timestamp: 100,
         content: Content::Text("C1".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
     let hash1 = node1.hash();
 
@@ -361,7 +370,8 @@ fn test_fs_store_get_node_across_conversations() {
         network_timestamp: 100,
         content: Content::Text("C2".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
     let hash2 = node2.hash();
     store.put_node(&conv2, node2, true).unwrap();
@@ -386,7 +396,8 @@ fn test_fs_store_node_lookup_packed() {
         network_timestamp: 100,
         content: Content::Text("packed lookup".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
     let hash = node.hash();
     let node_type = node.node_type();
@@ -425,7 +436,8 @@ fn test_fs_store_mark_verified_idempotency() {
         network_timestamp: 100,
         content: Content::Text("test".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
     let hash = node.hash();
 

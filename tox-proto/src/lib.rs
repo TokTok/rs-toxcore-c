@@ -175,6 +175,20 @@ merkle_tox_newtype!(
     [u8; 32],
     "A message authentication code for a Merkle node."
 );
+merkle_tox_newtype!(SenderKey, [u8; 32], "Per-sender ratchet root seed.", secret);
+merkle_tox_newtype!(HeaderKey, [u8; 32], "K_header for routing AEAD.", secret);
+merkle_tox_newtype!(
+    EphemeralSigningSk,
+    [u8; 32],
+    "Disclosed ephemeral Ed25519 signing secret.",
+    secret
+);
+merkle_tox_newtype!(
+    EphemeralSigningPk,
+    [u8; 32],
+    "Ephemeral Ed25519 signing public key."
+);
+
 merkle_tox_newtype!(Ed25519Signature, [u8; 64], "An Ed25519 signature.");
 
 impl From<NodeHash> for ConversationId {

@@ -1,21 +1,23 @@
 # Merkle-Tox Principles
 
-This document defines the foundational principles of the Merkle-Tox protocol.
-These principles serve as a "constitution" for all design decisions, ensuring
-that performance optimizations or security hardening do not compromise the
-values of the Tox ecosystem.
+Defines protocol principles to ensure performance optimizations and security
+hardening do not compromise Tox ecosystem values.
 
 ## 1. Plausible Deniability (DARE Model)
 
 *   **Principle**: No participant or observer should be able to
     cryptographically prove to a third party that a specific logical identity
     authored a specific content node.
-*   **Implementation**: Use symmetric Message Authentication Codes (MACs) for
-    all conversation content. Separate non-repudiable management (signatures for
-    Admin nodes) from deniable communication (MACs for Content nodes).
-*   **Trade-off**: We accept **Key Compromise Impersonation (KCI)** for content.
-    If a user's key is stolen, an attacker can impersonate others *to that
-    user*. This is the mandatory cost of deniability.
+*   **Implementation**: Use **Ephemeral Ed25519 Signatures** with intentional
+    key disclosure for all conversation content. During the active epoch, only
+    the sender holds the signing key (internal authentication). After epoch
+    rotation, the key is disclosed to all members, making past signatures
+    forgeable (deniability). Separate non-repudiable management (permanent
+    signatures for Admin nodes) from deniable communication (ephemeral
+    signatures for Content nodes).
+*   **Trade-off**: Deniability is delayed until the epoch rotation (≤7 days /
+    5,000 messages). During the active epoch, signatures are non-repudiable to
+    group members.
 
 ## 2. Strict Metadata Privacy
 
@@ -33,8 +35,8 @@ values of the Tox ecosystem.
 *   **Implementation**:
     *   **Timestamp Jitter**: The `tox-sequenced` layer SHOULD inject a small
         amount of random noise (between `-TIME_JITTER_MS` and `+TIME_JITTER_MS`,
-        where `TIME_JITTER_MS = 5`) into the PING/PONG timestamps. This prevents
-        a peer from calculating a machine-unique microsecond-level offset.
+        where `TIME_JITTER_MS = 5`) into the PING/PONG timestamps, preventing a
+        peer from calculating a machine-unique microsecond-level offset.
     *   **Coarse-Grained Synchronization**: While internal RTT measurements
         require precision for congestion control, the publicly-visible
         `network_timestamp` in the DAG and the offsets shared with peers should
@@ -64,8 +66,8 @@ values of the Tox ecosystem.
     verified Admin nodes.
 *   **Current Tension**: The **500-hop Ancestry Cap** limits how much history
     can be fetched from a blind relay without an intermediate Admin "anchor"
-    (e.g., a Snapshot). This protects the buffer from deep-ancestry DoS attacks.
-    If a conversation has gaps in the Admin track larger than 500 hops, a new
+    (e.g., a Snapshot), protecting the buffer from deep-ancestry DoS attacks. If
+    a conversation has gaps in the Admin track larger than 500 hops, a new
     joiner may require a full group member to come online to "re-anchor" the
     trust.
 
@@ -100,6 +102,5 @@ values of the Tox ecosystem.
         Blake3 with secrets unknown to the peer.
     *   Protect against **Storage-Filling Attacks** by using Authorized Vouching
         to filter sync requests.
-*   **Rationale**: A peer who is "authorized" to sync the room's data is not
-    necessarily "trusted" to not observe your behavior or attempt to disrupt
-    your service.
+*   **Rationale**: Authorized peers are not necessarily trusted. They may
+    observe behavior or attempt disruption.

@@ -1,8 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use merkle_tox_core::cas::BlobData;
-use merkle_tox_core::crypto::ConversationKeys;
 use merkle_tox_core::dag::{
-    Content, ConversationId, KConv, LogicalIdentityPk, MerkleNode, NodeAuth, NodeHash, NodeMac,
+    Content, ConversationId, Ed25519Signature, LogicalIdentityPk, MerkleNode, NodeAuth, NodeHash,
     PhysicalDevicePk,
 };
 use merkle_tox_core::sync::SyncHeads;
@@ -21,31 +20,28 @@ fn make_dummy_node(content: Content) -> MerkleNode {
         network_timestamp: 123456789,
         content,
         metadata: vec![0; 64],
-        authentication: NodeAuth::Mac(NodeMac::from([5; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     }
 }
 
 fn bench_joiner_hot_path(c: &mut Criterion) {
     let mut g = c.benchmark_group("joiner_ops");
-    let keys = ConversationKeys::derive(&KConv::from([42; 32]));
 
     let text_node = make_dummy_node(Content::Text("History message contents".to_string()));
-    let wire_node = text_node.pack_wire(&keys, true).unwrap();
+    let pack_keys = merkle_tox_core::crypto::PackKeys::Exception;
+    let wire_node = text_node.pack_wire(&pack_keys, true).unwrap();
 
-    g.bench_function("unpack_wire_text_compressed", |b| {
-        b.iter(|| {
-            black_box(MerkleNode::unpack_wire(black_box(&wire_node), black_box(&keys)).unwrap())
-        })
+    g.bench_function("unpack_wire_exception_text_compressed", |b| {
+        b.iter(|| black_box(MerkleNode::unpack_wire_exception(black_box(&wire_node)).unwrap()))
     });
 
     let large_text = "a".repeat(2048);
     let large_node = make_dummy_node(Content::Text(large_text));
-    let wire_large = large_node.pack_wire(&keys, true).unwrap();
+    let wire_large = large_node.pack_wire(&pack_keys, true).unwrap();
 
-    g.bench_function("unpack_wire_large_text_compressed", |b| {
-        b.iter(|| {
-            black_box(MerkleNode::unpack_wire(black_box(&wire_large), black_box(&keys)).unwrap())
-        })
+    g.bench_function("unpack_wire_exception_large_text_compressed", |b| {
+        b.iter(|| black_box(MerkleNode::unpack_wire_exception(black_box(&wire_large)).unwrap()))
     });
 
     g.finish();
@@ -142,7 +138,6 @@ fn bench_sync_messages(c: &mut Criterion) {
         conversation_id: ConversationId::from([11; 32]),
         cells: iblt.into_cells(),
         range: SyncRange {
-            epoch: 1,
             min_rank: 0,
             max_rank: 1000,
         },

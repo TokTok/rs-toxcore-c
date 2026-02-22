@@ -1,7 +1,7 @@
 use crate::crypto::ConversationKeys;
 use crate::dag::{
-    Content, ControlAction, ConversationId, Ed25519Signature, LogicalIdentityPk, MerkleNode,
-    NodeAuth, NodeMac, Permissions, PhysicalDevicePk,
+    Content, ControlAction, Ed25519Signature, LogicalIdentityPk, MerkleNode, NodeAuth, Permissions,
+    PhysicalDevicePk,
 };
 use ed25519_dalek::Signer;
 
@@ -30,15 +30,19 @@ impl NodeBuilder {
                 permissions: Permissions::ALL,
                 flags: 0,
                 created_at: 0,
-                pow_nonce: 0,
             }),
             metadata: vec![],
-            authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])), // Placeholder
+            authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])), // Placeholder
+            pow_nonce: 0,
         };
 
-        // 1-on-1 Genesis nodes use MAC and don't require PoW.
-        let auth_data = node.serialize_for_auth(&ConversationId::from([0u8; 32]));
-        node.authentication = NodeAuth::Mac(keys.calculate_mac(&auth_data));
+        // 1-on-1 Genesis nodes use a MAC-derived pseudo-signature for authentication.
+        // MAC bytes are embedded in the first 32 bytes of the 64-byte signature field.
+        let auth_data = node.serialize_for_auth();
+        let mac = keys.calculate_mac(&auth_data);
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[..32].copy_from_slice(mac.as_bytes());
+        node.authentication = NodeAuth::EphemeralSignature(Ed25519Signature::from(sig_bytes));
 
         node
     }
@@ -64,32 +68,29 @@ impl NodeBuilder {
                 permissions: Permissions::ALL,
                 flags,
                 created_at: timestamp,
-                pow_nonce: 0,
             }),
             metadata: vec![],
             authentication: NodeAuth::Signature(Ed25519Signature::from([0u8; 64])), // Placeholder
+            pow_nonce: 0,
         };
 
-        // Solve PoW
+        // Sign first: signature is stable because pow_nonce is excluded
+        // from serialization (#[tox(skip)]).
+        let auth_data = node.serialize_for_auth();
+        let sig = signing_key.sign(&auth_data).to_bytes();
+        node.authentication = NodeAuth::Signature(Ed25519Signature::from(sig));
+
+        // Solve PoW: iterate nonces using external formula.
+        // node.hash() is stable because pow_nonce is #[tox(skip)].
+        let node_hash = node.hash();
         let mut nonce = 0u64;
         loop {
-            if let Content::Control(ControlAction::Genesis {
-                ref mut pow_nonce, ..
-            }) = node.content
-            {
-                *pow_nonce = nonce;
-            }
-
-            // Signature depends on pow_nonce
-            let auth_data = node.serialize_for_auth(&ConversationId::from([0u8; 32]));
-            let sig = signing_key.sign(&auth_data).to_bytes();
-            node.authentication = NodeAuth::Signature(Ed25519Signature::from(sig));
-
-            if node.validate_pow() {
+            if crate::dag::validate_pow(creator_pk.as_bytes(), &node_hash, nonce) {
                 break;
             }
             nonce += 1;
         }
+        node.pow_nonce = nonce;
 
         node
     }

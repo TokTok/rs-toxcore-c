@@ -21,7 +21,6 @@ fn test_pow_solve_and_verify() {
         conversation_id: ConversationId::from([0; 32]),
         cells: Vec::new(),
         range: tox_reconcile::SyncRange {
-            epoch: 0,
             min_rank: 0,
             max_rank: 0,
         },
@@ -51,7 +50,6 @@ fn test_pow_incorrect_solution() {
         conversation_id: ConversationId::from([0; 32]),
         cells: Vec::new(),
         range: tox_reconcile::SyncRange {
-            epoch: 0,
             min_rank: 0,
             max_rank: 0,
         },
@@ -79,7 +77,6 @@ fn test_pow_expired_challenge() {
         conversation_id: ConversationId::from([0; 32]),
         cells: Vec::new(),
         range: tox_reconcile::SyncRange {
-            epoch: 0,
             min_rank: 0,
             max_rank: 0,
         },

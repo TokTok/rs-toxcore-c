@@ -2,19 +2,16 @@
 
 ## Overview
 
-Merkle-Tox is a decentralized, eventually consistent system. Verifying its
-correctness requires testing not just individual components, but the emergent
-behavior of a distributed swarm under adverse conditions.
+Verifying Merkle-Tox requires testing the emergent behavior of a distributed
+swarm under adverse conditions.
 
-This document defines the architecture for the **Merkle-Tox Benchmark & Chaos
-Laboratory**, a suite designed to simulate large-scale network topologies,
-inject impairments (loss, latency, partitions), and bridge virtual simulations
-with real-world Tox nodes.
+This sub-design defines the **Merkle-Tox Benchmark & Chaos Laboratory**, a suite
+simulating network topologies, injecting impairments, and bridging virtual
+simulations with real-world Tox nodes.
 
 ## 1. Abstractions
 
-To support a unified testing environment, we decouple the protocol logic from
-the physical networking and time.
+Decouples protocol logic from physical networking and time.
 
 ### A. `Transport` Trait
 
@@ -79,8 +76,8 @@ The Hub applies a pipeline of impairments to every packet before delivery:
 
 ## 3. Hybrid Connectivity (Real + Virtual)
 
-An essential feature of the benchmark suite is the ability to bridge simulated
-environments with the real Tox network via a **Gateway Node**.
+The benchmark suite bridges simulated environments with the real Tox network via
+a **Gateway Node**.
 
 ### Gateway Logic
 

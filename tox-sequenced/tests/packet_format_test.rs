@@ -127,8 +127,12 @@ fn test_all_message_type_discriminants() {
         (SyncReconFail, 0x0B),
         (SyncShardChecksums, 0x0C),
         (HandshakeError, 0x0D),
-        (ReconPowChallenge, 0x0E),
-        (ReconPowSolution, 0x0F),
+        (SyncRateLimited, 0x0E),
+        (KeywrapAck, 0x0F),
+        (ReinclusionRequest, 0x10),
+        (ReinclusionResponse, 0x11),
+        (ReconPowChallenge, 0x12),
+        (ReconPowSolution, 0x13),
     ];
 
     for (mtype, expected_id) in cases {

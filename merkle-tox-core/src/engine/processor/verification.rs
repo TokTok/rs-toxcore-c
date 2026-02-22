@@ -1,7 +1,7 @@
 use crate::NodeEvent;
 use crate::dag::{
     Content, ControlAction, ConversationId, KConv, LogicalIdentityPk, MerkleNode, NodeAuth,
-    NodeType, Permissions,
+    NodeHash, NodeType, Permissions,
 };
 use crate::engine::processor::VerifiedNode;
 use crate::engine::{Conversation, ConversationData, Effect, MerkleToxEngine, conversation};
@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 const VOUCH_THRESHOLD: usize = 1;
 
 impl MerkleToxEngine {
-    /// Handles a received Merkle node.
+    /// Handles received Merkle node.
     pub fn handle_node(
         &mut self,
         conversation_id: ConversationId,
@@ -21,10 +21,11 @@ impl MerkleToxEngine {
         store: &dyn NodeStore,
         blob_store: Option<&dyn BlobStore>,
     ) -> MerkleToxResult<Vec<Effect>> {
+        self.clear_pending();
         self.handle_node_internal_ext(conversation_id, node, store, blob_store, true)
     }
 
-    pub(crate) fn handle_node_internal_ext(
+    pub fn handle_node_internal_ext(
         &mut self,
         conversation_id: ConversationId,
         node: MerkleNode,
@@ -39,10 +40,16 @@ impl MerkleToxEngine {
         let is_bootstrap = matches!(
             node.content,
             Content::KeyWrap { .. }
-                | Content::RatchetSnapshot { .. }
+                | Content::HistoryExport { .. }
+                | Content::SenderKeyDistribution { .. }
                 | Content::Control(ControlAction::Genesis { .. })
                 | Content::Control(ControlAction::AuthorizeDevice { .. })
+                | Content::Control(ControlAction::AnchorSnapshot { .. })
         );
+
+        // Collect OPK IDs consumed during verification for deferred deletion
+        // (cannot mutate self.ephemeral_keys while overlay holds &self.pending_cache).
+        let mut opk_ids_to_consume: Vec<NodeHash> = Vec::new();
 
         let (verified, authentic) = {
             let overlay = crate::engine::EngineStore {
@@ -51,6 +58,16 @@ impl MerkleToxEngine {
             };
 
             if overlay.is_verified(&node_hash) {
+                return Ok(effects);
+            }
+
+            // Deduplicate speculative nodes for external submissions.
+            // If node already stored (even as unverified/speculative),
+            // skip re-processing avoiding duplicate WriteStore effects.
+            // Internal re-verification calls (reverify=false) must be
+            // allowed through so speculative nodes can be promoted to
+            // verified when new identity state becomes available.
+            if reverify && overlay.has_node(&node_hash) {
                 return Ok(effects);
             }
 
@@ -68,10 +85,39 @@ impl MerkleToxEngine {
             let mut authentic = false;
             let mut quarantined = false;
 
-            // Hard Monotonicity Check
-            let mut max_parent_ts = 0;
+            // Timestamp lower-bound check: spec §3 says ts >= oldest_parent_ts - 10min.
+            let mut min_parent_ts = i64::MAX;
+
+            let mut admin_ancestor_hashes = std::collections::HashSet::new();
+            let mut stack = node.parents.clone();
+            let mut visited = std::collections::HashSet::new();
+
+            while let Some(parent_hash) = stack.pop() {
+                if visited.insert(parent_hash)
+                    && let Some(parent_node) = overlay.get_node(&parent_hash)
+                {
+                    if parent_node.node_type() == crate::dag::NodeType::Admin {
+                        admin_ancestor_hashes.insert(parent_hash);
+                    }
+                    if let Some(cached) = self.admin_ancestors_cache.lock().get(&parent_hash) {
+                        admin_ancestor_hashes.extend(cached.iter().cloned());
+                    } else {
+                        stack.extend(parent_node.parents.clone());
+                    }
+                }
+            }
+            self.admin_ancestors_cache.lock().put(
+                node.hash(),
+                std::sync::Arc::new(admin_ancestor_hashes.clone()),
+            );
+
+            let ctx = crate::identity::CausalContext {
+                evaluating_node_hash: node.hash(),
+                admin_ancestor_hashes,
+            };
 
             let is_authorized = self.identity_manager.is_authorized(
+                &ctx,
                 conversation_id,
                 &node.sender_pk,
                 &node.author_pk,
@@ -81,7 +127,7 @@ impl MerkleToxEngine {
 
             for p in &node.parents {
                 if let Some(parent_node) = overlay.get_node(p) {
-                    max_parent_ts = max_parent_ts.max(parent_node.network_timestamp);
+                    min_parent_ts = min_parent_ts.min(parent_node.network_timestamp);
                 }
 
                 if !overlay.is_verified(p) && !is_bootstrap {
@@ -112,12 +158,12 @@ impl MerkleToxEngine {
                 }
             }
 
-            if node.network_timestamp < max_parent_ts {
+            if min_parent_ts != i64::MAX && node.network_timestamp < min_parent_ts - 600_000 {
                 debug!(
-                    "Node {} quarantined: timestamp {} < max parent timestamp {}",
+                    "Node {} quarantined: timestamp {} < oldest parent timestamp {} - 10min",
                     hex::encode(node_hash.as_bytes()),
                     node.network_timestamp,
-                    max_parent_ts
+                    min_parent_ts
                 );
                 quarantined = true;
             }
@@ -144,7 +190,7 @@ impl MerkleToxEngine {
                     .identity_manager
                     .has_authorization_record(conversation_id, &node.sender_pk)
             {
-                self.check_permissions(conversation_id, &node, node.network_timestamp)?;
+                self.check_permissions(&ctx, conversation_id, &node, node.network_timestamp)?;
             }
 
             if is_authorized {
@@ -158,18 +204,45 @@ impl MerkleToxEngine {
                 );
 
                 if node.sequence_number <= last_verified_seq {
-                    warn!(
-                        "Node {} has invalid sequence number {} (last verified was {})",
+                    // Check ratchet state to distinguish legitimate
+                    // out-of-order delivery from sequence number replay.
+                    // If ratchet consumed this seq and no skipped key
+                    // remains, key was already used: reject as replay.
+                    let is_replay = if let Some(Conversation::Established(em)) =
+                        self.conversations.get(&conversation_id)
+                    {
+                        let epoch = node.sequence_number >> 32;
+                        if let Some(&(last_seq, _, _, last_epoch)) =
+                            em.state.sender_ratchets.get(&node.sender_pk)
+                        {
+                            last_epoch == epoch
+                                && node.sequence_number <= last_seq
+                                && !em
+                                    .state
+                                    .skipped_keys
+                                    .contains_key(&(node.sender_pk, node.sequence_number))
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if is_replay {
+                        return Err(MerkleToxError::Validation(
+                            crate::dag::ValidationError::InvalidSequenceNumber {
+                                actual: node.sequence_number,
+                                last: last_verified_seq,
+                            },
+                        ));
+                    }
+
+                    debug!(
+                        "Node {} has out-of-order sequence number {} (last verified was {})",
                         hex::encode(node_hash.as_bytes()),
                         node.sequence_number,
                         last_verified_seq
                     );
-                    return Err(MerkleToxError::Validation(
-                        crate::dag::ValidationError::InvalidSequenceNumber {
-                            actual: node.sequence_number,
-                            last: last_verified_seq,
-                        },
-                    ));
                 }
 
                 if node.sequence_number > last_verified_seq + 1 {
@@ -179,9 +252,9 @@ impl MerkleToxEngine {
                         node.sequence_number,
                         last_verified_seq
                     );
-                    // We don't mark as quarantined here anymore, because we want to allow
+                    // We don't mark quarantined here anymore, to allow
                     // skipping unverifiable nodes (like old KeyWraps).
-                    // The parent-is-verified check will handle topological ordering.
+                    // Parent-is-verified check handles topological ordering.
                 }
 
                 if (last_verified_seq & 0xFFFFFFFF) >= MAX_VERIFIED_NODES_PER_DEVICE {
@@ -198,69 +271,93 @@ impl MerkleToxEngine {
             let mut verified = false;
             if is_authorized {
                 if let Content::KeyWrap {
-                    epoch,
+                    generation,
+                    anchor_hash: _,
                     wrapped_keys,
                     ephemeral_pk,
-                    pre_key_pk,
                 } = &node.content
                 {
                     let mut k_conv_received = None;
-                    if let (Some(e_a), Some(spk_b_pk)) = (ephemeral_pk, pre_key_pk)
-                        && let Some(spk_b_sk) = self.ephemeral_keys.get(spk_b_pk)
-                        && let Some(sk) = &self.self_sk
-                        && let Some(sk_shared) = crate::crypto::x3dh_derive_secret_recipient(
-                            sk,
-                            spk_b_sk,
-                            &node.sender_pk,
-                            e_a,
-                            None,
-                        )
-                    {
-                        for wrapped in wrapped_keys {
-                            if wrapped.recipient_pk == self.self_pk
-                                && wrapped.ciphertext.len() == 32
-                            {
-                                use chacha20::cipher::{KeyIvInit, StreamCipher};
-                                let mut k = [0u8; 32];
-                                k.copy_from_slice(&wrapped.ciphertext);
-                                let mut cipher = chacha20::ChaCha20::new(
-                                    sk_shared.as_bytes().into(),
-                                    &[0u8; 12].into(),
+                    // Try ECIES unwrap using SPK secrets.
+                    // If opk_id is non-zero, find and use OPK private key.
+                    for wrapped in wrapped_keys {
+                        if wrapped.recipient_pk == self.self_pk {
+                            // OPK collision detection (merkle-tox-handshake-ecies.md §5)
+                            if wrapped.opk_id != NodeHash::from([0u8; 32]) {
+                                if let Some((_prev_hash, prev_sender, prev_rank)) =
+                                    self.consumed_opk_ids.get(&wrapped.opk_id)
+                                {
+                                    // Collision detected: same OPK consumed by two KeyWraps.
+                                    // Deterministic tie-breaker: lower topological_rank wins,
+                                    // then lexicographic sender_pk.
+                                    let this_wins = (node.topological_rank, &node.sender_pk)
+                                        < (*prev_rank, prev_sender);
+                                    if !this_wins {
+                                        debug!(
+                                            "OPK collision: discarding entry from {:?} (rank {}), winner at rank {}",
+                                            node.sender_pk, node.topological_rank, prev_rank
+                                        );
+                                        continue; // skip this entry
+                                    }
+                                    debug!(
+                                        "OPK collision: new entry from {:?} (rank {}) wins over {:?} (rank {})",
+                                        node.sender_pk,
+                                        node.topological_rank,
+                                        prev_sender,
+                                        prev_rank
+                                    );
+                                    // New entry wins: overwrite below
+                                }
+                                // Record OPK consumption
+                                self.consumed_opk_ids.insert(
+                                    wrapped.opk_id,
+                                    (node_hash, node.sender_pk, node.topological_rank),
                                 );
-                                cipher.apply_keystream(&mut k);
-                                k_conv_received = Some(KConv::from(k));
+                            }
+                            let opk_sk = self.find_opk_sk(&wrapped.opk_id);
+                            for spk_sk in self.ephemeral_keys.values() {
+                                if let Some(pt) = crate::crypto::ecies_unwrap_32(
+                                    spk_sk,
+                                    ephemeral_pk,
+                                    opk_sk,
+                                    None,
+                                    &wrapped.ciphertext,
+                                ) {
+                                    k_conv_received = Some(KConv::from(pt));
+                                    break;
+                                }
+                            }
+                            // Also try device DH key as SPK fallback
+                            if k_conv_received.is_none()
+                                && let Some(sk) = &self.self_dh_sk
+                            {
+                                let dh_as_eph = crate::dag::EphemeralX25519Sk::from(*sk.as_bytes());
+                                if let Some(pt) = crate::crypto::ecies_unwrap_32(
+                                    &dh_as_eph,
+                                    ephemeral_pk,
+                                    opk_sk,
+                                    None,
+                                    &wrapped.ciphertext,
+                                ) {
+                                    k_conv_received = Some(KConv::from(pt));
+                                }
+                            }
+                            // Consume OPK private key for forward secrecy
+                            if k_conv_received.is_some() {
+                                opk_ids_to_consume.push(wrapped.opk_id);
                                 break;
                             }
                         }
                     }
-                    if k_conv_received.is_none()
-                        && let Some(sk) = &self.self_dh_sk
-                    {
-                        for wrapped in wrapped_keys {
-                            if wrapped.recipient_pk == self.self_pk {
-                                if let Some(e_a) = ephemeral_pk {
-                                    // Alice used an ephemeral key for this rotation
-                                    k_conv_received =
-                                        crate::crypto::ConversationKeys::unwrap_from_x25519(
-                                            sk.as_bytes(),
-                                            e_a.as_bytes(),
-                                            &wrapped.ciphertext,
-                                        );
-                                } else {
-                                    // Alice used her static key (backward compatibility)
-                                    k_conv_received = crate::crypto::ConversationKeys::unwrap_from(
-                                        sk.as_bytes(),
-                                        &node.sender_pk,
-                                        &wrapped.ciphertext,
-                                    );
-                                }
-                                if k_conv_received.is_some() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
                     if let Some(k_conv) = k_conv_received {
+                        // Send KEYWRAP_ACK to sender (off-DAG, §5)
+                        effects.push(Effect::SendPacket(
+                            node.sender_pk,
+                            crate::ProtocolMessage::KeywrapAck {
+                                keywrap_hash: node_hash,
+                                recipient_pk: self.self_pk,
+                            },
+                        ));
                         let em =
                             match self
                                 .conversations
@@ -273,46 +370,182 @@ impl MerkleToxEngine {
                                     )
                                 }) {
                                 Conversation::Pending(p) => {
-                                    p.establish(k_conv.clone(), node.network_timestamp, *epoch)
+                                    let mut est = p.establish(
+                                        k_conv.clone(),
+                                        node.network_timestamp,
+                                        *generation,
+                                    );
+                                    // Mark identity_pending when establishing from KeyWrap
+                                    // whose sender lacks verified Genesis chain.
+                                    let has_genesis = self
+                                        .identity_manager
+                                        .get_founder(&conversation_id)
+                                        .is_some();
+                                    est.state.identity_pending = !has_genesis;
+                                    est
                                 }
                                 Conversation::Established(mut e) => {
-                                    e.add_epoch(*epoch, k_conv.clone());
+                                    e.add_epoch(*generation, k_conv.clone());
                                     e
                                 }
                             };
                         effects.push(Effect::WriteConversationKey(
                             conversation_id,
-                            *epoch,
+                            *generation,
                             k_conv,
                         ));
                         self.conversations
                             .insert(conversation_id, Conversation::Established(em));
+                        // Track handshake for announcement rotation
+                        *self
+                            .handshake_count_since_announcement
+                            .entry(conversation_id)
+                            .or_insert(0) += 1;
+                        // Clear trust-restored state: device fully re-included
+                        self.trust_restored_devices
+                            .remove(&(conversation_id, self.self_pk));
                     }
-                } else if let Content::RatchetSnapshot { epoch, ciphertext } = &node.content
-                    && let Some(sk) = &self.self_dh_sk
-                    && let Ok(wrapped_keys) =
-                        tox_proto::deserialize::<Vec<crate::dag::WrappedKey>>(ciphertext)
+                } else if let Content::SenderKeyDistribution {
+                    ephemeral_pk: skd_ephemeral_pk,
+                    wrapped_keys,
+                    ..
+                } = &node.content
                 {
+                    // Unwrap SenderKey distributed via ECIES.
+                    // SKD wraps per-sender random SenderKey (not k_conv).
+                    // auth_secret = ECDH(sender_x25519, recipient_spk).
+                    // Payload is 32 bytes for rotation SKD or 72 bytes for JIT SKD.
+                    let sender_x25519_pk =
+                        crate::crypto::device_pk_to_x25519(node.sender_pk.as_bytes());
+                    let mut skd_payload: Option<Vec<u8>> = None;
                     for wrapped in wrapped_keys {
                         if wrapped.recipient_pk == self.self_pk {
-                            if let Some(k_conv) = crate::crypto::ConversationKeys::unwrap_from(
-                                sk.as_bytes(),
-                                &node.sender_pk,
-                                &wrapped.ciphertext,
-                            ) {
-                                let chain_key = k_conv.to_chain_key();
-                                if let Some(Conversation::Established(em)) =
-                                    self.conversations.get_mut(&conversation_id)
-                                    && em.current_epoch() == *epoch
-                                {
-                                    em.commit_node_key(
-                                        node.sender_pk,
-                                        node.sequence_number,
-                                        chain_key,
-                                        node_hash,
-                                        *epoch,
-                                    );
+                            let opk_sk = self.find_opk_sk(&wrapped.opk_id);
+                            // Try each SPK secret
+                            for spk_sk in self.ephemeral_keys.values() {
+                                let spk = x25519_dalek::StaticSecret::from(*spk_sk.as_bytes());
+                                let auth_secret = *spk.diffie_hellman(&sender_x25519_pk).as_bytes();
+                                if let Some(pt) = crate::crypto::ecies_unwrap(
+                                    spk_sk,
+                                    skd_ephemeral_pk,
+                                    opk_sk,
+                                    Some(&auth_secret),
+                                    &wrapped.ciphertext,
+                                ) {
+                                    skd_payload = Some(pt);
+                                    break;
                                 }
+                            }
+                            // Also try device DH key as SPK for backward compat
+                            if skd_payload.is_none()
+                                && let Some(sk) = &self.self_dh_sk
+                            {
+                                let dh_as_eph = crate::dag::EphemeralX25519Sk::from(*sk.as_bytes());
+                                let spk = x25519_dalek::StaticSecret::from(*sk.as_bytes());
+                                let auth_secret = *spk.diffie_hellman(&sender_x25519_pk).as_bytes();
+                                if let Some(pt) = crate::crypto::ecies_unwrap(
+                                    &dh_as_eph,
+                                    skd_ephemeral_pk,
+                                    opk_sk,
+                                    Some(&auth_secret),
+                                    &wrapped.ciphertext,
+                                ) {
+                                    skd_payload = Some(pt);
+                                }
+                            }
+                            // Consume OPK private key for forward secrecy
+                            if skd_payload.is_some() {
+                                opk_ids_to_consume.push(wrapped.opk_id);
+                                break;
+                            }
+                        }
+                    }
+                    // Dispatch on payload length: 32-byte = rotation SKD (root SenderKey),
+                    // 72-byte = JIT SKD (K_chain || last_seq || K_header).
+                    if let Some(payload) = skd_payload {
+                        let epoch = node.sequence_number >> 32;
+                        if let Some(Conversation::Established(em)) =
+                            self.conversations.get_mut(&conversation_id)
+                        {
+                            if payload.len() == 32 {
+                                // Rotation SKD: store root SenderKey
+                                let mut sk = [0u8; 32];
+                                sk.copy_from_slice(&payload);
+                                em.state.sender_keys.insert(
+                                    (node.sender_pk, epoch),
+                                    crate::dag::SenderKey::from(sk),
+                                );
+                            } else if payload.len() == 72 {
+                                // JIT SKD: extract (K_chain, last_seq, K_header)
+                                let mut chain_key = [0u8; 32];
+                                chain_key.copy_from_slice(&payload[0..32]);
+                                let last_seq =
+                                    u64::from_be_bytes(payload[32..40].try_into().unwrap());
+                                let mut k_header = [0u8; 32];
+                                k_header.copy_from_slice(&payload[40..72]);
+                                // Seed ratchet at provided position
+                                em.state.sender_ratchets.insert(
+                                    node.sender_pk,
+                                    (last_seq, crate::dag::ChainKey::from(chain_key), None, epoch),
+                                );
+                                // Store K_header for routing decryption
+                                em.state.jit_headers.insert(
+                                    (node.sender_pk, epoch),
+                                    crate::dag::HeaderKey::from(k_header),
+                                );
+                            }
+                        }
+                    }
+                } else if let Content::HistoryExport {
+                    blob_hash,
+                    ephemeral_pk: he_ephemeral_pk,
+                    wrapped_keys,
+                } = &node.content
+                {
+                    // Register blob_hash for CAS fetching when we are recipient.
+                    // Unwrapped bytes are K_export: fresh key used to encrypt blob.
+                    for wrapped in wrapped_keys {
+                        if wrapped.recipient_pk == self.self_pk {
+                            let mut k_export: Option<[u8; 32]> = None;
+                            let opk_sk = self.find_opk_sk(&wrapped.opk_id);
+                            for spk_sk in self.ephemeral_keys.values() {
+                                if let Some(pt) = crate::crypto::ecies_unwrap_32(
+                                    spk_sk,
+                                    he_ephemeral_pk,
+                                    opk_sk,
+                                    None,
+                                    &wrapped.ciphertext,
+                                ) {
+                                    k_export = Some(pt);
+                                    break;
+                                }
+                            }
+                            // Also try device DH key as SPK
+                            if k_export.is_none()
+                                && let Some(sk) = &self.self_dh_sk
+                            {
+                                let dh_as_eph = crate::dag::EphemeralX25519Sk::from(*sk.as_bytes());
+                                k_export = crate::crypto::ecies_unwrap_32(
+                                    &dh_as_eph,
+                                    he_ephemeral_pk,
+                                    opk_sk,
+                                    None,
+                                    &wrapped.ciphertext,
+                                );
+                            }
+                            // Consume OPK private key for forward secrecy
+                            if k_export.is_some() {
+                                opk_ids_to_consume.push(wrapped.opk_id);
+                                let info = crate::cas::BlobInfo {
+                                    hash: *blob_hash,
+                                    size: 0,
+                                    bao_root: None,
+                                    status: crate::cas::BlobStatus::Pending,
+                                    received_mask: None,
+                                    decryption_key: k_export,
+                                };
+                                self.blob_syncs
+                                    .insert(*blob_hash, crate::cas::SwarmSync::new(info));
                             }
                             break;
                         }
@@ -320,26 +553,85 @@ impl MerkleToxEngine {
                 }
             }
 
-            if let NodeAuth::Mac(_) = &node.authentication {
-                if let Some(Conversation::Established(em)) =
-                    self.conversations.get_mut(&conversation_id)
-                {
-                    if em.verify_node_mac(&conversation_id, &node) {
-                        authentic = true;
+            if let NodeAuth::EphemeralSignature(sig) = &node.authentication {
+                if matches!(
+                    &node.content,
+                    Content::Control(ControlAction::Genesis { .. })
+                ) {
+                    // Genesis: verify MAC embedded in first 32 bytes of signature
+                    if let Some(Conversation::Established(em)) =
+                        self.conversations.get(&conversation_id)
+                        && let Some(keys) = em.get_keys(0)
+                    {
+                        let auth_data = node.serialize_for_auth();
+                        let mac = keys.calculate_mac(&auth_data);
+                        if sig.as_bytes()[..32] == *mac.as_bytes() {
+                            authentic = true;
+                        }
                     }
-
-                    if !authentic {
-                        debug!(
-                            "Node {} MAC verification failed after trying all epochs",
-                            hex::encode(node_hash.as_bytes())
-                        );
+                } else {
+                    // Content nodes: verify ephemeral signature against stored
+                    // peer ephemeral signing public key for sender's epoch.
+                    let epoch = node.sequence_number >> 32;
+                    // DARE §2: SKD for epoch n is signed with epoch n-1's key.
+                    let lookup_epoch =
+                        if matches!(&node.content, Content::SenderKeyDistribution { .. }) {
+                            epoch.saturating_sub(1)
+                        } else {
+                            epoch
+                        };
+                    if let Some(epk) = self
+                        .peer_ephemeral_signing_keys
+                        .get(&(node.sender_pk, lookup_epoch))
+                    {
+                        let vk = ed25519_dalek::VerifyingKey::from_bytes(epk.as_bytes());
+                        if let Ok(vk) = vk {
+                            let ed_sig = ed25519_dalek::Signature::from_bytes(sig.as_bytes());
+                            // Encrypt-then-sign: for content nodes, try
+                            // verifying against wire node's auth data
+                            // (ciphertext) first. Fall back to plaintext
+                            // auth data for direct API / legacy compat.
+                            if !node.is_exception_node() {
+                                if let Some(wire) = overlay.get_wire_node(&node_hash) {
+                                    let wire_auth = wire.serialize_for_auth();
+                                    if vk.verify_strict(&wire_auth, &ed_sig).is_ok() {
+                                        authentic = true;
+                                    }
+                                }
+                                if !authentic {
+                                    let plain_auth = node.serialize_for_auth();
+                                    if vk.verify_strict(&plain_auth, &ed_sig).is_ok() {
+                                        authentic = true;
+                                    }
+                                }
+                            } else {
+                                let auth_data = node.serialize_for_auth();
+                                if vk.verify_strict(&auth_data, &ed_sig).is_ok() {
+                                    authentic = true;
+                                }
+                            }
+                        }
                     }
                 }
             } else if let NodeAuth::Signature(_) = &node.authentication {
                 authentic = true;
             }
 
-            if authentic && structurally_valid && !quarantined {
+            // For unauthorized AnchorSnapshot nodes the generic path must be
+            // skipped: speculative trust requires a founder-signed ADMIN cert,
+            // checked in the dedicated branch below.
+            let skip_generic_path = !is_authorized
+                && matches!(
+                    &node.content,
+                    Content::Control(ControlAction::AnchorSnapshot { .. })
+                        | Content::Control(ControlAction::SoftAnchor { .. })
+                );
+
+            if authentic && structurally_valid && !quarantined && !skip_generic_path {
+                verified = true;
+            } else if !is_authorized && !quarantined && structurally_valid && !skip_generic_path {
+                // Vouched: unauthorized node passed vouch threshold (line ~146),
+                // so enough authorized members referenced it as a parent.
                 verified = true;
             } else if !is_authorized
                 && !quarantined
@@ -347,33 +639,70 @@ impl MerkleToxEngine {
                 && self
                     .identity_manager
                     .authorize_device(
+                        &ctx,
                         conversation_id,
                         node.author_pk,
                         cert,
                         node.network_timestamp,
                         node.topological_rank,
+                        node.hash(),
                     )
                     .is_ok()
                 && structurally_valid
             {
                 verified = true;
+            } else if !is_authorized
+                && !quarantined
+                && structurally_valid
+                && let Content::Control(ControlAction::AnchorSnapshot { cert, data: _ }) =
+                    &node.content
+            {
+                if let Some(founder_pk) = self.identity_manager.get_founder(&conversation_id) {
+                    let sig_ok = crate::identity::verify_delegation(
+                        cert,
+                        founder_pk,
+                        node.network_timestamp,
+                    )
+                    .is_ok();
+                    let has_admin = cert.permissions.contains(crate::dag::Permissions::ADMIN);
+                    let device_bound = cert.device_pk == node.sender_pk;
+                    if sig_ok && has_admin && device_bound {
+                        verified = true;
+                        tracing::debug!(
+                            "AnchorSnapshot verified against Genesis founder's key. Speculative 'Identity Pending' mode active."
+                        );
+                    } else if sig_ok && !has_admin {
+                        tracing::warn!(
+                            "AnchorSnapshot certificate valid but lacks ADMIN permission: rejecting speculative trust."
+                        );
+                    } else {
+                        tracing::warn!(
+                            "AnchorSnapshot certificate failed verification against Founder's key."
+                        );
+                    }
+                } else {
+                    tracing::warn!("Could not find Founder PK for AnchorSnapshot verification.");
+                }
+            } else if !is_authorized
+                && !quarantined
+                && structurally_valid
+                && let Content::Control(ControlAction::SoftAnchor { cert, .. }) = &node.content
+                && let Some(founder_pk) = self.identity_manager.get_founder(&conversation_id)
+            {
+                let sig_ok =
+                    crate::identity::verify_delegation(cert, founder_pk, node.network_timestamp)
+                        .is_ok();
+                let has_admin = cert.permissions.contains(crate::dag::Permissions::ADMIN);
+                let device_bound = cert.device_pk == node.sender_pk;
+                if sig_ok && has_admin && device_bound {
+                    verified = true;
+                    tracing::debug!("SoftAnchor verified against Genesis founder's key.");
+                }
             }
 
             if verified {
                 overlay.put_node(&conversation_id, node.clone(), true)?;
-                debug!(
-                    "Node {} verified and added to overlay",
-                    hex::encode(node_hash.as_bytes())
-                );
             } else {
-                debug!(
-                    "Node {} NOT verified. structurally_valid={}, authentic={}, is_authorized={}, quarantined={}",
-                    hex::encode(node_hash.as_bytes()),
-                    structurally_valid,
-                    authentic,
-                    is_authorized,
-                    quarantined
-                );
                 let (_, spec_count) = overlay.get_node_counts(&conversation_id);
                 if spec_count >= MAX_SPECULATIVE_NODES_PER_CONVERSATION {
                     warn!(
@@ -390,6 +719,11 @@ impl MerkleToxEngine {
 
             (verified, authentic)
         };
+
+        // Consume OPK private keys for forward secrecy (deferred from inside overlay scope)
+        for opk_id in opk_ids_to_consume {
+            self.consume_opk_sk(&opk_id);
+        }
 
         // Ensure conversation entry exists
         self.conversations
@@ -446,16 +780,31 @@ impl MerkleToxEngine {
         }
 
         if reverify && (authentic || verified) {
-            effects.extend(self.reverify_speculative_for_conversation(conversation_id, store));
+            // Process opaque nodes first: they may unpack into MerkleNodes
+            // that are parents of speculative nodes.  Processing them first
+            // ensures those parents are verified before we re-check
+            // quarantined speculative nodes.
             effects.extend(self.reverify_opaque_nodes(conversation_id, store));
+            effects.extend(self.reverify_speculative_for_conversation(conversation_id, store));
         }
 
         if verified {
-            effects.push(Effect::EmitEvent(NodeEvent::NodeVerified {
-                conversation_id,
-                hash: node_hash,
-                node,
-            }));
+            let is_identity_pending = self.conversations.get(&conversation_id).is_some_and(
+                |c| matches!(c, Conversation::Established(e) if e.state.identity_pending),
+            );
+            if is_identity_pending {
+                effects.push(Effect::EmitEvent(NodeEvent::NodeIdentityPending {
+                    conversation_id,
+                    hash: node_hash,
+                    node,
+                }));
+            } else {
+                effects.push(Effect::EmitEvent(NodeEvent::NodeVerified {
+                    conversation_id,
+                    hash: node_hash,
+                    node,
+                }));
+            }
         } else {
             effects.push(Effect::EmitEvent(NodeEvent::NodeSpeculative {
                 conversation_id,
@@ -512,6 +861,7 @@ impl MerkleToxEngine {
     /// Checks if the sender has required permissions for the node's content.
     fn check_permissions(
         &self,
+        ctx: &crate::identity::CausalContext,
         conversation_id: ConversationId,
         node: &MerkleNode,
         now: i64,
@@ -519,6 +869,7 @@ impl MerkleToxEngine {
         let actual = self
             .identity_manager
             .get_permissions(
+                ctx,
                 conversation_id,
                 &node.sender_pk,
                 &node.author_pk,
@@ -532,17 +883,21 @@ impl MerkleToxEngine {
             | Content::Blob { .. }
             | Content::Reaction { .. }
             | Content::Location { .. }
+            | Content::Edit { .. }
             | Content::Redaction { .. }
-            | Content::Other { .. }
-            | Content::RatchetSnapshot { .. } => Permissions::MESSAGE,
+            | Content::Custom { .. }
+            | Content::HistoryExport { .. }
+            | Content::LegacyBridge { .. }
+            | Content::SenderKeyDistribution { .. } => Permissions::MESSAGE,
             Content::Control(action) => match action {
                 ControlAction::AuthorizeDevice { .. }
                 | ControlAction::RevokeDevice { .. }
                 | ControlAction::SetTitle(_)
                 | ControlAction::SetTopic(_)
                 | ControlAction::Invite(_)
-                | ControlAction::Snapshot { .. }
-                | ControlAction::Rekey { .. }
+                | ControlAction::Snapshot(_)
+                | ControlAction::AnchorSnapshot { .. }
+                | ControlAction::SoftAnchor { .. }
                 | ControlAction::Genesis { .. } => Permissions::ADMIN,
                 ControlAction::Leave(target_pk) => {
                     if node.author_pk == *target_pk {
@@ -586,11 +941,25 @@ impl MerkleToxEngine {
                     } else {
                         effects.extend(v_effects);
                         effects.push(Effect::WriteStore(conversation_id, node.clone(), true));
-                        effects.push(Effect::EmitEvent(NodeEvent::NodeVerified {
-                            conversation_id,
-                            hash: node.hash(),
-                            node: node.clone(),
-                        }));
+                        let is_identity_pending = self
+                            .conversations
+                            .get(&conversation_id)
+                            .is_some_and(|c| {
+                                matches!(c, Conversation::Established(e) if e.state.identity_pending)
+                            });
+                        if is_identity_pending {
+                            effects.push(Effect::EmitEvent(NodeEvent::NodeIdentityPending {
+                                conversation_id,
+                                hash: node.hash(),
+                                node: node.clone(),
+                            }));
+                        } else {
+                            effects.push(Effect::EmitEvent(NodeEvent::NodeVerified {
+                                conversation_id,
+                                hash: node.hash(),
+                                node: node.clone(),
+                            }));
+                        }
                         // Vouch for parents of newly verified node
                         for ((_, cid), session) in self.sessions.iter_mut() {
                             if cid == &conversation_id {
@@ -638,13 +1007,72 @@ impl MerkleToxEngine {
                 // OR if it's an Admin node (which are always "authentic" for this purpose as they use signatures)
                 let is_authentic = match &node.authentication {
                     NodeAuth::Signature(_) => true,
-                    NodeAuth::Mac(_) => {
-                        if let Some(Conversation::Established(em)) =
-                            self.conversations.get(&conversation_id)
-                        {
-                            em.verify_node_mac(&conversation_id, &node)
+                    NodeAuth::EphemeralSignature(sig) => {
+                        if matches!(
+                            &node.content,
+                            Content::Control(ControlAction::Genesis { .. })
+                        ) {
+                            // Genesis: verify MAC embedded in first 32 bytes
+                            if let Some(Conversation::Established(em)) =
+                                self.conversations.get(&conversation_id)
+                                && let Some(keys) = em.get_keys(0)
+                            {
+                                let auth_data = node.serialize_for_auth();
+                                let mac = keys.calculate_mac(&auth_data);
+                                sig.as_bytes()[..32] == *mac.as_bytes()
+                            } else {
+                                false
+                            }
                         } else {
-                            false
+                            let epoch = node.sequence_number >> 32;
+                            // DARE §2: SKD for epoch n is signed with epoch n-1's key.
+                            let lookup_epoch =
+                                if matches!(&node.content, Content::SenderKeyDistribution { .. }) {
+                                    epoch.saturating_sub(1)
+                                } else {
+                                    epoch
+                                };
+                            if let Some(epk) = self
+                                .peer_ephemeral_signing_keys
+                                .get(&(node.sender_pk, lookup_epoch))
+                            {
+                                let vk = ed25519_dalek::VerifyingKey::from_bytes(epk.as_bytes());
+                                if let Ok(vk) = vk {
+                                    let ed_sig =
+                                        ed25519_dalek::Signature::from_bytes(sig.as_bytes());
+                                    // Encrypt-then-sign: try wire auth
+                                    // first, plaintext fallback.
+                                    let mut sig_ok = false;
+                                    if !node.is_exception_node() {
+                                        let overlay = crate::engine::EngineStore {
+                                            store,
+                                            cache: &self.pending_cache,
+                                        };
+                                        if let Some(wire) = overlay.get_wire_node(&node_hash) {
+                                            let wire_auth = wire.serialize_for_auth();
+                                            if vk.verify_strict(&wire_auth, &ed_sig).is_ok() {
+                                                sig_ok = true;
+                                            }
+                                        }
+                                        if !sig_ok {
+                                            let plain_auth = node.serialize_for_auth();
+                                            if vk.verify_strict(&plain_auth, &ed_sig).is_ok() {
+                                                sig_ok = true;
+                                            }
+                                        }
+                                    } else {
+                                        let auth_data = node.serialize_for_auth();
+                                        if vk.verify_strict(&auth_data, &ed_sig).is_ok() {
+                                            sig_ok = true;
+                                        }
+                                    }
+                                    sig_ok
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
                         }
                     }
                 };
@@ -656,7 +1084,15 @@ impl MerkleToxEngine {
                 );
 
                 if !is_authentic {
-                    continue;
+                    // Allow vouched nodes through for re-verification
+                    let vouches = self
+                        .conversations
+                        .get(&conversation_id)
+                        .map(|c| c.vouchers().get(&node_hash).map_or(0, |v| v.len()))
+                        .unwrap_or(0);
+                    if vouches < VOUCH_THRESHOLD {
+                        continue;
+                    }
                 }
 
                 if let Ok(v_effects) =
@@ -673,6 +1109,25 @@ impl MerkleToxEngine {
 
                     if became_verified {
                         verified_any = true;
+                        // Update the pending cache so subsequent nodes in this
+                        // loop iteration can see their parent as verified.
+                        for e in &v_effects {
+                            if let Effect::WriteStore(cid, n, true) = e {
+                                let h = n.hash();
+                                let mut cache = self.pending_cache.lock();
+                                cache.nodes.insert(h, n.clone());
+                                cache.verified.insert(h);
+                                let sender_pk = n.sender_pk;
+                                let seq = n.sequence_number;
+                                let entry = cache
+                                    .last_verified_sequences
+                                    .entry((*cid, sender_pk))
+                                    .or_insert(0);
+                                if seq > *entry {
+                                    *entry = seq;
+                                }
+                            }
+                        }
                         all_effects.extend(v_effects);
                     }
                 }
@@ -716,21 +1171,22 @@ impl MerkleToxEngine {
                 }
             };
 
-            // Hard Monotonicity Check
-            let mut max_parent_ts = 0;
+            // Timestamp lower-bound check: spec says ts >= min_parent_ts - 10min.
+            // There is deliberately no requirement that ts >= max parent ts.
+            let mut min_parent_ts_vn = i64::MAX;
             for p in &node.parents {
                 if let Some(parent_node) = overlay.get_node(p) {
-                    max_parent_ts = max_parent_ts.max(parent_node.network_timestamp);
+                    min_parent_ts_vn = min_parent_ts_vn.min(parent_node.network_timestamp);
                 }
             }
 
             let mut quarantined = false;
-            if node.network_timestamp < max_parent_ts {
+            if min_parent_ts_vn != i64::MAX && node.network_timestamp < min_parent_ts_vn - 600_000 {
                 debug!(
-                    "Node {} failed verification: network_timestamp {} < max_parent_ts {}",
+                    "Node {} failed verification: network_timestamp {} < min_parent_ts {} - 10min",
                     hex::encode(node.hash().as_bytes()),
                     node.network_timestamp,
-                    max_parent_ts
+                    min_parent_ts_vn
                 );
                 quarantined = true;
             }
@@ -744,7 +1200,36 @@ impl MerkleToxEngine {
                 quarantined = true;
             }
 
+            let mut admin_ancestor_hashes = std::collections::HashSet::new();
+            let mut stack = node.parents.clone();
+            let mut visited = std::collections::HashSet::new();
+
+            while let Some(parent_hash) = stack.pop() {
+                if visited.insert(parent_hash)
+                    && let Some(parent_node) = overlay.get_node(&parent_hash)
+                {
+                    if parent_node.node_type() == crate::dag::NodeType::Admin {
+                        admin_ancestor_hashes.insert(parent_hash);
+                    }
+                    if let Some(cached) = self.admin_ancestors_cache.lock().get(&parent_hash) {
+                        admin_ancestor_hashes.extend(cached.iter().cloned());
+                    } else {
+                        stack.extend(parent_node.parents.clone());
+                    }
+                }
+            }
+            self.admin_ancestors_cache.lock().put(
+                node.hash(),
+                std::sync::Arc::new(admin_ancestor_hashes.clone()),
+            );
+
+            let ctx = crate::identity::CausalContext {
+                evaluating_node_hash: node.hash(),
+                admin_ancestor_hashes,
+            };
+
             let is_authorized = self.identity_manager.is_authorized(
+                &ctx,
                 conversation_id,
                 &node.sender_pk,
                 &node.author_pk,
@@ -758,31 +1243,48 @@ impl MerkleToxEngine {
             if is_authorized && !quarantined {
                 if let NodeAuth::Signature(_) = &node.authentication {
                     authentic = true;
-                } else if let NodeAuth::Mac(mac) = &node.authentication {
+                } else if let NodeAuth::EphemeralSignature(sig) = &node.authentication {
                     if overlay.is_verified(&node.hash()) {
                         // If already verified once, trust its authenticity.
                         // We are just re-checking authorization (e.g. for revocation).
                         authentic = true;
-                    } else if let Some(Conversation::Established(em)) =
-                        self.conversations.get_mut(&conversation_id)
-                    {
-                        if let Some((k_msg, _)) =
-                            em.peek_keys(&node.sender_pk, node.sequence_number)
+                    } else {
+                        let epoch = node.sequence_number >> 32;
+                        // DARE §2: SKD for epoch n is signed with epoch n-1's key.
+                        let lookup_epoch =
+                            if matches!(&node.content, Content::SenderKeyDistribution { .. }) {
+                                epoch.saturating_sub(1)
+                            } else {
+                                epoch
+                            };
+                        if let Some(epk) = self
+                            .peer_ephemeral_signing_keys
+                            .get(&(node.sender_pk, lookup_epoch))
                         {
-                            let keys = crate::crypto::ConversationKeys::derive(&KConv::from(
-                                *k_msg.as_bytes(),
-                            ));
-                            if keys.verify_mac(&node.serialize_for_auth(&conversation_id), mac) {
-                                authentic = true;
-                            }
-                        }
-
-                        if !authentic {
-                            let auth_data = node.serialize_for_auth(&conversation_id);
-                            if let Some(keys) = em.get_keys(em.current_epoch())
-                                && keys.verify_mac(&auth_data, mac)
-                            {
-                                authentic = true;
+                            let vk = ed25519_dalek::VerifyingKey::from_bytes(epk.as_bytes());
+                            if let Ok(vk) = vk {
+                                let ed_sig = ed25519_dalek::Signature::from_bytes(sig.as_bytes());
+                                // Encrypt-then-sign: try wire auth first,
+                                // plaintext fallback.
+                                if !node.is_exception_node() {
+                                    if let Some(wire) = overlay.get_wire_node(&node.hash()) {
+                                        let wire_auth = wire.serialize_for_auth();
+                                        if vk.verify_strict(&wire_auth, &ed_sig).is_ok() {
+                                            authentic = true;
+                                        }
+                                    }
+                                    if !authentic {
+                                        let plain_auth = node.serialize_for_auth();
+                                        if vk.verify_strict(&plain_auth, &ed_sig).is_ok() {
+                                            authentic = true;
+                                        }
+                                    }
+                                } else {
+                                    let auth_data = node.serialize_for_auth();
+                                    if vk.verify_strict(&auth_data, &ed_sig).is_ok() {
+                                        authentic = true;
+                                    }
+                                }
                             }
                         }
                     }
@@ -867,10 +1369,10 @@ impl MerkleToxEngine {
                     }
                 };
 
-                let candidate_devices = self
+                let all_senders = self
                     .identity_manager
-                    .list_authorized_devices_for_author(conversation_id, wire.author_pk);
-                let unpacked = em.unpack_node(&wire, &candidate_devices);
+                    .list_all_authorized_sender_pairs(conversation_id);
+                let unpacked = em.identify_sender_and_unpack(&wire, &all_senders);
 
                 if let Some(node) = unpacked {
                     debug!(
@@ -878,13 +1380,26 @@ impl MerkleToxEngine {
                         hex::encode(hash.as_bytes())
                     );
 
-                    all_effects.push(Effect::DeleteWireNode(conversation_id, hash));
+                    // Remove from opaque store usage tracker when promoted
+                    if let Some((total, entries)) =
+                        self.opaque_store_usage.get_mut(&conversation_id)
+                        && let Some(pos) = entries.iter().position(|(h, _, _)| *h == hash)
                     {
-                        let overlay = crate::engine::EngineStore {
-                            store,
-                            cache: &self.pending_cache,
-                        };
-                        let _ = overlay.remove_wire_node(&conversation_id, &hash);
+                        *total -= entries[pos].1;
+                        entries.swap_remove(pos);
+                    }
+                    all_effects.push(Effect::DeleteWireNode(conversation_id, hash));
+
+                    // Keep the wire node in the pending cache so that
+                    // handle_node_internal_ext can verify encrypt-then-sign
+                    // signatures against the wire data. Remove from the
+                    // backing store but preserve in cache.
+                    {
+                        let _ = store.remove_wire_node(&conversation_id, &hash);
+                        self.pending_cache
+                            .lock()
+                            .wire_nodes
+                            .insert(hash, (conversation_id, wire.clone()));
                     }
 
                     if let Ok(node_effects) =
@@ -893,6 +1408,8 @@ impl MerkleToxEngine {
                         all_effects.extend(node_effects);
                         progress = true;
                     }
+                    // Clean up wire node from cache after verification
+                    self.pending_cache.lock().wire_nodes.remove(&hash);
                 }
             }
 

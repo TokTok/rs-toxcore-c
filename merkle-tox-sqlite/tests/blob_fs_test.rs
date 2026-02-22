@@ -24,6 +24,7 @@ fn test_large_blob_fs_fallback() {
         bao_root: None,
         status: BlobStatus::Pending,
         received_mask: None,
+        decryption_key: None,
     };
 
     storage.put_blob_info(info).unwrap();
@@ -88,6 +89,7 @@ fn test_small_blob_db_storage() {
         bao_root: None,
         status: BlobStatus::Pending,
         received_mask: None,
+        decryption_key: None,
     };
 
     storage.put_blob_info(info).unwrap();

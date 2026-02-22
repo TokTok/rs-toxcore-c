@@ -1,10 +1,12 @@
 use crate::NodeEvent;
 use crate::dag::{
-    Content, ControlAction, ConversationId, EphemeralX25519Pk, EphemeralX25519Sk, KConv,
-    MerkleNode, NodeAuth, NodeLookup, NodeType, PhysicalDevicePk, ValidationError,
+    Content, ControlAction, ConversationId, EphemeralSigningPk, EphemeralSigningSk,
+    EphemeralX25519Pk, EphemeralX25519Sk, KConv, MerkleNode, NodeAuth, NodeHash, NodeLookup,
+    NodeType, PhysicalDevicePk, SenderKey, ValidationError, WireNode,
 };
 use crate::engine::{
-    Conversation, ConversationData, Effect, EngineStore, MerkleToxEngine, conversation,
+    Conversation, ConversationData, Effect, EngineStore, KeyWrapPending, MerkleToxEngine,
+    conversation,
 };
 use crate::error::{MerkleToxError, MerkleToxResult};
 use crate::sync::NodeStore;
@@ -13,15 +15,19 @@ use rand::RngCore;
 
 const MESSAGES_PER_EPOCH: u32 = 5000;
 const EPOCH_DURATION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// Re-anchor every N content messages so joining devices have fresh anchor.
+const MESSAGES_PER_ANCHOR: u32 = 400;
 
 impl MerkleToxEngine {
-    /// Authors a KeyWrap node using X3DH for initial key exchange with a peer.
+    /// Authors KeyWrap node using X3DH for initial key exchange with peer.
+    /// Per spec §2.C, K_conv_0 derived internally from SK_shared; caller
+    /// does not supply k_conv. Alice's conversation state updated to
+    /// Established with K_conv_0 so she can immediately author messages.
     pub fn author_x3dh_key_exchange(
         &mut self,
         conversation_id: ConversationId,
         peer_pk: PhysicalDevicePk,
         peer_spk: EphemeralX25519Pk,
-        k_conv: KConv,
         store: &dyn NodeStore,
     ) -> MerkleToxResult<Vec<Effect>> {
         self.clear_pending();
@@ -32,9 +38,8 @@ impl MerkleToxEngine {
         }) = self.peer_announcements.get(&peer_pk)
             && last_resort_key.public_key == peer_spk
         {
-            return Err(MerkleToxError::Crypto(
-                "Handshake with last resort key blocked. Send HandshakePulse instead.".to_string(),
-            ));
+            let content = Content::Control(ControlAction::HandshakePulse);
+            return self.author_node(conversation_id, content, Vec::new(), store);
         }
 
         let mut e_a_sk_bytes = [0u8; 32];
@@ -45,36 +50,91 @@ impl MerkleToxEngine {
                 .to_bytes(),
         );
 
-        let sk = self
-            .self_sk
-            .as_ref()
-            .ok_or_else(|| MerkleToxError::Crypto("Missing identity key".to_string()))?;
+        // Generate a fresh K_conv_0 and wrap it with ECIES.
+        // Consume an OPK from the peer's Announcement if available.
+        let mut k_conv_0_bytes = [0u8; 32];
+        self.rng.lock().fill_bytes(&mut k_conv_0_bytes);
+        let k_conv_0 = KConv::from(k_conv_0_bytes);
+        let (opk, opk_id) = self
+            .consume_recipient_opk(&peer_pk)
+            .map(|(pk, id)| (Some(pk), id))
+            .unwrap_or((None, NodeHash::from([0u8; 32])));
+        let ciphertext_vec =
+            crate::crypto::ecies_wrap(&e_a_sk, &peer_spk, opk.as_ref(), None, k_conv_0.as_bytes());
 
-        let sk_shared =
-            crate::crypto::x3dh_derive_secret_initiator(sk, &e_a_sk, &peer_pk, &peer_spk, None)
-                .ok_or_else(|| {
-                    MerkleToxError::Crypto("Failed to derive X3DH shared secret".to_string())
-                })?;
+        let generation = self.get_current_generation(&conversation_id) as u64;
 
-        // Wrap the k_conv using SK_shared
-        use chacha20::cipher::{KeyIvInit, StreamCipher};
-        let mut ciphertext = *k_conv.as_bytes();
-        let mut cipher = chacha20::ChaCha20::new(sk_shared.as_bytes().into(), &[0u8; 12].into());
-        cipher.apply_keystream(&mut ciphertext);
+        // Alice is initiator: establish conversation with K_conv_0 BEFORE
+        // calling author_node. apply_side_effects (in author_node_internal)
+        // advances Alice's ratchet using current epoch key; seeding from K_conv_0
+        // ensures Alice's ratchet matches Bob's (who seeds from K_conv_0 when
+        // processing KeyWrap).
+        let now = self.clock.network_time_ms();
+        let em = match self
+            .conversations
+            .remove(&conversation_id)
+            .unwrap_or_else(|| {
+                Conversation::Pending(ConversationData::<conversation::Pending>::new(
+                    conversation_id,
+                ))
+            }) {
+            Conversation::Pending(p) => p.establish(k_conv_0.clone(), now, generation),
+            Conversation::Established(mut e) => {
+                e.add_epoch(generation, k_conv_0.clone());
+                e
+            }
+        };
+        self.conversations
+            .insert(conversation_id, Conversation::Established(em));
 
         let wrapped = crate::dag::WrappedKey {
             recipient_pk: peer_pk,
-            ciphertext: ciphertext.to_vec(),
+            ciphertext: ciphertext_vec,
+            opk_id,
         };
 
         let content = Content::KeyWrap {
-            epoch: self.get_current_epoch(&conversation_id) as u64,
+            generation,
+            anchor_hash: self
+                .latest_anchor_hashes
+                .get(&conversation_id)
+                .copied()
+                .unwrap_or_else(|| NodeHash::from(*conversation_id.as_bytes())),
             wrapped_keys: vec![wrapped],
-            ephemeral_pk: Some(e_a_pk),
-            pre_key_pk: Some(peer_spk),
+            ephemeral_pk: e_a_pk,
         };
 
-        self.author_node(conversation_id, content, Vec::new(), store)
+        let mut effects = self.author_node(conversation_id, content, Vec::new(), store)?;
+
+        effects.push(Effect::WriteConversationKey(
+            conversation_id,
+            generation,
+            k_conv_0,
+        ));
+
+        // If OPK consumed, enter KeyWrap Pending state (merkle-tox-handshake-ecies.md §2.A.3).
+        // Content authoring buffered until KEYWRAP_ACK received.
+        if opk_id != NodeHash::from([0u8; 32]) {
+            // Find the node hash from effects
+            if let Some(kw_hash) = effects.iter().find_map(|e| {
+                if let Effect::WriteStore(_, n, _) = e {
+                    Some(n.hash())
+                } else {
+                    None
+                }
+            }) {
+                self.keywrap_pending.insert(
+                    kw_hash,
+                    KeyWrapPending {
+                        conversation_id,
+                        recipient_pk: peer_pk,
+                        created_at: self.clock.time_provider().now_instant(),
+                    },
+                );
+            }
+        }
+
+        Ok(effects)
     }
 
     /// Appends a new message to a conversation.
@@ -87,6 +147,69 @@ impl MerkleToxEngine {
     ) -> MerkleToxResult<Vec<Effect>> {
         self.clear_pending();
 
+        // Guard: Spec §5 Observer Mode requires devices in Pending state or
+        // Established with identity_pending=true MUST NOT author new nodes.
+        // Exceptions: Announcement, HandshakePulse (observer-safe), KeyWrap
+        // and SenderKeyDistribution (needed for key exchange in pending mode).
+        let is_observer_safe = matches!(
+            &content,
+            Content::Control(ControlAction::Announcement { .. })
+                | Content::Control(ControlAction::HandshakePulse)
+                | Content::KeyWrap { .. }
+                | Content::SenderKeyDistribution { .. }
+        );
+        // Guard: KeyWrap Pending state (merkle-tox-handshake-ecies.md §2.A.3).
+        // Content authoring blocked while waiting for KEYWRAP_ACK after OPK consumption.
+        let is_content = !is_observer_safe
+            && !matches!(
+                &content,
+                Content::Control(ControlAction::Genesis { .. })
+                    | Content::Control(ControlAction::AuthorizeDevice { .. })
+                    | Content::Control(ControlAction::RevokeDevice { .. })
+            );
+        if is_content
+            && self
+                .keywrap_pending
+                .values()
+                .any(|p| p.conversation_id == conversation_id)
+        {
+            return Err(crate::error::MerkleToxError::Other(
+                "Cannot author content: awaiting KEYWRAP_ACK (OPK consumed)".to_string(),
+            ));
+        }
+
+        if !is_observer_safe {
+            let is_pending = matches!(
+                self.conversations.get(&conversation_id),
+                Some(Conversation::Pending(_))
+            ) && !self
+                .identity_manager
+                .has_authorization_record(conversation_id, &self.self_pk);
+            let is_identity_pending = matches!(
+                self.conversations.get(&conversation_id),
+                Some(Conversation::Established(e)) if e.state.identity_pending
+            );
+            if is_pending || is_identity_pending {
+                return Err(crate::error::MerkleToxError::Other(
+                    "Cannot author nodes: device is in observer mode (pending/identity_pending)"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // Block authoring if self is in expired trust-restored state
+        if let Some(&heal_ts) = self
+            .trust_restored_devices
+            .get(&(conversation_id, self.self_pk))
+        {
+            let now_ms = self.clock.network_time_ms();
+            if now_ms - heal_ts > tox_proto::constants::TRUST_RESTORED_EXPIRY_MS {
+                return Err(crate::error::MerkleToxError::Other(
+                    "Cannot author: trust-restored state has expired (30-day limit)".to_string(),
+                ));
+            }
+        }
+
         // Check for automatic rotation
         let mut all_effects = Vec::new();
         if self.check_rotation_triggers(conversation_id) {
@@ -94,15 +217,67 @@ impl MerkleToxEngine {
             all_effects.extend(effects);
         }
 
-        let use_epoch = match &content {
-            Content::KeyWrap { epoch, .. } => Some(*epoch),
-            Content::RatchetSnapshot { epoch, .. } => Some(*epoch),
+        // JIT Piggybacking: before authoring content node, check for authorized
+        // devices lacking SenderKey/ratchet state this epoch.
+        // If any exist, author JIT SenderKeyDistribution first.
+        if !matches!(&content, Content::Control(_) | Content::KeyWrap { .. })
+            && let Some(Conversation::Established(em)) = self.conversations.get(&conversation_id)
+        {
+            let now = self.clock.network_time_ms();
+            let ctx = crate::identity::CausalContext::global();
+            let authorized = self.identity_manager.list_active_authorized_devices(
+                &ctx,
+                conversation_id,
+                now,
+                u64::MAX,
+            );
+            let missing: Vec<_> = authorized
+                .into_iter()
+                .filter(|pk| *pk != self.self_pk)
+                .filter(|pk| !em.state.shared_keys_sent_to.contains(pk))
+                .collect();
+            if !missing.is_empty() {
+                // JIT is best-effort: if authoring fails (e.g., no signing key),
+                // proceed with content node.
+                if let Ok(jit_effects) =
+                    self.author_jit_sender_key_distribution(conversation_id, missing, store)
+                {
+                    all_effects.extend(jit_effects);
+                }
+            }
+        }
+
+        let use_generation = match &content {
+            Content::KeyWrap { generation, .. } => Some(*generation),
             _ => None,
         };
 
+        // Capture content node status before `content` is
+        // moved into author_node_internal to check re-anchor
+        // threshold afterwards.
+        let is_content_node = !matches!(&content, Content::Control(_));
+
         let effects =
-            self.author_node_internal(conversation_id, content, metadata, store, use_epoch)?;
+            self.author_node_internal(conversation_id, content, metadata, store, use_generation)?;
         all_effects.extend(effects);
+
+        // After content message, check if re-anchoring
+        // threshold crossed. If so, auto-author Snapshot so
+        // new devices have fresh trust anchor.
+        if is_content_node {
+            let should_anchor = if let Some(Conversation::Established(em)) =
+                self.conversations.get(&conversation_id)
+            {
+                em.state.message_count > 0 && em.state.message_count % MESSAGES_PER_ANCHOR == 0
+            } else {
+                false
+            };
+            if should_anchor && let Ok(snap_effects) = self.create_snapshot(conversation_id, store)
+            {
+                all_effects.extend(snap_effects);
+            }
+        }
+
         Ok(all_effects)
     }
 
@@ -139,16 +314,19 @@ impl MerkleToxEngine {
                 _ => NodeType::Content,
             };
 
-            let is_bootstrap = matches!(
+            let _is_bootstrap = matches!(
                 content,
-                Content::KeyWrap { .. } | Content::RatchetSnapshot { .. }
+                Content::KeyWrap { .. }
+                    | Content::HistoryExport { .. }
+                    | Content::SenderKeyDistribution { .. }
             );
 
             // Find or create a session to get the heads.
             let mut parents = if node_type == NodeType::Admin {
                 overlay.get_admin_heads(&conversation_id)
-            } else if is_bootstrap {
-                // Bootstrap nodes (KeyWrap, RatchetSnapshot) merge both tracks
+            } else {
+                // Content nodes (and bootstrap nodes) must merge both tracks
+                // to causally depend on recent AuthorizeDevice/RevokeDevice nodes.
                 let mut p = overlay.get_heads(&conversation_id);
                 for h in overlay.get_admin_heads(&conversation_id) {
                     if !p.contains(&h) {
@@ -156,12 +334,10 @@ impl MerkleToxEngine {
                     }
                 }
                 p
-            } else {
-                overlay.get_heads(&conversation_id)
             };
 
-            // RULE: Only use verified heads as parents for new nodes.
-            // This prevents quarantined/speculative nodes from being used as parents.
+            // RULE: Use only verified heads as parents for new nodes.
+            // Prevents using quarantined/speculative nodes as parents.
             parents.retain(|h| overlay.is_verified(h));
 
             parents.sort_unstable();
@@ -218,15 +394,48 @@ impl MerkleToxEngine {
                 network_timestamp: now,
                 content,
                 metadata,
-                authentication: NodeAuth::Mac(crate::dag::NodeMac::from([0u8; 32])), // Placeholder
+                authentication: NodeAuth::EphemeralSignature(crate::dag::Ed25519Signature::from(
+                    [0u8; 64],
+                )), // Placeholder
+                pow_nonce: 0,
             };
 
-            if node_type == NodeType::Admin {
+            // KeyWrap must be Ed25519-signed (not ephemeral-signed).
+            // SKD uses device Signature if no prior epoch ephemeral key
+            // (first-ever SKD), otherwise uses EphemeralSignature from
+            // previous epoch key (DARE §2).
+            let is_key_wrap = matches!(node.content, Content::KeyWrap { .. });
+            let is_skd_needs_device_sig =
+                matches!(&node.content, Content::SenderKeyDistribution { .. }) && {
+                    let eph_epoch = use_epoch.unwrap_or(0);
+                    // SKD for epoch N is signed with epoch N-1's key.
+                    // If N==0 or epoch N-1 has no key, fall back to device sig.
+                    eph_epoch == 0
+                        || !self
+                            .self_ephemeral_signing_keys
+                            .contains_key(&(eph_epoch.saturating_sub(1)))
+                };
+
+            // Pre-packed wire for content nodes (encrypt-then-sign):
+            // Content nodes packed BEFORE signing so signature covers
+            // encrypted wire data, not plaintext.
+            let mut content_wire: Option<WireNode> = None;
+
+            // Three signing/packing paths:
+            // 1. Device-signed exception nodes (Admin, KeyWrap, first-epoch SKD)
+            // 2. Ephemeral-signed exception nodes (subsequent-epoch SKD)
+            // 3. Content nodes (encrypt-then-sign)
+            //
+            // Exception nodes use cleartext wire packing, so
+            // node.serialize_for_auth() == wire.serialize_for_auth().
+            // Content nodes are encrypted, requiring wire (ciphertext) signature.
+            let is_exception = node.is_exception_node();
+
+            if node_type == NodeType::Admin || is_key_wrap || is_skd_needs_device_sig {
+                // Path 1: Device signature on exception node.
                 if let Some(sk) = &self.self_sk {
                     let signing_key = SigningKey::from_bytes(sk.as_bytes());
-                    let sig = signing_key
-                        .sign(&node.serialize_for_auth(&conversation_id))
-                        .to_bytes();
+                    let sig = signing_key.sign(&node.serialize_for_auth()).to_bytes();
                     node.authentication =
                         NodeAuth::Signature(crate::dag::Ed25519Signature::from(sig));
                 } else {
@@ -234,52 +443,201 @@ impl MerkleToxEngine {
                         "Missing signing key for Admin node".to_string(),
                     ));
                 }
+            } else if is_exception {
+                // Path 2: Ephemeral signature on exception node (e.g. SKD epoch > 0).
+                // Exception nodes are cleartext, so plaintext auth == wire auth.
+                let auth_data = node.serialize_for_auth();
 
-                // Admin nodes also advance the ratchet if keys are available
+                let current_epoch = if let Some(Conversation::Established(em)) =
+                    self.conversations.get(&conversation_id)
+                {
+                    use_epoch.unwrap_or_else(|| em.current_epoch())
+                } else {
+                    use_epoch.unwrap_or(0)
+                };
+
+                // DARE §2: SKD for epoch n>0 signed with PREVIOUS epoch's
+                // ephemeral key (epoch n-1), not current epoch's key.
+                let signing_epoch =
+                    if matches!(&node.content, Content::SenderKeyDistribution { .. })
+                        && current_epoch > 0
+                    {
+                        current_epoch - 1
+                    } else {
+                        current_epoch
+                    };
+
+                let eph_sk = self
+                    .self_ephemeral_signing_keys
+                    .entry(signing_epoch)
+                    .or_insert_with(|| {
+                        let mut bytes = [0u8; 32];
+                        self.rng.lock().fill_bytes(&mut bytes);
+                        ed25519_dalek::SigningKey::from_bytes(&bytes)
+                    });
+                let sig = eph_sk.sign(&auth_data).to_bytes();
+                node.authentication =
+                    NodeAuth::EphemeralSignature(crate::dag::Ed25519Signature::from(sig));
             } else {
-                // Calculate MAC if we have keys
+                // Path 3: Content nodes (encrypt-then-sign).
+                // 1. Increment message count
                 if let Some(Conversation::Established(em)) =
                     self.conversations.get_mut(&conversation_id)
                 {
                     em.state.message_count += 1;
+                }
 
-                    let keys = if let Some(epoch) = use_epoch {
-                        // Use epoch root key if requested (for bootstrapping)
-                        em.get_keys(epoch).cloned()
-                    } else {
-                        // Try to use per-message ratchet
-                        em.peek_keys(&node.sender_pk, node.sequence_number)
-                            .map(|(k_msg, _)| {
-                                crate::crypto::ConversationKeys::derive(&KConv::from(
-                                    *k_msg.as_bytes(),
-                                ))
+                // 2. Pack wire with placeholder auth BEFORE signing
+                if let Some(Conversation::Established(em)) =
+                    self.conversations.get_mut(&conversation_id)
+                {
+                    let pack_keys = em
+                        .peek_keys(&node.sender_pk, node.sequence_number, now)
+                        .map(|(k_msg, _k_next)| {
+                            let epoch = node.sequence_number >> 32;
+                            let keys = em
+                                .get_keys(epoch)
+                                .or_else(|| em.get_keys(em.current_epoch()));
+                            let k_conv = keys
+                                .map(|k| &k.k_conv)
+                                .cloned()
+                                .unwrap_or_else(|| KConv::from([0u8; 32]));
+                            let sender_key = em
+                                .state
+                                .sender_keys
+                                .get(&(node.sender_pk, epoch))
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    SenderKey::from(
+                                        *crate::crypto::ratchet_init_sender(
+                                            &k_conv,
+                                            &node.sender_pk,
+                                        )
+                                        .as_bytes(),
+                                    )
+                                });
+                            let k_header =
+                                crate::crypto::derive_k_header_epoch(&k_conv, &sender_key);
+                            let mut routing_nonce = [0u8; 12];
+                            let mut payload_nonce = [0u8; 12];
+                            self.rng.lock().fill_bytes(&mut routing_nonce);
+                            self.rng.lock().fill_bytes(&mut payload_nonce);
+                            crate::crypto::PackKeys::Content(crate::crypto::PackContentKeys {
+                                k_msg,
+                                k_header,
+                                routing_nonce,
+                                payload_nonce,
                             })
+                        });
+                    if let Some(keys) = pack_keys
+                        && let Ok(wire) = node.pack_wire(&keys, true)
+                    {
+                        content_wire = Some(wire);
+                    }
+                }
+
+                // 3. Sign the wire's auth data (encrypt-then-sign).
+                // If wire packing failed, fall back to signing the plaintext.
+                let auth_data = if let Some(ref wire) = content_wire {
+                    wire.serialize_for_auth()
+                } else {
+                    node.serialize_for_auth()
+                };
+
+                let current_epoch = if let Some(Conversation::Established(em)) =
+                    self.conversations.get(&conversation_id)
+                {
+                    use_epoch.unwrap_or_else(|| em.current_epoch())
+                } else {
+                    use_epoch.unwrap_or(0)
+                };
+
+                // DARE §2: SKD for epoch n>0 signed with PREVIOUS epoch's
+                // ephemeral key (epoch n-1), not current epoch's key.
+                let signing_epoch =
+                    if matches!(&node.content, Content::SenderKeyDistribution { .. })
+                        && current_epoch > 0
+                    {
+                        current_epoch - 1
+                    } else {
+                        current_epoch
                     };
 
-                    if let Some(keys) = keys {
-                        let auth_data = node.serialize_for_auth(&conversation_id);
-                        node.authentication = NodeAuth::Mac(keys.calculate_mac(&auth_data));
-                    }
+                // Look up (or generate) the ephemeral signing key for this epoch
+                let eph_sk = self
+                    .self_ephemeral_signing_keys
+                    .entry(signing_epoch)
+                    .or_insert_with(|| {
+                        let mut bytes = [0u8; 32];
+                        self.rng.lock().fill_bytes(&mut bytes);
+                        ed25519_dalek::SigningKey::from_bytes(&bytes)
+                    });
+                let sig = eph_sk.sign(&auth_data).to_bytes();
+                node.authentication =
+                    NodeAuth::EphemeralSignature(crate::dag::Ed25519Signature::from(sig));
+
+                // 4. Copy auth to pre-packed wire node
+                if let Some(ref mut wire) = content_wire {
+                    wire.authentication = node.authentication.clone();
                 }
             }
 
             let hash = node.hash();
             overlay.put_node(&conversation_id, node.clone(), true)?;
 
-            // Also store the wire representation for future sync
+            // Store the wire representation for future sync
             let mut wire_node = None;
-            if let Some(Conversation::Established(em)) = self.conversations.get(&conversation_id) {
-                let keys = if node.node_type() == NodeType::Admin || is_bootstrap {
-                    em.get_keys(em.current_epoch()).cloned()
+            if let Some(wire) = content_wire {
+                // Content node was already packed during encrypt-then-sign
+                overlay.put_wire_node(&conversation_id, &hash, wire.clone())?;
+                wire_node = Some(wire);
+            } else if let Some(Conversation::Established(em)) =
+                self.conversations.get_mut(&conversation_id)
+            {
+                // Exception nodes: pack after signing (wire copies auth from node)
+                let pack_keys = if node.is_exception_node() {
+                    Some(crate::crypto::PackKeys::Exception)
                 } else {
-                    // Use the same keys we used for the MAC
-                    em.peek_keys(&node.sender_pk, node.sequence_number)
-                        .map(|(k_msg, _)| {
-                            crate::crypto::ConversationKeys::derive(&KConv::from(*k_msg.as_bytes()))
+                    em.peek_keys(&node.sender_pk, node.sequence_number, now)
+                        .map(|(k_msg, _k_next)| {
+                            let epoch = node.sequence_number >> 32;
+                            let keys = em
+                                .get_keys(epoch)
+                                .or_else(|| em.get_keys(em.current_epoch()));
+                            let k_conv = keys
+                                .map(|k| &k.k_conv)
+                                .cloned()
+                                .unwrap_or_else(|| KConv::from([0u8; 32]));
+                            let sender_key = em
+                                .state
+                                .sender_keys
+                                .get(&(node.sender_pk, epoch))
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    SenderKey::from(
+                                        *crate::crypto::ratchet_init_sender(
+                                            &k_conv,
+                                            &node.sender_pk,
+                                        )
+                                        .as_bytes(),
+                                    )
+                                });
+                            let k_header =
+                                crate::crypto::derive_k_header_epoch(&k_conv, &sender_key);
+                            let mut routing_nonce = [0u8; 12];
+                            let mut payload_nonce = [0u8; 12];
+                            self.rng.lock().fill_bytes(&mut routing_nonce);
+                            self.rng.lock().fill_bytes(&mut payload_nonce);
+                            crate::crypto::PackKeys::Content(crate::crypto::PackContentKeys {
+                                k_msg,
+                                k_header,
+                                routing_nonce,
+                                payload_nonce,
+                            })
                         })
                 };
 
-                if let Some(keys) = keys
+                if let Some(keys) = pack_keys
                     && let Ok(wire) = node.pack_wire(&keys, true)
                 {
                     overlay.put_wire_node(&conversation_id, &hash, wire.clone())?;
@@ -441,38 +799,12 @@ impl MerkleToxEngine {
 
         let mut effects = Vec::new();
 
-        let (old_epoch, new_epoch) =
+        let (old_generation, new_generation) =
             if let Some(Conversation::Established(em)) = self.conversations.get(&conversation_id) {
                 (Some(em.current_epoch()), em.current_epoch() + 1)
             } else {
                 (None, 0)
             };
-
-        // 1. Create Rekey node (belongs to the OLD epoch's ratchet)
-        let mut rekey_rank = 0;
-        if let Some(epoch) = old_epoch {
-            let rekey_effects = self.author_node_internal(
-                conversation_id,
-                Content::Control(ControlAction::Rekey { new_epoch }),
-                Vec::new(),
-                store,
-                Some(epoch),
-            )?;
-            let rekey_node = rekey_effects
-                .iter()
-                .find_map(|e| {
-                    if let Effect::WriteStore(_, node, _) = e
-                        && matches!(node.content, Content::Control(ControlAction::Rekey { .. }))
-                    {
-                        return Some(node.clone());
-                    }
-                    None
-                })
-                .unwrap();
-            rekey_rank = rekey_node.topological_rank;
-            tracing::debug!("Rotation: Rekey node created at rank {}", rekey_rank);
-            effects.extend(rekey_effects);
-        }
 
         // 2. Update Conversation state (Perform the actual rotation)
         if let Some(Conversation::Established(em)) = self.conversations.get_mut(&conversation_id) {
@@ -490,64 +822,390 @@ impl MerkleToxEngine {
         // Persist new key
         effects.push(Effect::WriteConversationKey(
             conversation_id,
-            new_epoch,
+            new_generation,
             new_k_conv,
         ));
 
-        // 3. Create KeyWrap nodes for all authorized devices (bootstraps the NEW epoch)
+        // 3. Create KeyWrap nodes for all authorized devices (bootstraps the NEW generation)
         let mut wrapped_keys = Vec::new();
-        let em = match self.conversations.get(&conversation_id).unwrap() {
-            Conversation::Established(em) => em,
-            _ => unreachable!(),
+        let k_conv_bytes = {
+            let em = match self.conversations.get(&conversation_id).unwrap() {
+                Conversation::Established(em) => em,
+                _ => unreachable!(),
+            };
+            *em.get_keys(new_generation).unwrap().k_conv.as_bytes()
         };
-        let keys = em.get_keys(new_epoch).unwrap();
 
         // Generate an ephemeral key for this rotation to avoid two-time pad
         let mut e_sk_bytes = [0u8; 32];
         self.rng.lock().fill_bytes(&mut e_sk_bytes);
-        let e_sk = e_sk_bytes;
+        let e_sk = EphemeralX25519Sk::from(e_sk_bytes);
         let e_pk = EphemeralX25519Pk::from(
             x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(e_sk_bytes)).to_bytes(),
         );
 
+        let dummy_ctx = crate::identity::CausalContext {
+            evaluating_node_hash: crate::dag::NodeHash::from([0u8; 32]),
+            admin_ancestor_hashes: std::collections::HashSet::new(),
+        };
+
         let recipients = self.identity_manager.list_active_authorized_devices(
+            &dummy_ctx,
             conversation_id,
             now,
-            if rekey_rank > 0 { rekey_rank } else { u64::MAX },
+            u64::MAX,
         );
         tracing::debug!(
-            "Rotation: Found {} active recipients at rank {}",
-            recipients.len(),
-            if rekey_rank > 0 { rekey_rank } else { u64::MAX }
+            "Rotation: Found {} active recipients at max rank",
+            recipients.len()
         );
         for recipient_pk in recipients {
-            if recipient_pk != self.self_pk
-                && let Some(ciphertext) = keys.wrap_for(&e_sk, &recipient_pk)
-            {
-                wrapped_keys.push(crate::dag::WrappedKey {
-                    recipient_pk,
-                    ciphertext,
-                });
+            if recipient_pk == self.self_pk {
+                continue;
             }
+            // Skip members publishing Announcement with
+            // only last-resort key (empty pre_keys list).
+            // If no announcement received, fall through and wrap normally.
+            let only_last_resort = self
+                .peer_announcements
+                .get(&recipient_pk)
+                .is_some_and(|ann| {
+                    matches!(
+                        ann,
+                        crate::dag::ControlAction::Announcement { pre_keys, .. }
+                        if pre_keys.is_empty()
+                    )
+                });
+            if only_last_resort {
+                tracing::debug!(
+                    "Skipping KeyWrap for {:?}: only last-resort key available",
+                    recipient_pk
+                );
+                continue;
+            }
+            let spk = self.resolve_recipient_spk(&recipient_pk);
+            let (opk, opk_id) = self
+                .consume_recipient_opk(&recipient_pk)
+                .map(|(pk, id)| (Some(pk), id))
+                .unwrap_or((None, NodeHash::from([0u8; 32])));
+            let ciphertext =
+                crate::crypto::ecies_wrap(&e_sk, &spk, opk.as_ref(), None, &k_conv_bytes);
+            wrapped_keys.push(crate::dag::WrappedKey {
+                recipient_pk,
+                ciphertext,
+                opk_id,
+            });
         }
 
-        if !wrapped_keys.is_empty() || new_epoch == 0 {
+        if !wrapped_keys.is_empty() || new_generation == 0 {
+            let anchor_hash = self
+                .latest_anchor_hashes
+                .get(&conversation_id)
+                .copied()
+                .unwrap_or_else(|| NodeHash::from(*conversation_id.as_bytes()));
             let wrap_effects = self.author_node_internal(
                 conversation_id,
                 Content::KeyWrap {
-                    epoch: new_epoch,
+                    generation: new_generation,
+                    anchor_hash,
                     wrapped_keys,
-                    ephemeral_pk: Some(e_pk),
-                    pre_key_pk: None,
+                    ephemeral_pk: e_pk,
                 },
                 Vec::new(),
                 store,
-                Some(new_epoch),
+                Some(new_generation),
             )?;
             effects.extend(wrap_effects);
         }
 
+        // DARE §2: Author SenderKeyDistribution for the new epoch.
+        let skd_effects = self.author_sender_key_distribution(
+            conversation_id,
+            new_generation,
+            old_generation,
+            store,
+        )?;
+        effects.extend(skd_effects);
+
+        // Clean up old ephemeral signing key (now disclosed).
+        if let Some(old_gen) = old_generation {
+            self.self_ephemeral_signing_keys.remove(&old_gen);
+        }
+
         Ok(effects)
+    }
+
+    /// Authors a SenderKeyDistribution node for a new epoch (DARE §2).
+    ///
+    /// Distributes:
+    /// - `ephemeral_signing_pk`: the verifying key for the NEW epoch's ephemeral signing key
+    /// - `disclosed_keys`: the OLD epoch's ephemeral signing secret key (if it exists)
+    /// - `wrapped_keys`: the new SenderKey wrapped via ECIES for each authorized recipient
+    fn author_sender_key_distribution(
+        &mut self,
+        conversation_id: ConversationId,
+        new_generation: u64,
+        old_generation: Option<u64>,
+        store: &dyn NodeStore,
+    ) -> MerkleToxResult<Vec<Effect>> {
+        // Ensure we have an ephemeral signing key for the new epoch.
+        let new_eph_sk = self
+            .self_ephemeral_signing_keys
+            .entry(new_generation)
+            .or_insert_with(|| {
+                let mut bytes = [0u8; 32];
+                self.rng.lock().fill_bytes(&mut bytes);
+                ed25519_dalek::SigningKey::from_bytes(&bytes)
+            });
+        let ephemeral_signing_pk = EphemeralSigningPk::from(new_eph_sk.verifying_key().to_bytes());
+
+        // Collect disclosed keys: the old epoch's ephemeral signing secret key.
+        let disclosed_keys: Vec<EphemeralSigningSk> = if let Some(old_gen) = old_generation
+            && let Some(old_sk) = self.self_ephemeral_signing_keys.get(&old_gen)
+        {
+            vec![EphemeralSigningSk::from(old_sk.to_bytes())]
+        } else {
+            vec![]
+        };
+
+        // Generate a fresh ephemeral DH key for ECIES wrapping.
+        let mut skd_e_sk_bytes = [0u8; 32];
+        self.rng.lock().fill_bytes(&mut skd_e_sk_bytes);
+        let skd_e_sk = EphemeralX25519Sk::from(skd_e_sk_bytes);
+        let skd_e_pk = EphemeralX25519Pk::from(
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(skd_e_sk_bytes))
+                .to_bytes(),
+        );
+
+        // Generate a fresh random SenderKey for this epoch.
+        let mut sender_key_bytes = [0u8; 32];
+        self.rng.lock().fill_bytes(&mut sender_key_bytes);
+        let sender_key = SenderKey::from(sender_key_bytes);
+
+        // Store our own SenderKey so our ratchet uses it.
+        if let Some(Conversation::Established(em)) = self.conversations.get_mut(&conversation_id) {
+            em.state
+                .sender_keys
+                .insert((self.self_pk, new_generation), sender_key.clone());
+        }
+
+        // Wrap the SenderKey (not k_conv) for each authorized recipient.
+        let now = self.clock.network_time_ms();
+        if !matches!(
+            self.conversations.get(&conversation_id),
+            Some(Conversation::Established(_))
+        ) {
+            return Err(MerkleToxError::Other(
+                "Cannot author SKD: conversation not established".to_string(),
+            ));
+        }
+
+        let dummy_ctx = crate::identity::CausalContext {
+            evaluating_node_hash: crate::dag::NodeHash::from([0u8; 32]),
+            admin_ancestor_hashes: std::collections::HashSet::new(),
+        };
+        let recipients = self.identity_manager.list_active_authorized_devices(
+            &dummy_ctx,
+            conversation_id,
+            now,
+            u64::MAX,
+        );
+
+        // Compute our own X25519 secret for auth_secret computation.
+        let self_dh_sk_bytes = self.self_dh_sk.as_ref().map(|sk| *sk.as_bytes());
+
+        let mut wrapped_keys = Vec::new();
+        for recipient_pk in recipients {
+            if recipient_pk == self.self_pk {
+                continue;
+            }
+            let spk = self.resolve_recipient_spk(&recipient_pk);
+            let (opk, opk_id) = self
+                .consume_recipient_opk(&recipient_pk)
+                .map(|(pk, id)| (Some(pk), id))
+                .unwrap_or((None, NodeHash::from([0u8; 32])));
+            // auth_secret = ECDH(sender_x25519_sk, recipient_spk) for deniable auth
+            let auth_secret = self_dh_sk_bytes.map(|sk| {
+                let ss = x25519_dalek::StaticSecret::from(sk);
+                let rpk = x25519_dalek::PublicKey::from(*spk.as_bytes());
+                *ss.diffie_hellman(&rpk).as_bytes()
+            });
+            let ciphertext = crate::crypto::ecies_wrap(
+                &skd_e_sk,
+                &spk,
+                opk.as_ref(),
+                auth_secret.as_ref(),
+                sender_key.as_bytes(),
+            );
+            wrapped_keys.push(crate::dag::WrappedKey {
+                recipient_pk,
+                ciphertext,
+                opk_id,
+            });
+        }
+
+        // Track which devices received our SenderKey in this epoch
+        if let Some(Conversation::Established(em)) = self.conversations.get_mut(&conversation_id) {
+            for wrapped in &wrapped_keys {
+                em.state.shared_keys_sent_to.insert(wrapped.recipient_pk);
+            }
+        }
+
+        let content = Content::SenderKeyDistribution {
+            ephemeral_pk: skd_e_pk,
+            wrapped_keys,
+            ephemeral_signing_pk,
+            disclosed_keys,
+        };
+
+        self.author_node_internal(
+            conversation_id,
+            content,
+            Vec::new(),
+            store,
+            Some(new_generation),
+        )
+    }
+
+    /// Authors a JIT SenderKeyDistribution containing the current ratchet state
+    /// (K_chain, last_seq, K_header) for newly-authorized devices that haven't
+    /// received our SenderKey yet. This enables immediate decryption without
+    /// waiting for the next epoch rotation.
+    fn author_jit_sender_key_distribution(
+        &mut self,
+        conversation_id: ConversationId,
+        target_devices: Vec<PhysicalDevicePk>,
+        store: &dyn NodeStore,
+    ) -> MerkleToxResult<Vec<Effect>> {
+        // Bail out early if we don't have a signing key: avoids computing
+        // ECIES wraps only to fail at the signing step.
+        if self.self_sk.is_none() {
+            return Ok(Vec::new());
+        }
+
+        let epoch =
+            if let Some(Conversation::Established(em)) = self.conversations.get(&conversation_id) {
+                em.current_epoch()
+            } else {
+                return Ok(Vec::new());
+            };
+
+        // Get our current ratchet state
+        let (last_seq, next_key) = if let Some(Conversation::Established(em)) =
+            self.conversations.get(&conversation_id)
+        {
+            if let Some(&(seq, ref key, _, epoch_id)) = em.state.sender_ratchets.get(&self.self_pk)
+                && epoch_id == epoch
+            {
+                (seq, key.clone())
+            } else {
+                let keys = em.get_keys(epoch).ok_or_else(|| {
+                    MerkleToxError::Other("No keys for current epoch".to_string())
+                })?;
+                let init = crate::crypto::ratchet_init_sender(&keys.k_conv, &self.self_pk);
+                (epoch << 32, init)
+            }
+        } else {
+            return Ok(Vec::new());
+        };
+
+        // Derive K_header for this sender/epoch
+        let k_header =
+            if let Some(Conversation::Established(em)) = self.conversations.get(&conversation_id) {
+                if let Some(h) = em.state.jit_headers.get(&(self.self_pk, epoch)) {
+                    h.clone()
+                } else {
+                    let keys = em.get_keys(epoch).ok_or_else(|| {
+                        MerkleToxError::Other("No keys for current epoch".to_string())
+                    })?;
+                    let sender_key = em
+                        .state
+                        .sender_keys
+                        .get(&(self.self_pk, epoch))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            SenderKey::from(
+                                *crate::crypto::ratchet_init_sender(&keys.k_conv, &self.self_pk)
+                                    .as_bytes(),
+                            )
+                        });
+                    crate::crypto::derive_k_header_epoch(&keys.k_conv, &sender_key)
+                }
+            } else {
+                return Ok(Vec::new());
+            };
+
+        // Build 72-byte JIT payload: [next_key(32) || last_seq(8 BE) || k_header(32)]
+        let mut payload = Vec::with_capacity(72);
+        payload.extend_from_slice(next_key.as_bytes());
+        payload.extend_from_slice(&last_seq.to_be_bytes());
+        payload.extend_from_slice(k_header.as_bytes());
+
+        // Generate ephemeral DH key for ECIES
+        let mut jit_e_sk_bytes = [0u8; 32];
+        self.rng.lock().fill_bytes(&mut jit_e_sk_bytes);
+        let jit_e_sk = EphemeralX25519Sk::from(jit_e_sk_bytes);
+        let jit_e_pk = EphemeralX25519Pk::from(
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(jit_e_sk_bytes))
+                .to_bytes(),
+        );
+
+        // Compute our own X25519 secret for auth_secret computation
+        let self_dh_sk_bytes = self.self_dh_sk.as_ref().map(|sk| *sk.as_bytes());
+
+        // Wrap JIT payload for each target device
+        let mut wrapped_keys = Vec::new();
+        for recipient_pk in &target_devices {
+            let spk = self.resolve_recipient_spk(recipient_pk);
+            let (opk, opk_id) = self
+                .consume_recipient_opk(recipient_pk)
+                .map(|(pk, id)| (Some(pk), id))
+                .unwrap_or((None, NodeHash::from([0u8; 32])));
+            let auth_secret = self_dh_sk_bytes.map(|sk| {
+                let ss = x25519_dalek::StaticSecret::from(sk);
+                let rpk = x25519_dalek::PublicKey::from(*spk.as_bytes());
+                *ss.diffie_hellman(&rpk).as_bytes()
+            });
+            let ciphertext = crate::crypto::ecies_wrap(
+                &jit_e_sk,
+                &spk,
+                opk.as_ref(),
+                auth_secret.as_ref(),
+                &payload,
+            );
+            wrapped_keys.push(crate::dag::WrappedKey {
+                recipient_pk: *recipient_pk,
+                ciphertext,
+                opk_id,
+            });
+        }
+
+        // Record targets as sent
+        if let Some(Conversation::Established(em)) = self.conversations.get_mut(&conversation_id) {
+            for pk in &target_devices {
+                em.state.shared_keys_sent_to.insert(*pk);
+            }
+        }
+
+        // Get/create ephemeral signing key for current epoch
+        let new_eph_sk = self
+            .self_ephemeral_signing_keys
+            .entry(epoch)
+            .or_insert_with(|| {
+                let mut bytes = [0u8; 32];
+                self.rng.lock().fill_bytes(&mut bytes);
+                ed25519_dalek::SigningKey::from_bytes(&bytes)
+            });
+        let ephemeral_signing_pk = EphemeralSigningPk::from(new_eph_sk.verifying_key().to_bytes());
+
+        let content = Content::SenderKeyDistribution {
+            ephemeral_pk: jit_e_pk,
+            wrapped_keys,
+            ephemeral_signing_pk,
+            disclosed_keys: vec![], // JIT has no disclosed keys
+        };
+
+        self.author_node_internal(conversation_id, content, Vec::new(), store, Some(epoch))
     }
 
     pub fn get_authorized_devices(
@@ -558,7 +1216,7 @@ impl MerkleToxEngine {
             .list_authorized_devices(*conversation_id)
     }
 
-    pub fn get_current_epoch(&self, conversation_id: &ConversationId) -> u32 {
+    pub fn get_current_generation(&self, conversation_id: &ConversationId) -> u32 {
         self.conversations
             .get(conversation_id)
             .and_then(|c| match c {
@@ -568,14 +1226,15 @@ impl MerkleToxEngine {
             .unwrap_or(0)
     }
 
-    /// Authors a RatchetSnapshot node for self-recovery.
-    pub fn author_ratchet_snapshot(
+    /// Authors a HistoryExport node to distribute historical keys.
+    pub fn author_history_key_export(
         &mut self,
         conversation_id: ConversationId,
+        blob_hash: NodeHash,
         store: &dyn NodeStore,
     ) -> MerkleToxResult<Vec<Effect>> {
-        let em = match self.conversations.get(&conversation_id) {
-            Some(Conversation::Established(em)) => em,
+        match self.conversations.get(&conversation_id) {
+            Some(Conversation::Established(_)) => {}
             _ => return Err(MerkleToxError::KeyNotFound(conversation_id, 0)),
         };
 
@@ -584,38 +1243,54 @@ impl MerkleToxEngine {
             return Err(MerkleToxError::Validation(ValidationError::EmptyDag));
         }
 
-        let last_seq = store.get_last_sequence_number(&conversation_id, &self.self_pk);
-        // We take the chain key for the NEXT message we are about to author
-        let (_k_msg, k_next) = em.peek_keys(&self.self_pk, last_seq + 1).ok_or_else(|| {
-            MerkleToxError::Ratchet("Missing parent chain keys for snapshot".to_string())
-        })?;
+        // Generate a fresh random K_export for blob encryption.
+        let mut k_export = [0u8; 32];
+        self.rng.lock().fill_bytes(&mut k_export);
 
-        // Encrypt for our other authorized devices
+        // Generate an ephemeral key for the history export ECIES wrapping.
+        let mut he_sk_bytes = [0u8; 32];
+        self.rng.lock().fill_bytes(&mut he_sk_bytes);
+        let he_sk = EphemeralX25519Sk::from(he_sk_bytes);
+        let he_pk = EphemeralX25519Pk::from(
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(he_sk_bytes))
+                .to_bytes(),
+        );
+
+        // Encrypt K_export for our other authorized devices using ECIES.
         let mut wrapped_keys = Vec::new();
-        if let Some(sk) = &self.self_dh_sk {
+        {
+            let dummy_ctx = crate::identity::CausalContext {
+                evaluating_node_hash: crate::dag::NodeHash::from([0u8; 32]),
+                admin_ancestor_hashes: std::collections::HashSet::new(),
+            };
             let recipients = self.identity_manager.list_active_authorized_devices(
+                &dummy_ctx,
                 conversation_id,
                 self.clock.network_time_ms(),
                 u64::MAX,
             );
             for recipient_pk in recipients {
-                if recipient_pk != self.self_pk
-                    && let Some(temp_keys) = Some(crate::crypto::ConversationKeys::derive(
-                        &k_next.to_conversation_key(),
-                    ))
-                    && let Some(ciphertext) = temp_keys.wrap_for(sk.as_bytes(), &recipient_pk)
-                {
+                if recipient_pk != self.self_pk {
+                    let spk = self.resolve_recipient_spk(&recipient_pk);
+                    let (opk, opk_id) = self
+                        .consume_recipient_opk(&recipient_pk)
+                        .map(|(pk, id)| (Some(pk), id))
+                        .unwrap_or((None, NodeHash::from([0u8; 32])));
+                    let ciphertext =
+                        crate::crypto::ecies_wrap(&he_sk, &spk, opk.as_ref(), None, &k_export);
                     wrapped_keys.push(crate::dag::WrappedKey {
                         recipient_pk,
                         ciphertext,
+                        opk_id,
                     });
                 }
             }
         }
 
-        let content = Content::RatchetSnapshot {
-            epoch: em.current_epoch(),
-            ciphertext: tox_proto::serialize(&wrapped_keys)?,
+        let content = Content::HistoryExport {
+            blob_hash,
+            ephemeral_pk: he_pk,
+            wrapped_keys,
         };
 
         self.author_node(conversation_id, content, Vec::new(), store)
@@ -653,11 +1328,11 @@ impl MerkleToxEngine {
             last_seq_numbers.push((dev_pk, seq));
         }
 
-        let content = Content::Control(ControlAction::Snapshot {
+        let content = Content::Control(ControlAction::Snapshot(crate::dag::SnapshotData {
             basis_hash,
             members,
             last_seq_numbers,
-        });
+        }));
 
         self.author_node(conversation_id, content, Vec::new(), store)
     }

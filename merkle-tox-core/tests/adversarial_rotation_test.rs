@@ -1,6 +1,7 @@
 use merkle_tox_core::clock::ManualTimeProvider;
 use merkle_tox_core::dag::{Content, ControlAction, Permissions, PhysicalDeviceSk};
 use merkle_tox_core::engine::MerkleToxEngine;
+use merkle_tox_core::sync::NodeStore;
 use merkle_tox_core::testing::{
     InMemoryStore, TestIdentity, TestRoom, create_admin_node, make_cert, sign_content_node,
 };
@@ -49,12 +50,11 @@ fn test_pcs_exclusion_adversarial() {
     room.setup_engine(&mut malicious_engine, &store_malicious);
 
     // All share Epoch 0 key initially
-    assert_eq!(alice_engine.get_current_epoch(&room.conv_id), 0);
-    assert_eq!(bob_engine.get_current_epoch(&room.conv_id), 0);
-    assert_eq!(malicious_engine.get_current_epoch(&room.conv_id), 0);
+    assert_eq!(alice_engine.get_current_generation(&room.conv_id), 0);
+    assert_eq!(bob_engine.get_current_generation(&room.conv_id), 0);
+    assert_eq!(malicious_engine.get_current_generation(&room.conv_id), 0);
 
-    // 2. Alice performs Epoch Rotation (Epoch 1)
-    // First, Alice should revoke Malicious to ensure they are excluded from the new KeyWrap.
+    // 2. Alice revokes Malicious. Fix 6 auto-rotates key (Epoch 0 → 1).
     let effects = alice_engine
         .author_node(
             room.conv_id,
@@ -66,25 +66,8 @@ fn test_pcs_exclusion_adversarial() {
             &store_alice,
         )
         .unwrap();
-    let revoke_node = merkle_tox_core::testing::get_node_from_effects(effects.clone());
-    merkle_tox_core::testing::apply_effects(effects, &store_alice);
-
-    // Bob and Malicious receive revocation
-    let effects = bob_engine
-        .handle_node(room.conv_id, revoke_node.clone(), &store_bob, None)
-        .unwrap();
-    merkle_tox_core::testing::apply_effects(effects, &store_bob);
-
-    let effects = malicious_engine
-        .handle_node(room.conv_id, revoke_node.clone(), &store_malicious, None)
-        .unwrap();
-    merkle_tox_core::testing::apply_effects(effects, &store_malicious);
-
-    // Now Alice rotates
-    let effects = alice_engine
-        .rotate_conversation_key(room.conv_id, &store_alice)
-        .unwrap();
-    let rotation_nodes: Vec<_> = effects
+    // Extract ALL nodes: RevokeDevice + auto-rotation (KeyWrap + SKD)
+    let all_revoke_nodes: Vec<_> = effects
         .iter()
         .filter_map(|e| {
             if let merkle_tox_core::engine::Effect::WriteStore(_, node, _) = e {
@@ -96,26 +79,23 @@ fn test_pcs_exclusion_adversarial() {
         .collect();
     merkle_tox_core::testing::apply_effects(effects, &store_alice);
 
-    // Bob receives rotation
-    for node in &rotation_nodes {
+    // Bob and Malicious receive ALL effects (revoke + auto-rotation)
+    for node in &all_revoke_nodes {
         let effects = bob_engine
             .handle_node(room.conv_id, node.clone(), &store_bob, None)
             .unwrap();
         merkle_tox_core::testing::apply_effects(effects, &store_bob);
     }
-
-    // Malicious receives rotation
-    for node in &rotation_nodes {
+    for node in &all_revoke_nodes {
         let effects = malicious_engine
             .handle_node(room.conv_id, node.clone(), &store_malicious, None)
             .unwrap();
         merkle_tox_core::testing::apply_effects(effects, &store_malicious);
     }
 
-    // Verify Bob is at Epoch 1
-    assert_eq!(bob_engine.get_current_epoch(&room.conv_id), 1);
-    // Verify Malicious is STILL at Epoch 0 because they couldn't unwrap the KeyWrap (revoked)
-    assert_eq!(malicious_engine.get_current_epoch(&room.conv_id), 0);
+    // Verify Bob is at Epoch 1 (from auto-rotation), Malicious at 0 (revoked, can't unwrap)
+    assert_eq!(bob_engine.get_current_generation(&room.conv_id), 1);
+    assert_eq!(malicious_engine.get_current_generation(&room.conv_id), 0);
 
     // 3. Alice authors a message in Epoch 1
     let effects = alice_engine
@@ -127,6 +107,7 @@ fn test_pcs_exclusion_adversarial() {
         )
         .unwrap();
     let msg_e1 = merkle_tox_core::testing::get_node_from_effects(effects.clone());
+    merkle_tox_core::testing::transfer_wire_nodes(&effects, &store_bob);
     merkle_tox_core::testing::apply_effects(effects, &store_alice);
 
     // 4. Bob receives and verifies successfully
@@ -185,7 +166,6 @@ fn test_zombie_device_rotation_exclusion() {
         tp.clone(),
     );
     room.setup_engine(&mut alice_engine, &store);
-    let genesis_hash = room.genesis_node.as_ref().unwrap().hash();
 
     // 2. Alice authorizes Admin A
     let admin_a = TestIdentity::new();
@@ -195,14 +175,15 @@ fn test_zombie_device_rotation_exclusion() {
         Permissions::ADMIN | Permissions::MESSAGE,
         i64::MAX,
     );
+    let admin_heads = store.get_admin_heads(&room.conv_id);
     let auth_a_node = create_admin_node(
         &room.conv_id,
         alice_id.master_pk,
         &alice_id.master_sk,
-        vec![genesis_hash],
+        admin_heads,
         ControlAction::AuthorizeDevice { cert: cert_a },
-        1,
-        1,
+        2,
+        2,
         1000,
     );
     let effects = alice_engine
@@ -224,7 +205,7 @@ fn test_zombie_device_rotation_exclusion() {
         &admin_a.device_sk,
         vec![auth_a_node.hash()],
         ControlAction::AuthorizeDevice { cert: cert_b },
-        2,
+        3,
         1,
         2000,
     );
@@ -235,12 +216,14 @@ fn test_zombie_device_rotation_exclusion() {
     alice_engine.clear_pending();
 
     // Verify B is authorized
+    let ctx = merkle_tox_core::identity::CausalContext::global();
     assert!(alice_engine.identity_manager.is_authorized(
+        &ctx,
         room.conv_id,
         &device_b.device_pk,
         &alice_id.master_pk,
         2500,
-        2
+        3
     ));
 
     // 4. Master Alice revokes Admin A
@@ -253,8 +236,8 @@ fn test_zombie_device_rotation_exclusion() {
             target_device_pk: admin_a.device_pk,
             reason: "Revoked".to_string(),
         },
-        3,
-        2,
+        4, // Rank 4
+        3, // Seq 3
         3000,
     );
     let effects = alice_engine
@@ -264,11 +247,12 @@ fn test_zombie_device_rotation_exclusion() {
 
     // Verify B is now a "Zombie" (path broken via A)
     assert!(!alice_engine.identity_manager.is_authorized(
+        &ctx,
         room.conv_id,
         &device_b.device_pk,
         &alice_id.master_pk,
         3500,
-        3
+        4
     ));
 
     // 5. Alice performs Epoch Rotation

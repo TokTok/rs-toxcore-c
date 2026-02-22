@@ -2,13 +2,12 @@
 
 ## Overview
 
-Merkle-Tox is a performance-critical decentralized synchronization system.
-Because it operates over a limited-bandwidth, high-latency network (Tox), every
-byte on the wire and every millisecond of CPU time spent on serialization or
-cryptography directly impacts the user experience.
+Merkle-Tox operates over a limited-bandwidth, high-latency network (Tox).
+Benchmarks measure bytes on the wire and CPU time spent on serialization and
+cryptography.
 
-Our benchmarking strategy is **Tiered**, focusing on micro-level primitives,
-protocol-level logic units, and high-level user scenarios.
+The strategy is **Tiered**: micro-level primitives, protocol-level logic units,
+and high-level user scenarios.
 
 ## 1. Chosen Benchmarks & Rationale
 
@@ -20,8 +19,8 @@ protocol-level logic units, and high-level user scenarios.
 *   **Metrics:** We benchmark naked `u64` (for discriminator optimization),
     `SmallVec` (stack vs heap), and `Vec<u8>` (MessagePack `bin`
     specialization).
-*   **Goal:** Ensure that our custom MessagePack implementation provides the
-    theoretical maximum byte-density and nanosecond-level performance.
+*   **Goal:** Ensure the custom MessagePack implementation provides maximum
+    byte-density and nanosecond-level performance.
 
 ### Tier 2: Algorithmic Scaling (`tox-reconcile`)
 
@@ -36,54 +35,46 @@ protocol-level logic units, and high-level user scenarios.
 
 ### Tier 3: User Scenarios (`merkle-tox-core`)
 
-**Target:** `core_bench` Instead of benchmarking every function, we target the
-"Hot Paths" of the two most important user experiences:
+**Target:** `core_bench`
+
+Targets the "Hot Paths" of two primary scenarios:
 
 #### A. The "New Joiner" Path
 
 *   **Metric:** `unpack_wire` (Decryption + Decompression + Deserialization).
-*   **Rationale:** A user joining a long-lived chat may need to ingest 10,000+
-    nodes. If `unpack_wire` takes 1ms, the app freezes for 10 seconds. Our
-    target is < 10µs per node to ensure smooth background loading.
+*   **Rationale:** Ingesting 10,000+ nodes requires `unpack_wire` < 10µs per
+    node to prevent main thread blocking.
 
 #### B. The "Blob Transfer" Path
 
 *   **Metric:** `blob_chunk_verify_64kb`.
 *   **Rationale:** Files are transferred in 64KB chunks. Every chunk is verified
     against a Merkle tree.
-*   **Goal:** Ensure integrity checks are fast enough to saturate high-speed
-    fiber connections without bottlenecking the CPU.
+*   **Goal:** Ensure integrity checks saturate high-speed connections without
+    bottlenecking the CPU.
 
 ## 2. Intentional Exclusions
 
-We have intentionally **excluded** the following from our Criterion suite:
+The following are **excluded** from the Criterion suite:
 
-*   **Disk I/O (SQLite/FS):** Disk performance is variable and depends on the
-    environment (NVMe vs. SD Card). These are better handled by "Stress Tests"
-    and "Integration Benchmarks" rather than statistical micro-benchmarks.
-*   **End-to-End Networking:** Real network jitter makes Criterion results
-    meaningless. We use the `merkle-tox-workbench` Swarm Simulator to measure
-    network convergence times separately.
-*   **UI/Rendering:** The cost of drawing the TUI or GUI is decoupled from the
-    protocol performance and is not measured here.
+*   **Disk I/O (SQLite/FS):** Disk performance is environment-dependent. Handled
+    by integration benchmarks.
+*   **End-to-End Networking:** Network jitter invalidates Criterion results.
+    Measured separately via `merkle-tox-workbench` Swarm Simulator.
+*   **UI/Rendering:** Decoupled from protocol performance.
 
-## 3. High-Priority Future Benchmarks
+## 3. Future Benchmarks
 
-The following are the next areas for instrumentation:
-
-1.  **Engine Lock Contention:** As we move to more parallel processing of
-    incoming packets, we need to benchmark the `MerkleToxEngine` under heavy
-    multi-threaded contention (using `parking_lot` vs. standard Mutexes).
-2.  **Ratchet Chain Scaling:** In a DAG with many concurrent branches, the
-    ratchet needs to "merge" many keys. We need to benchmark the cost of
-    `ratchet_merge` when joining 10+ parent chains.
-3.  **Bao Full-Outboard Generation:** Currently, we benchmark single-chunk
-    verification. We need to benchmark the time it takes to generate the full
-    Bao outboard for a 100MB file, as this happens on the "Sender" hot path.
+1.  **Engine Lock Contention:** Benchmark `MerkleToxEngine` under heavy
+    multi-threaded contention (`parking_lot` vs. standard Mutexes).
+2.  **State Promotion Latency:** Benchmark trial decryption and DAG validation
+    cost during Opaque Store promotion flows.
+3.  **Bao Full-Outboard Generation:** Benchmark full Bao outboard generation
+    time for a 100MB file.
 
 ## How to Run
 
-Benchmarks should always be run in **Release Mode** with the `--bench` flag:
+Run in **Release Mode** with the `--bench` flag:
 
 ```bash
 # Protocol Benchmarks

@@ -2,34 +2,25 @@
 
 ## Overview
 
-To ensure interoperability and backward compatibility, Merkle-Tox peers must
-negotiate their capabilities before initiating a synchronization session. This
-prevents protocol mismatches and allows the system to evolve without breaking
-existing clients.
+Peers MUST negotiate capabilities before initiating a synchronization session to
+prevent protocol mismatches.
 
 ## 1. Capability Discovery
 
-Merkle-Tox uses the `tox-sequenced` reliability layer for all communications,
-including the initial handshake. This ensures that even the capability exchange
-is resistant to packet loss.
+The handshake uses `tox-sequenced`.
 
 ### Discovery via Custom Packet
 
 1.  Upon connection, a client sends a `CAPS_ANNOUNCE` message via a
-    `tox-sequenced` DATA packet (using custom lossy packets as the carrier).
-2.  If the peer supports Merkle-Tox, they will respond with their own
+    `tox-sequenced` DATA packet over custom lossy packets.
+2.  If the peer supports Merkle-Tox, they respond with their own
     `CAPS_ANNOUNCE`.
 
 ## 2. Capability Negotiation
 
-Merkle-Tox separates capabilities into two categories to ensure that history
-remains readable even when synced via blind relays and that parsing-critical
-features are committed to the DAG.
-
 ### A. Network-Intrinsic (Ephemeral)
 
-These are negotiated per-session via the `CAPS_ANNOUNCE` packet. They describe
-how the current peer wants to communicate.
+Negotiated per-session via the `CAPS_ANNOUNCE` packet.
 
 Serialized via MessagePack:
 
@@ -47,33 +38,30 @@ struct CapsAnnounce {
 
 ### B. Data-Intrinsic (Persistent / Baseline)
 
-These are mandatory for Version 1 and are committed to the DAG (in the **Genesis
-Node** or **Announcement Nodes**). Every member of the conversation MUST support
-these to parse the history.
+Mandatory for Version 1. Committed to the DAG (in **Genesis Node** or
+**Announcement Nodes**). Every member MUST support these to parse history.
 
-*   **X3DH Handshake**: Mandatory for initial $K_{conv}$ establishment.
-*   **Symmetric Ratcheting**: Mandatory for per-message forward secrecy.
+*   **Signed ECIES Handshake**: Mandatory for initial $K_{conv}$ establishment.
+*   **Symmetric Ratcheting**: Mandatory for post-compromise security and hash
+    chaining.
 *   **Power-of-2 Padding**: Mandatory ISO/IEC 7816-4 anti-traffic analysis.
 *   **Compression**: (e.g., Zstd) If used by an author, it must be supported by
     all readers.
 
-**Principle**: Data-Intrinsic features are immutable properties of the
-conversation's history. A peer MUST NOT author a node using an optional
-Data-Intrinsic feature (like compression) unless that feature was enabled in the
-room's Genesis parameters.
+**Principle**: Data-Intrinsic features are immutable history properties. A peer
+MUST NOT author a node using an optional Data-Intrinsic feature unless enabled
+in the room's Genesis parameters.
 
 ### `CAPS_ACK` (Packet Content)
 
-Peer B responds with its own `CapsAnnounce` struct using the `CAPS_ACK` message
-type (0x02). This completes the 2-way handshake. Once both sides have exchanged
-these, the `merkle-tox-sync` state machine begins.
+Peer B responds with `CapsAnnounce` via a `CAPS_ACK` message (0x02), completing
+the handshake. The `merkle-tox-sync` state machine begins.
 
 ## 3. Post-Handshake Procedures
 
-Immediately following a successful `CAPS_ACK`, the following procedures are
-initiated:
+After `CAPS_ACK`:
 
 1.  **Head Exchange**: Both peers send `SYNC_HEADS` to begin history
     reconciliation.
-2.  **Continuous Clock Sync**: Peers monitor transport-layer PING/PONG
-    timestamps to maintain network time offsets.
+2.  **Continuous Clock Sync**: Peers monitor transport PING/PONG timestamps to
+    maintain network time offsets.

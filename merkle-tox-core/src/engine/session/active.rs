@@ -68,7 +68,7 @@ impl SyncSession<Active> {
                 && !self.common.missing_nodes.contains(parent)
                 && !self.common.in_flight_fetches.contains(parent)
             {
-                // Prioritize Admin nodes if we could know the type, but here we don't.
+                // Prioritize Admin nodes if type known, but here we don't.
                 self.common.missing_nodes.push_back(*parent);
             }
         }
@@ -98,17 +98,26 @@ impl SyncSession<Active> {
         sketch: tox_reconcile::SyncSketch,
         store: &dyn NodeStore,
     ) -> MerkleToxResult<DecodingResult> {
+        self.handle_sync_sketch_keyed(sketch, store, None)
+    }
+
+    pub fn handle_sync_sketch_keyed(
+        &mut self,
+        sketch: tox_reconcile::SyncSketch,
+        store: &dyn NodeStore,
+        k_iblt: Option<[u8; 32]>,
+    ) -> MerkleToxResult<DecodingResult> {
         if sketch.conversation_id != self.conversation_id {
             return Ok(DecodingResult::Failed);
         }
 
-        let mut local_iblt = IbltSketch::new(sketch.cells.len());
+        let mut local_iblt = IbltSketch::new_keyed(sketch.cells.len(), k_iblt);
         let local_hashes = store.get_node_hashes_in_range(&self.conversation_id, &sketch.range)?;
         for hash in local_hashes {
             local_iblt.insert(hash.as_ref());
         }
 
-        let mut remote_iblt = IbltSketch::from_cells(sketch.cells);
+        let mut remote_iblt = IbltSketch::from_cells_keyed(sketch.cells, k_iblt);
         remote_iblt.subtract(&local_iblt).map_err(|e| {
             MerkleToxError::Reconciliation(format!("Sketch subtraction failed: {}", e))
         })?;
@@ -194,9 +203,13 @@ impl SyncSession<Active> {
             self.common.missing_blobs.insert(*hash);
         }
 
-        if let crate::dag::Content::Control(crate::dag::ControlAction::Snapshot { .. }) =
-            &node.content
-            && self.common.shallow
+        if matches!(
+            &node.content,
+            crate::dag::Content::Control(
+                crate::dag::ControlAction::Snapshot(_)
+                    | crate::dag::ControlAction::AnchorSnapshot { .. }
+            )
+        ) && self.common.shallow
         {
             return;
         }
@@ -241,7 +254,17 @@ impl SyncSession<Active> {
         tier: Tier,
         store: &dyn NodeStore,
     ) -> MerkleToxResult<tox_reconcile::SyncSketch> {
-        let mut iblt = IbltSketch::new(tier.cell_count());
+        self.make_sync_sketch_keyed(range, tier, store, None)
+    }
+
+    pub fn make_sync_sketch_keyed(
+        &self,
+        range: SyncRange,
+        tier: Tier,
+        store: &dyn NodeStore,
+        k_iblt: Option<[u8; 32]>,
+    ) -> MerkleToxResult<tox_reconcile::SyncSketch> {
+        let mut iblt = IbltSketch::new_keyed(tier.cell_count(), k_iblt);
         let hashes = store.get_node_hashes_in_range(&self.conversation_id, &range)?;
         for hash in hashes {
             iblt.insert(hash.as_ref());
@@ -268,7 +291,6 @@ impl SyncSession<Active> {
 
         for start_rank in (0..=max_rank).step_by(crate::sync::SHARD_SIZE as usize) {
             let range = SyncRange {
-                epoch: 0,
                 min_rank: start_rank,
                 max_rank: start_rank + crate::sync::SHARD_SIZE - 1,
             };
@@ -392,7 +414,7 @@ impl SyncSession<Active> {
         self.common.effective_difficulty = votes[votes.len() / 2];
     }
 
-    /// Prepares a new MerkleNode with automatic parent merging and rank calculation.
+    /// Prepares new MerkleNode with automatic parent merging and rank calculation.
     #[allow(clippy::too_many_arguments)]
     pub fn create_node(
         &self,
@@ -424,7 +446,10 @@ impl SyncSession<Active> {
             network_timestamp: timestamp,
             content,
             metadata,
-            authentication: crate::dag::NodeAuth::Mac(crate::dag::NodeMac::from([0u8; 32])), // Placeholder
+            authentication: crate::dag::NodeAuth::EphemeralSignature(
+                crate::dag::Ed25519Signature::from([0u8; 64]),
+            ), // Placeholder
+            pow_nonce: 0,
         }
     }
 }

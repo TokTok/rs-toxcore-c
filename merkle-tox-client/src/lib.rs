@@ -8,7 +8,7 @@ use merkle_tox_core::dag::{
     Content, ControlAction, ConversationId, EmojiSource, InviteAction, LogicalIdentityPk,
     MerkleNode, NodeHash, NodeType, Permissions, PhysicalDevicePk,
 };
-use merkle_tox_core::engine::{Conversation, Effect};
+use merkle_tox_core::engine::Effect;
 use merkle_tox_core::error::{MerkleToxError, MerkleToxResult};
 use merkle_tox_core::identity::sign_delegation;
 use merkle_tox_core::node::MerkleToxNode;
@@ -142,7 +142,7 @@ impl<T: Transport + 'static, S: NodeStore + BlobStore + 'static> MerkleToxClient
             Content::Text(_)
             | Content::Blob { .. }
             | Content::Location { .. }
-            | Content::Other { .. } => {
+            | Content::Custom { .. } => {
                 state.messages.push(crate::state::ChatMessage {
                     hash: *hash,
                     author_pk: node.author_pk,
@@ -229,8 +229,10 @@ impl<T: Transport + 'static, S: NodeStore + BlobStore + 'static> MerkleToxClient
                 }
                 _ => {}
             },
-            Content::RatchetSnapshot { .. } => {
-                // RatchetSnapshot is for self-recovery, not for the UI.
+            Content::HistoryExport { .. }
+            | Content::LegacyBridge { .. }
+            | Content::SenderKeyDistribution { .. } => {
+                // Not for UI state.
             }
             _ => {}
         }
@@ -248,7 +250,9 @@ impl<T: Transport + 'static, S: NodeStore + BlobStore + 'static> MerkleToxClient
             | Content::Control(ControlAction::RevokeDevice { .. })
             | Content::Control(ControlAction::Invite(_))
             | Content::Control(ControlAction::Leave(_)) => {
+                let ctx = merkle_tox_core::identity::CausalContext::global();
                 if node_lock.engine.identity_manager.is_admin(
+                    &ctx,
                     cid,
                     &self_pk,
                     &self_pk.to_logical(),
@@ -274,18 +278,16 @@ impl<T: Transport + 'static, S: NodeStore + BlobStore + 'static> MerkleToxClient
             Content::Control(ControlAction::Announcement { pre_keys, .. }) => {
                 // A peer has published their ephemeral keys.
                 // If we are an admin and have the conversation key, we should share it with them.
+                let ctx = merkle_tox_core::identity::CausalContext::global();
                 if node_lock.engine.identity_manager.is_admin(
+                    &ctx,
                     cid,
                     &self_pk,
                     &self_pk.to_logical(),
                     now,
                     u64::MAX,
-                ) && let Some(Conversation::Established(em)) =
-                    node_lock.engine.conversations.get(&cid)
-                    && let Some(keys) = em.get_keys(em.current_epoch())
-                {
-                    let k_conv = keys.k_conv.clone();
-                    // Use the first valid pre-key
+                ) {
+                    // Use the first valid pre-key; K_conv_0 is derived internally per spec §2.C.
                     if let Some(spk) = pre_keys.iter().find(|k| k.expires_at > now) {
                         info!(
                             "Automatically sharing conversation key with {:?} via X3DH",
@@ -296,7 +298,6 @@ impl<T: Transport + 'static, S: NodeStore + BlobStore + 'static> MerkleToxClient
                             cid,
                             node.sender_pk,
                             spk.public_key,
-                            k_conv,
                             &node_ref.store,
                         )?;
                         let now_inst = node_ref.time_provider.now_instant();
@@ -543,6 +544,7 @@ impl<T: Transport + 'static, S: NodeStore + BlobStore + 'static> MerkleToxClient
                 bao_root: None, // Simplified: no outboard proof for small/medium blobs
                 status: merkle_tox_core::cas::BlobStatus::Available,
                 received_mask: None,
+                decryption_key: None,
             };
             node_lock.store.put_blob_info(info)?;
 

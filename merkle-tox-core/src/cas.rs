@@ -12,19 +12,21 @@ pub enum BlobStatus {
     Error,
 }
 
-/// Metadata for a large binary object.
+/// Metadata for large binary object.
 #[derive(Debug, Clone, ToxProto, PartialEq, Eq)]
 pub struct BlobInfo {
     pub hash: NodeHash,
     pub size: u64,
-    /// The Blake3-Merkle root for incremental verification (Bao).
+    /// Blake3-Merkle root for incremental verification (Bao).
     pub bao_root: Option<[u8; 32]>,
     pub status: BlobStatus,
     /// Optional bitmask of received chunks.
     pub received_mask: Option<Vec<u8>>,
+    /// Decryption key for blob (K_export from HistoryExport).
+    pub decryption_key: Option<[u8; 32]>,
 }
 
-/// A request for a specific chunk of a blob.
+/// Request for specific blob chunk.
 #[derive(Debug, Clone, ToxProto, PartialEq, Eq)]
 pub struct BlobReq {
     pub hash: NodeHash,
@@ -32,18 +34,18 @@ pub struct BlobReq {
     pub length: u32,
 }
 
-/// Data payload for a blob chunk, including Bao proof for verification.
+/// Data payload for blob chunk, including Bao proof for verification.
 #[derive(Debug, Clone, ToxProto, PartialEq, Eq)]
 pub struct BlobData {
     pub hash: NodeHash,
     pub offset: u64,
     pub data: Vec<u8>,
-    /// Intermediate hashes needed to verify this chunk against the bao_root.
+    /// Intermediate hashes to verify chunk against bao_root.
     pub proof: Vec<u8>,
 }
 
 impl BlobData {
-    /// Verifies the chunk data and proof against the provided Bao root.
+    /// Verifies chunk data and proof against Bao root.
     pub fn verify(&self, bao_root: &[u8; 32]) -> bool {
         let mut decoder = bao::decode::SliceDecoder::new(
             &*self.proof,
@@ -62,7 +64,7 @@ impl BlobData {
 pub const CHUNK_SIZE: u64 = 64 * 1024; // 64KB
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Tracks which chunks of a blob have been received.
+/// Tracks received blob chunks.
 pub struct ChunkTracker {
     pub hash: NodeHash,
     pub total_size: u64,
@@ -127,13 +129,13 @@ impl ChunkTracker {
     }
 }
 
-/// Manages the synchronization of a blob from multiple peers.
+/// Manages synchronization of blob from multiple peers.
 pub struct SwarmSync {
     pub info: BlobInfo,
     pub tracker: ChunkTracker,
-    /// Peers who have confirmed possession of this blob.
+    /// Peers confirming possession of blob.
     pub seeders: HashSet<PhysicalDevicePk>,
-    /// Chunks currently being fetched: chunk_index -> (peer_pk, start_time)
+    /// Chunks currently being fetched: chunk_index to (peer_pk, start_time)
     pub active_fetches: HashMap<u64, (PhysicalDevicePk, Instant)>,
 }
 
@@ -152,19 +154,19 @@ impl SwarmSync {
         self.seeders.insert(peer);
     }
 
-    /// Removes a seeder and clears any active fetches assigned to them.
+    /// Removes seeder and clears assigned active fetches.
     pub fn remove_seeder(&mut self, peer: &PhysicalDevicePk) {
         self.seeders.remove(peer);
         self.active_fetches.retain(|_, (p, _)| p != peer);
     }
 
-    /// Clears any fetches that have exceeded FETCH_TIMEOUT.
+    /// Clears fetches exceeding FETCH_TIMEOUT.
     pub fn clear_stalled_fetches(&mut self, now: Instant) {
         self.active_fetches
             .retain(|_, (_, start)| now.saturating_duration_since(*start) < FETCH_TIMEOUT);
     }
 
-    /// Selects the next set of chunk requests to send to available seeders.
+    /// Selects next chunk requests for available seeders.
     pub fn next_requests(
         &mut self,
         max_total_requests: usize,
@@ -188,7 +190,7 @@ impl SwarmSync {
 
             if let Some(chunk_idx) = self.tracker.next_missing(hint) {
                 if !self.active_fetches.contains_key(&chunk_idx) {
-                    // Pick seeder with least in-flight that is below limit
+                    // Pick seeder with least in-flight below limit
                     let seeder = self
                         .seeders
                         .iter()
@@ -232,7 +234,7 @@ impl SwarmSync {
         true
     }
 
-    /// Returns the next scheduled wakeup time for this swarm sync.
+    /// Returns next scheduled wakeup time for swarm sync.
     pub fn next_wakeup(&self, now: Instant) -> Instant {
         let mut next = now + Duration::from_secs(3600);
 
@@ -241,7 +243,7 @@ impl SwarmSync {
             next = next.min(*start + FETCH_TIMEOUT);
         }
 
-        // 2. If we have missing chunks that are not already in flight, and available seeders, we want to poll ASAP
+        // 2. Poll ASAP if missing chunks not in flight and seeders available
         let busy_peers: HashSet<PhysicalDevicePk> =
             self.active_fetches.values().map(|(p, _)| *p).collect();
         let has_available_seeder = self.seeders.iter().any(|p| !busy_peers.contains(p));

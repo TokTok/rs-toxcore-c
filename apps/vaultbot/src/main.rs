@@ -2,7 +2,7 @@ use clap::Parser;
 use merkle_tox_client::MerkleToxClient;
 use merkle_tox_core::dag::{ConversationId, PhysicalDeviceSk};
 use merkle_tox_core::node::MerkleToxNode;
-use merkle_tox_core::{NodeEvent, NodeEventHandler, Transport};
+use merkle_tox_core::{NodeEvent, NodeEventHandler};
 use merkle_tox_fs::FsStore;
 use merkle_tox_tox::{ToxMerkleBridge, ToxTransport};
 use parking_lot::ReentrantMutex;
@@ -126,7 +126,10 @@ impl VaultBot {
         let transport = ToxTransport {
             tox: tox_shared.clone(),
         };
-        let self_pk = transport.local_pk();
+        // Derive Ed25519 identity from Tox X25519 secret key.
+        let self_pk = merkle_tox_core::dag::PhysicalDevicePk::from(
+            merkle_tox_core::crypto::ed25519_public_key_from_seed(&self_sk),
+        );
         let engine = merkle_tox_core::engine::MerkleToxEngine::with_sk(
             self_pk,
             self_pk.to_logical(),

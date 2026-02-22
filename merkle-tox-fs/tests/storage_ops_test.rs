@@ -1,5 +1,6 @@
 use merkle_tox_core::dag::{
-    Content, ConversationId, LogicalIdentityPk, MerkleNode, NodeAuth, NodeMac, PhysicalDevicePk,
+    Content, ConversationId, Ed25519Signature, LogicalIdentityPk, MerkleNode, NodeAuth,
+    PhysicalDevicePk,
 };
 use merkle_tox_core::sync::NodeStore;
 use merkle_tox_core::vfs::StdFileSystem;
@@ -23,7 +24,8 @@ fn test_fs_store_size_calculation() {
         network_timestamp: 100,
         content: Content::Text("Size Test".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
 
     store.put_node(&conv_id, node, true).unwrap();
@@ -52,7 +54,8 @@ fn test_fs_store_compaction_ops() {
             network_timestamp: 100,
             content: Content::Text(format!("Node {}", i)),
             metadata: vec![],
-            authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+            authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+            pow_nonce: 0,
         };
         store.put_node(&conv_id, node, true).unwrap();
     }

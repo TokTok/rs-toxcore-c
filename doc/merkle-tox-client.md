@@ -2,11 +2,9 @@
 
 ## Overview
 
-Merkle-Tox separates **Mechanism** from **Policy**. The `merkle-tox-core`
-provides the mechanisms (DAG synchronization, verification, and chunking), while
-the `merkle-tox-client` layer implements the policies required for a realistic
-group chat experience (auto-authorization, key management, and materialized
-views).
+Merkle-Tox separates **Mechanism** from **Policy**. `merkle-tox-core` provides
+mechanisms (DAG synchronization, verification, chunking). `merkle-tox-client`
+implements policy (auto-authorization, key management, materialized views).
 
 ## 1. Core vs. Client Responsibilities
 
@@ -27,26 +25,25 @@ views).
 
 ## 2. The Orchestration Loop
 
-The Client layer implements an orchestrator that watches for `NodeEvent`s from
-the Core and takes action based on the configured `PolicyHandler`.
+The Client implements an orchestrator watching `NodeEvent`s from the Core to
+execute actions via the configured `PolicyHandler`.
 
 ### Auto-Authorization Flow
 
 1.  **Peer Connection**: Core emits `PeerHandshakeComplete`.
-2.  **Policy Check**: Orchestrator asks policy: "Should I authorize this peer?"
-3.  **Action**: If yes and local node is an Admin, author an `AuthorizeDevice`
-    node for the peer.
+2.  **Policy Check**: Orchestrator queries policy: "Should I authorize this
+    peer?"
+3.  **Action**: If true and local node is Admin, author `AuthorizeDevice`.
 
 ### Auto-Key Exchange
 
 1.  **Auth Confirmed**: Core emits `NodeVerified` (AuthorizeDevice).
-2.  **Action**: Orchestrator authors a `KeyWrap` node containing the encrypted
-    $K_{conv}$ for the newly authorized peer.
+2.  **Action**: Orchestrator authors `KeyWrap` containing $K_{conv}$ for the
+    peer.
 
 ## 3. High-Level API
 
-The Client layer provides a simplified interface for applications like `toxxi`
-and `vaultbot`.
+The Client provides an interface for applications like `toxxi` and `vaultbot`.
 
 ```rust
 impl MerkleToxClient {
@@ -63,8 +60,7 @@ impl MerkleToxClient {
 
 ## 4. Policy Customization
 
-To support diverse use cases (e.g., public forums, private groups), the Client
-uses a `PolicyHandler` trait.
+The Client uses `PolicyHandler` to customize behavior.
 
 ```rust
 pub trait PolicyHandler: Send + Sync {
@@ -76,11 +72,10 @@ pub trait PolicyHandler: Send + Sync {
 }
 ```
 
-## 5. Tradeoffs and Sophistication
+## 5. Deployment Modes
 
--   **Wrapper Mode**: The Client owns the Node. Easiest for 99% of apps.
--   **Controller Mode**: The Client acts as an external agent. Required for the
-    **Workbench** to allow for fault injection (e.g., refusing to share keys to
-    test sync stalls).
+-   **Wrapper Mode**: The Client owns the Node.
+-   **Controller Mode**: The Client acts as an external agent (used by the
+    **Workbench** for fault injection).
 -   **Consistency**: The materialized view is eventually consistent.
-    Applications should listen to the `ClientEvent` stream for state updates.
+    Applications MUST listen to the `ClientEvent` stream for updates.

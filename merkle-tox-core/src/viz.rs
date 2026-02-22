@@ -3,7 +3,7 @@ use crate::sync::NodeStore;
 use std::collections::HashSet;
 use std::fmt::Write;
 
-/// Export the DAG for a given conversation to a Graphviz .dot format string.
+/// Exports conversation DAG to Graphviz .dot format string.
 pub fn export_dot(conversation_id: &ConversationId, store: &dyn NodeStore) -> String {
     let mut dot = String::new();
     dot.push_str("digraph DAG {\n");
@@ -67,9 +67,13 @@ fn format_node_label(hash: &NodeHash, node: &MerkleNode) -> String {
         Content::Blob { name, .. } => format!("Blob: {}", name),
         Content::Reaction { emoji, .. } => format!("Reaction: {:?}", emoji),
         Content::Redaction { reason, .. } => format!("Redaction: {}", reason),
-        Content::KeyWrap { epoch, .. } => format!("KeyWrap: epoch={}", epoch),
-        Content::RatchetSnapshot { epoch, .. } => format!("RatchetSnapshot: epoch={}", epoch),
-        _ => "Other".to_string(),
+        Content::KeyWrap { generation, .. } => format!("KeyWrap: gen={}", generation),
+        Content::HistoryExport { .. } => "HistoryExport".to_string(),
+        Content::LegacyBridge { .. } => "LegacyBridge".to_string(),
+        Content::SenderKeyDistribution { .. } => "SenderKeyDistribution".to_string(),
+        Content::Location { .. } => "Location".to_string(),
+        Content::Edit { .. } => "Edit".to_string(),
+        Content::Custom { .. } => "Custom".to_string(),
     };
 
     format!(

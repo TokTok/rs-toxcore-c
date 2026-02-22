@@ -4,9 +4,9 @@ use crate::cas::SwarmSync;
 use crate::clock::{NetworkClock, TimeProvider};
 use crate::crypto::ed25519_sk_to_x25519;
 use crate::dag::{
-    ChainKey, Content, ControlAction, ConversationId, EphemeralX25519Pk, EphemeralX25519Sk, KConv,
-    LogicalIdentityPk, MerkleNode, NodeHash, NodeType, PhysicalDeviceDhSk, PhysicalDevicePk,
-    PhysicalDeviceSk,
+    ChainKey, Content, ControlAction, ConversationId, EphemeralSigningPk, EphemeralSigningSk,
+    EphemeralX25519Pk, EphemeralX25519Sk, KConv, LogicalIdentityPk, MerkleNode, NodeHash, NodeType,
+    PhysicalDeviceDhSk, PhysicalDevicePk, PhysicalDeviceSk,
 };
 use crate::error::MerkleToxResult;
 use crate::identity::IdentityManager;
@@ -32,18 +32,60 @@ pub struct MerkleToxEngine {
     pub self_dh_sk: Option<PhysicalDeviceDhSk>,
     pub identity_manager: IdentityManager,
     pub clock: NetworkClock,
-    /// (Peer PK, Conversation ID) -> SyncSession
+    /// Maps (Peer PK, Conversation ID) to SyncSession.
     pub sessions: HashMap<(PhysicalDevicePk, ConversationId), PeerSession>,
     pub conversations: HashMap<ConversationId, Conversation>,
     pub blob_syncs: HashMap<NodeHash, SwarmSync>,
-    /// Our generated ephemeral private keys: Public Key -> Private Key
+    /// Maps generated ephemeral Public Key to Private Key.
     pub ephemeral_keys: HashMap<EphemeralX25519Pk, EphemeralX25519Sk>,
-    /// peer_pk -> Last seen announcement
+    /// Maps peer_pk to last seen announcement.
     pub peer_announcements: HashMap<PhysicalDevicePk, crate::dag::ControlAction>,
     pub rng: Mutex<StdRng>,
-    /// Transient cache for nodes and state that have been "written" as effects
-    /// but not yet committed to the store. Used for internal consistency.
+    /// Transient cache for nodes and state written as effects
+    /// but not yet committed to store. Used for internal consistency.
     pub(crate) pending_cache: Mutex<PendingCache>,
+    /// Tracks highest topological rank of handled HandshakePulses per peer.
+    pub highest_handled_pulse: HashMap<(ConversationId, PhysicalDevicePk), u64>,
+    /// Latest verified Genesis or Snapshot hash per conversation, used as
+    /// `anchor_hash` in KeyWrap nodes.
+    pub latest_anchor_hashes: HashMap<ConversationId, NodeHash>,
+    /// Ephemeral signing keys per epoch for content node authoring.
+    pub self_ephemeral_signing_keys: HashMap<u64, ed25519_dalek::SigningKey>,
+    /// Peer ephemeral signing public keys: (sender_pk, epoch) to verifying key bytes.
+    pub peer_ephemeral_signing_keys: HashMap<(PhysicalDevicePk, u64), EphemeralSigningPk>,
+    /// Disclosed ephemeral signing private keys from past epochs for deniability.
+    /// Maps (sender_pk, epoch) to disclosed_signing_sk_bytes.
+    pub disclosed_signing_keys: HashMap<(PhysicalDevicePk, u64), EphemeralSigningSk>,
+    /// Cache to avoid O(N^2) DAG traversals computing causal history.
+    pub(crate) admin_ancestors_cache:
+        Mutex<lru::LruCache<NodeHash, std::sync::Arc<std::collections::HashSet<NodeHash>>>>,
+    /// Per-conversation opaque wire node store usage tracker.
+    /// Tracks (total_bytes, Vec<(hash, size, timestamp)>) for quota enforcement.
+    #[allow(clippy::type_complexity)]
+    pub opaque_store_usage: HashMap<ConversationId, (usize, Vec<(NodeHash, usize, i64)>)>,
+    /// Counts X3DH handshakes (KeyWrap decryptions consuming ephemeral keys)
+    /// per conversation. When >= MAX_HANDSHAKES_PER_ANNOUNCEMENT, fresh
+    /// Announcement should be published.
+    pub handshake_count_since_announcement: HashMap<ConversationId, u32>,
+    /// Devices restored via AnchorSnapshot (heal timestamp in ms).
+    /// If not re-keyed within TRUST_RESTORED_EXPIRY_MS, conversation
+    /// is downgraded to permanent observer mode.
+    pub trust_restored_devices: HashMap<(ConversationId, PhysicalDevicePk), i64>,
+    /// Pending KeyWrap ACKs: keywrap_hash to pending state.
+    /// When authoring KeyWrap consuming OPK, enters pending state
+    /// and buffers content until KEYWRAP_ACK received.
+    pub keywrap_pending: HashMap<NodeHash, KeyWrapPending>,
+    /// OPK IDs consumed by received KeyWraps.
+    /// Maps opk_id to (keywrap_hash, sender_pk, topological_rank) for collision detection.
+    pub consumed_opk_ids: HashMap<NodeHash, (NodeHash, PhysicalDevicePk, u64)>,
+}
+
+/// State for pending KeyWrap awaiting KEYWRAP_ACK.
+#[derive(Debug, Clone)]
+pub struct KeyWrapPending {
+    pub conversation_id: ConversationId,
+    pub recipient_pk: PhysicalDevicePk,
+    pub created_at: Instant,
 }
 
 pub(crate) struct PendingCache {
@@ -53,6 +95,7 @@ pub(crate) struct PendingCache {
     pub heads: HashMap<ConversationId, Vec<NodeHash>>,
     pub admin_heads: HashMap<ConversationId, Vec<NodeHash>>,
     pub last_verified_sequences: HashMap<(ConversationId, PhysicalDevicePk), u64>,
+    pub admin_distances: HashMap<NodeHash, u64>,
 }
 
 impl PendingCache {
@@ -64,6 +107,7 @@ impl PendingCache {
             heads: HashMap::new(),
             admin_heads: HashMap::new(),
             last_verified_sequences: HashMap::new(),
+            admin_distances: HashMap::new(),
         }
     }
 
@@ -74,6 +118,7 @@ impl PendingCache {
         self.heads.clear();
         self.admin_heads.clear();
         self.last_verified_sequences.clear();
+        self.admin_distances.clear();
     }
 }
 
@@ -122,8 +167,21 @@ impl MerkleToxEngine {
             blob_syncs: HashMap::new(),
             ephemeral_keys: HashMap::new(),
             peer_announcements: HashMap::new(),
+            highest_handled_pulse: HashMap::new(),
+            latest_anchor_hashes: HashMap::new(),
+            self_ephemeral_signing_keys: HashMap::new(),
+            peer_ephemeral_signing_keys: HashMap::new(),
+            disclosed_signing_keys: HashMap::new(),
             rng: Mutex::new(rng),
             pending_cache: Mutex::new(PendingCache::new()),
+            admin_ancestors_cache: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(20000).unwrap(),
+            )),
+            opaque_store_usage: HashMap::new(),
+            handshake_count_since_announcement: HashMap::new(),
+            trust_restored_devices: HashMap::new(),
+            keywrap_pending: HashMap::new(),
+            consumed_opk_ids: HashMap::new(),
         }
     }
 
@@ -156,7 +214,7 @@ impl MerkleToxEngine {
         engine
     }
 
-    /// Loads conversation keys and metadata from the store.
+    /// Loads conversation keys and metadata from store.
     pub fn load_conversation_state(
         &mut self,
         conversation_id: ConversationId,
@@ -165,6 +223,34 @@ impl MerkleToxEngine {
         // 1. Reconstruct Identity state from verified Admin nodes
         let admin_nodes = store.get_verified_nodes_by_type(&conversation_id, NodeType::Admin)?;
         for node in &admin_nodes {
+            let mut admin_ancestor_hashes = std::collections::HashSet::new();
+            let mut stack = node.parents.clone();
+            let mut visited = std::collections::HashSet::new();
+
+            while let Some(parent_hash) = stack.pop() {
+                if visited.insert(parent_hash)
+                    && let Some(parent_node) = store.get_node(&parent_hash)
+                {
+                    if parent_node.node_type() == crate::dag::NodeType::Admin {
+                        admin_ancestor_hashes.insert(parent_hash);
+                    }
+                    if let Some(cached) = self.admin_ancestors_cache.lock().get(&parent_hash) {
+                        admin_ancestor_hashes.extend(cached.iter().cloned());
+                    } else {
+                        stack.extend(parent_node.parents.clone());
+                    }
+                }
+            }
+            self.admin_ancestors_cache.lock().put(
+                node.hash(),
+                std::sync::Arc::new(admin_ancestor_hashes.clone()),
+            );
+
+            let ctx = crate::identity::CausalContext {
+                evaluating_node_hash: node.hash(),
+                admin_ancestor_hashes,
+            };
+
             if let Content::Control(action) = &node.content {
                 match action {
                     ControlAction::Genesis {
@@ -181,11 +267,13 @@ impl MerkleToxEngine {
                     }
                     ControlAction::AuthorizeDevice { cert } => {
                         let _ = self.identity_manager.authorize_device(
+                            &ctx,
                             conversation_id,
                             node.author_pk,
                             cert,
                             node.network_timestamp,
                             node.topological_rank,
+                            node.hash(),
                         );
                     }
                     ControlAction::RevokeDevice {
@@ -193,8 +281,12 @@ impl MerkleToxEngine {
                     } => {
                         self.identity_manager.revoke_device(
                             conversation_id,
+                            node.sender_pk,
+                            node.author_pk,
                             *target_device_pk,
                             node.topological_rank,
+                            node.network_timestamp,
+                            node.hash(),
                         );
                     }
                     ControlAction::Invite(invite) => {
@@ -208,8 +300,12 @@ impl MerkleToxEngine {
                     ControlAction::Leave(logical_pk) => {
                         self.identity_manager.remove_member(
                             conversation_id,
+                            node.sender_pk,
+                            node.author_pk,
                             *logical_pk,
                             node.topological_rank,
+                            node.network_timestamp,
+                            node.hash(),
                         );
                     }
                     ControlAction::Announcement { .. } => {
@@ -293,7 +389,7 @@ impl MerkleToxEngine {
         Ok(())
     }
 
-    /// Registers a conversation and optionally initiates sync with a peer.
+    /// Registers conversation and optionally initiates sync with peer.
     pub fn start_sync(
         &mut self,
         conversation_id: ConversationId,
@@ -303,7 +399,7 @@ impl MerkleToxEngine {
         self.start_shallow_sync(conversation_id, peer_pk, store, 0, 0)
     }
 
-    /// Initiates a shallow sync with depth limits.
+    /// Initiates shallow sync with depth limits.
     pub fn start_shallow_sync(
         &mut self,
         conversation_id: ConversationId,
@@ -355,7 +451,24 @@ impl MerkleToxEngine {
         effects
     }
 
-    // Periodic background tasks (e.g. CAS swarm requests, background reconciliation).
+    /// Sends reinclusion request to admin for trust-restored conversation.
+    pub fn request_reinclusion(
+        &self,
+        conversation_id: ConversationId,
+        admin_pk: PhysicalDevicePk,
+        snapshot_hash: NodeHash,
+    ) -> Vec<Effect> {
+        vec![Effect::SendPacket(
+            admin_pk,
+            ProtocolMessage::ReinclusionRequest {
+                conversation_id,
+                sender_pk: self.self_pk,
+                healing_snapshot_hash: snapshot_hash,
+            },
+        )]
+    }
+
+    // Periodic background tasks (e.g., CAS swarm requests, background reconciliation).
     pub fn poll(&mut self, now: Instant, store: &dyn NodeStore) -> MerkleToxResult<Vec<Effect>> {
         self.clear_pending();
 
@@ -364,11 +477,88 @@ impl MerkleToxEngine {
 
         // 0. Check for automatic rotation
         let now_ms = self.clock.network_time_ms();
+
+        // Proactively evict stale skipped_keys across established conversations.
+        for conv in self.conversations.values_mut() {
+            if let Conversation::Established(em) = conv {
+                em.state
+                    .skipped_keys
+                    .retain(|_, &mut (_, timestamp)| now_ms - timestamp <= 86_400_000);
+            }
+        }
+
+        // Check trust-restored devices for 30-day expiry.
+        // If self expired, downgrade conversation to Pending (permanent observer mode).
+        let expired_trust: Vec<(ConversationId, PhysicalDevicePk)> = self
+            .trust_restored_devices
+            .iter()
+            .filter(|&(_, &heal_ts)| {
+                now_ms - heal_ts > tox_proto::constants::TRUST_RESTORED_EXPIRY_MS
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        for (cid, pk) in expired_trust {
+            self.trust_restored_devices.remove(&(cid, pk));
+            if pk == self.self_pk {
+                // Downgrade to Pending: permanent observer mode
+                if let Some(conv) = self.conversations.remove(&cid) {
+                    let pending = ConversationData::<conversation::Pending>::new(cid);
+                    self.conversations
+                        .insert(cid, Conversation::Pending(pending));
+                    info!(
+                        "Trust-restored expiry for {:?}: downgraded to Pending (observer mode)",
+                        cid
+                    );
+                    let _ = conv; // drop established state
+                }
+            }
+        }
+
+        // Auto-send reinclusion requests when approaching 25-day mark
+        // (5-day buffer before 30-day expiry).
+        const REINCLUSION_REQUEST_THRESHOLD_MS: i64 = 25 * 24 * 60 * 60 * 1000;
+        for (&(cid, pk), &heal_ts) in &self.trust_restored_devices {
+            if pk == self.self_pk
+                && now_ms - heal_ts > REINCLUSION_REQUEST_THRESHOLD_MS
+                && now_ms - heal_ts <= tox_proto::constants::TRUST_RESTORED_EXPIRY_MS
+            {
+                // Find admin for request
+                if let Some(anchor_hash) = self.latest_anchor_hashes.get(&cid) {
+                    let ctx = crate::identity::CausalContext::global();
+                    let admins = self.identity_manager.list_active_authorized_devices(
+                        &ctx,
+                        cid,
+                        now_ms,
+                        u64::MAX,
+                    );
+                    for admin_pk in admins {
+                        if admin_pk != self.self_pk
+                            && self.identity_manager.is_admin(
+                                &ctx,
+                                cid,
+                                &admin_pk,
+                                &admin_pk.to_logical(),
+                                now_ms,
+                                u64::MAX,
+                            )
+                        {
+                            effects.extend(self.request_reinclusion(cid, admin_pk, *anchor_hash));
+                            break; // One request per poll cycle
+                        }
+                    }
+                }
+            }
+        }
+
         let conv_ids: Vec<ConversationId> = self.conversations.keys().cloned().collect();
         for cid in conv_ids {
             if self.check_rotation_triggers(cid) {
-                // Only rotate if we are admin
+                // Only rotate if admin. Use global context: it bypasses
+                // per-node causal ancestry check, appropriate for this
+                // proactive self-check (no specific node evaluated).
+                let ctx = crate::identity::CausalContext::global();
                 let is_admin = self.identity_manager.is_admin(
+                    &ctx,
                     cid,
                     &self.self_pk,
                     &self.self_pk.to_logical(), // Assuming self-admin means master of self
@@ -380,10 +570,47 @@ impl MerkleToxEngine {
                     info!("Automatic rotation triggered for conversation {:?}", cid);
                     let conv_effects = self.rotate_conversation_key(cid, store)?;
                     effects.extend(conv_effects);
-                    // The new nodes will be advertised via heads_dirty in SyncSessions
+                    // New nodes advertised via heads_dirty in SyncSessions
                 }
             }
         }
+
+        // Check if conversation needs announcement rotation after 100 handshakes
+        let handshake_convs: Vec<ConversationId> = self
+            .handshake_count_since_announcement
+            .iter()
+            .filter(|&(_, &count)| count >= tox_proto::constants::MAX_HANDSHAKES_PER_ANNOUNCEMENT)
+            .map(|(cid, _)| *cid)
+            .collect();
+        for cid in handshake_convs {
+            match self.author_announcement(cid, store) {
+                Ok(ann_effects) => {
+                    effects.extend(ann_effects);
+                    self.handshake_count_since_announcement.insert(cid, 0);
+                }
+                Err(e) => {
+                    debug!(
+                        "Failed to author announcement rotation for {:?}: {}",
+                        cid, e
+                    );
+                }
+            }
+        }
+
+        // KEYWRAP_ACK timeout (merkle-tox-handshake-ecies.md §2.A.3):
+        // If no ACK within 30s, release pending state for content authoring.
+        const KEYWRAP_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+        self.keywrap_pending.retain(|_hash, pending| {
+            if pending.created_at.elapsed() < KEYWRAP_ACK_TIMEOUT {
+                true // keep: still waiting
+            } else {
+                debug!(
+                    "KEYWRAP_ACK timeout for conversation {:?}, releasing pending state",
+                    pending.conversation_id
+                );
+                false // remove: timed out
+            }
+        });
 
         // Handle Blob requests
         for sync in self.blob_syncs.values_mut() {
@@ -422,21 +649,32 @@ impl MerkleToxEngine {
                     || now.duration_since(s.common.last_recon_time)
                         > crate::sync::RECONCILIATION_INTERVAL
                 {
-                    effects.push(Effect::SendPacket(
-                        *peer_pk,
-                        ProtocolMessage::SyncShardChecksums {
-                            conversation_id: s.conversation_id,
-                            shards: s.make_sync_shard_checksums(&EngineStore {
-                                store,
-                                cache: &self.pending_cache,
-                            })?,
-                        },
-                    ));
-                    s.common.recon_dirty = false;
-                    s.common.last_recon_time = now;
+                    match s.make_sync_shard_checksums(&EngineStore {
+                        store,
+                        cache: &self.pending_cache,
+                    }) {
+                        Ok(shards) => {
+                            effects.push(Effect::SendPacket(
+                                *peer_pk,
+                                ProtocolMessage::SyncShardChecksums {
+                                    conversation_id: s.conversation_id,
+                                    shards,
+                                },
+                            ));
+                            s.common.recon_dirty = false;
+                            s.common.last_recon_time = now;
+                        }
+                        Err(e) => {
+                            debug!("Failed to compute shard checksums for {:?}: {}", cid, e);
+                            // Back off to prevent tight loop; retry after
+                            // RECONCILIATION_INTERVAL or when new data arrives.
+                            s.common.recon_dirty = false;
+                            s.common.last_recon_time = now;
+                        }
+                    }
                 }
 
-                // Proactive Blob discovery: Query for blobs marked as missing in this session
+                // Proactive Blob discovery: Query blobs marked missing in this session
                 for blob_hash in s.common.missing_blobs.drain() {
                     effects.push(Effect::SendPacket(
                         *peer_pk,
@@ -478,12 +716,12 @@ impl MerkleToxEngine {
         Ok(effects)
     }
 
-    /// Clears the transient pending state cache.
+    /// Clears transient pending state cache.
     pub fn clear_pending(&self) {
         self.pending_cache.lock().clear();
     }
 
-    /// Returns the number of nodes in the pending cache.
+    /// Returns number of nodes in pending cache.
     pub fn pending_cache_len(&self) -> usize {
         self.pending_cache.lock().nodes.len()
     }
@@ -492,7 +730,93 @@ impl MerkleToxEngine {
         self.pending_cache.lock().nodes.insert(node.hash(), node);
     }
 
-    /// Updates the reachability status for all sessions associated with a peer.
+    /// Looks up recipient's Signed Pre-Key (SPK) from Announcement.
+    /// Prefers first non-expired pre-key, falls back to last_resort_key.
+    pub fn get_recipient_spk(&self, recipient_pk: &PhysicalDevicePk) -> Option<EphemeralX25519Pk> {
+        match self.peer_announcements.get(recipient_pk)? {
+            ControlAction::Announcement {
+                pre_keys,
+                last_resort_key,
+            } => pre_keys
+                .first()
+                .map(|pk| pk.public_key)
+                .or(Some(last_resort_key.public_key)),
+            _ => None,
+        }
+    }
+
+    /// Resolves X25519 public key for ECIES wrapping to recipient.
+    ///
+    /// 1. If recipient has Announcement with pre-keys, use SPK.
+    /// 2. Otherwise, convert device public key to X25519 via
+    ///    [`crate::crypto::device_pk_to_x25519`] (handles Ed25519 and
+    ///    native X25519 device keys).
+    pub fn resolve_recipient_spk(&self, recipient_pk: &PhysicalDevicePk) -> EphemeralX25519Pk {
+        self.get_recipient_spk(recipient_pk).unwrap_or_else(|| {
+            EphemeralX25519Pk::from(
+                crate::crypto::device_pk_to_x25519(recipient_pk.as_bytes()).to_bytes(),
+            )
+        })
+    }
+
+    /// Consumes One-Time Pre-Key from recipient's Announcement.
+    ///
+    /// Returns `(OPK public key, opk_id)` where `opk_id = Blake3(OPK_pk)`.
+    /// Consumed OPK removed from `peer_announcements` to prevent
+    /// reuse. First pre-key (`pre_keys[0]`) treated as SPK and
+    /// never consumed; only `pre_keys[1..]` are OPKs.
+    pub fn consume_recipient_opk(
+        &mut self,
+        recipient_pk: &PhysicalDevicePk,
+    ) -> Option<(EphemeralX25519Pk, NodeHash)> {
+        let ann = self.peer_announcements.get_mut(recipient_pk)?;
+        if let ControlAction::Announcement { pre_keys, .. } = ann {
+            // pre_keys[0] is SPK; pre_keys[1..] are OPKs
+            if pre_keys.len() > 1 {
+                let opk = pre_keys.remove(1);
+                let opk_id = NodeHash::from(*blake3::hash(opk.public_key.as_bytes()).as_bytes());
+                return Some((opk.public_key, opk_id));
+            }
+        }
+        None
+    }
+
+    /// Finds our OPK private key matching `opk_id` (Blake3 hash
+    /// of OPK public key). Returns `None` if no match found or if
+    /// `opk_id` is all-zeros (no OPK consumed).
+    pub fn find_opk_sk(&self, opk_id: &NodeHash) -> Option<&EphemeralX25519Sk> {
+        if *opk_id == NodeHash::from([0u8; 32]) {
+            return None;
+        }
+        self.ephemeral_keys.iter().find_map(|(pk, sk)| {
+            let hash = blake3::hash(pk.as_bytes());
+            if *hash.as_bytes() == *opk_id.as_bytes() {
+                Some(sk)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Consumes (removes) our OPK private key matching `opk_id`.
+    /// Returns removed secret key for forward secrecy: caller should
+    /// drop immediately after use.
+    pub fn consume_opk_sk(&mut self, opk_id: &NodeHash) -> Option<EphemeralX25519Sk> {
+        if *opk_id == NodeHash::from([0u8; 32]) {
+            return None;
+        }
+        let pk_to_remove = self.ephemeral_keys.iter().find_map(|(pk, _)| {
+            let hash = blake3::hash(pk.as_bytes());
+            if *hash.as_bytes() == *opk_id.as_bytes() {
+                Some(*pk)
+            } else {
+                None
+            }
+        })?;
+        self.ephemeral_keys.remove(&pk_to_remove)
+    }
+
+    /// Updates reachability status for all sessions associated with peer.
     pub fn set_peer_reachable(&mut self, peer_pk: PhysicalDevicePk, reachable: bool) {
         for ((p, _), session) in self.sessions.iter_mut() {
             if p == &peer_pk {
@@ -523,6 +847,36 @@ impl<'a> crate::dag::NodeLookup for EngineStore<'a> {
             .get(hash)
             .map(|n| n.topological_rank)
             .or_else(|| self.store.get_rank(hash))
+    }
+    fn get_admin_distance(&self, hash: &NodeHash) -> Option<u64> {
+        if let Some(&dist) = self.cache.lock().admin_distances.get(hash) {
+            return Some(dist);
+        }
+        // Look up cached node first. If admin node, distance is 0.
+        // If content node, compute by checking parents recursively.
+        let cached_node = self.cache.lock().nodes.get(hash).cloned();
+        if let Some(node) = cached_node {
+            if node.node_type() == crate::dag::NodeType::Admin {
+                self.cache.lock().admin_distances.insert(*hash, 0);
+                return Some(0);
+            }
+            let mut min_dist = u64::MAX;
+            for parent in &node.parents {
+                if let Some(dist) = self.get_admin_distance(parent) {
+                    min_dist = min_dist.min(dist);
+                }
+            }
+            let result = if min_dist == u64::MAX {
+                Some(10)
+            } else {
+                Some(min_dist + 1)
+            };
+            if let Some(d) = result {
+                self.cache.lock().admin_distances.insert(*hash, d);
+            }
+            return result;
+        }
+        self.store.get_admin_distance(hash)
     }
     fn contains_node(&self, hash: &NodeHash) -> bool {
         let cache = self.cache.lock();
@@ -649,9 +1003,13 @@ impl<'a> crate::sync::NodeStore for EngineStore<'a> {
         let mut spec = self.store.get_speculative_nodes(conversation_id);
         let cache = self.cache.lock();
         spec.retain(|n| !cache.verified.contains(&n.hash()));
+
+        let mut spec_hashes: std::collections::HashSet<_> = spec.iter().map(|n| n.hash()).collect();
+
         for (hash, node) in &cache.nodes {
-            if !cache.verified.contains(hash) && !spec.iter().any(|n| &n.hash() == hash) {
+            if !cache.verified.contains(hash) && !spec_hashes.contains(hash) {
                 spec.push(node.clone());
+                spec_hashes.insert(*hash);
             }
         }
         spec
@@ -691,7 +1049,7 @@ impl<'a> crate::sync::NodeStore for EngineStore<'a> {
         let (mut ver, mut spec) = self.store.get_node_counts(conversation_id);
         let cache = self.cache.lock();
         for hash in cache.nodes.keys() {
-            // Only count if not already in store to avoid double counting
+            // Count only if not already in store to avoid double counting
             if !self.store.has_node(hash) {
                 if cache.verified.contains(hash) {
                     ver += 1;

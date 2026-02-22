@@ -1,6 +1,8 @@
 use merkle_tox_core::builder::NodeBuilder;
 use merkle_tox_core::crypto::ConversationKeys;
-use merkle_tox_core::dag::{Content, ControlAction, KConv, LogicalIdentityPk, NodeAuth, NodeMac};
+use merkle_tox_core::dag::{
+    Content, ControlAction, Ed25519Signature, KConv, LogicalIdentityPk, NodeAuth,
+};
 
 #[test]
 fn test_group_genesis_pow() {
@@ -33,11 +35,11 @@ fn test_1on1_genesis() {
     );
     assert_eq!(node1.parents.len(), 0);
 
-    // MAC check
-    if let NodeAuth::Mac(mac) = node1.authentication {
-        assert_ne!(mac, NodeMac::from([0u8; 32]));
+    // EphemeralSignature check (1-on-1 genesis uses MAC-derived pseudo-sig in first 32 bytes)
+    if let NodeAuth::EphemeralSignature(sig) = node1.authentication {
+        assert_ne!(sig, Ed25519Signature::from([0u8; 64]));
     } else {
-        panic!("Should have MAC");
+        panic!("Should have EphemeralSignature");
     }
 }
 

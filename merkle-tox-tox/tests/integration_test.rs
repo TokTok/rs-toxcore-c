@@ -199,6 +199,13 @@ async fn test_multi_node_sync() {
     let conv_id = ConversationId::from([1u8; 32]);
     let k_conv = KConv::from([0xAAu8; 32]);
 
+    // Collect protocol identity PKs (Ed25519, derived from Tox SK).
+    // These differ from transport.local_pk() which returns Tox X25519 PKs.
+    let pk_a = node_a.bridge.node.lock().await.engine.self_pk;
+    let pk_b = node_b.bridge.node.lock().await.engine.self_pk;
+    let pk_c = node_c.bridge.node.lock().await.engine.self_pk;
+    let all_pks = [pk_a, pk_b, pk_c];
+
     for n in [&mut node_a, &mut node_b, &mut node_c] {
         n.store
             .put_conversation_key(&conv_id, 0, k_conv.clone())
@@ -213,6 +220,13 @@ async fn test_multi_node_sync() {
                 >::new(conv_id, k_conv.clone(), now_ms),
             ),
         );
+        // Register all device keys as members so sender identification works
+        for pk in &all_pks {
+            node_lock
+                .engine
+                .identity_manager
+                .add_member(conv_id, pk.to_logical(), 0, now_ms);
+        }
     }
 
     node_b
@@ -293,14 +307,7 @@ async fn test_multi_node_sync() {
         .expect("Node C should have the node");
     assert_eq!(
         received_node.author_pk,
-        node_a
-            .bridge
-            .node
-            .lock()
-            .await
-            .transport
-            .local_pk()
-            .to_logical()
+        node_a.bridge.node.lock().await.engine.self_pk.to_logical()
     );
     println!("Multi-node sync test passed!");
 }

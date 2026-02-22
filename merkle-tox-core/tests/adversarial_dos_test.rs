@@ -19,8 +19,31 @@ fn test_speculative_node_flooding_limit() {
     let store = InMemoryStore::new();
     let conv_id = ConversationId::from([0xAAu8; 32]);
 
-    // Flood the engine with speculative nodes
-    for i in 0..MAX_SPECULATIVE_NODES_PER_CONVERSATION {
+    // Seed the store with MAX-5 dummy speculative nodes to avoid iterating 1000 times.
+    let seed_count = MAX_SPECULATIVE_NODES_PER_CONVERSATION - 5;
+    for i in 0..seed_count {
+        let mut pk_bytes = [0u8; 32];
+        pk_bytes[0..4].copy_from_slice(&(i as u32).to_le_bytes());
+        let pk = PhysicalDevicePk::from(pk_bytes);
+        let author_pk = LogicalIdentityPk::from(pk_bytes);
+        let node = create_signed_content_node(
+            &conv_id,
+            &ConversationKeys::derive(&KConv::from([0u8; 32])),
+            author_pk,
+            pk,
+            vec![],
+            Content::Text(format!("Seed {}", i)),
+            0,
+            1,
+            1000 + i as i64,
+        );
+        store
+            .put_node(&conv_id, node, false)
+            .expect("seed speculative node");
+    }
+
+    // Process the last 5 through handle_node to test real behavior near the boundary.
+    for i in seed_count..MAX_SPECULATIVE_NODES_PER_CONVERSATION {
         let mut pk_bytes = [0u8; 32];
         pk_bytes[0..4].copy_from_slice(&(i as u32).to_le_bytes());
         let pk = PhysicalDevicePk::from(pk_bytes);
@@ -28,26 +51,23 @@ fn test_speculative_node_flooding_limit() {
 
         let node = create_signed_content_node(
             &conv_id,
-            &ConversationKeys::derive(&KConv::from([0u8; 32])), // Random keys (MAC will fail)
+            &ConversationKeys::derive(&KConv::from([0u8; 32])),
             author_pk,
             pk,
             vec![],
             Content::Text(format!("Spam {}", i)),
-            0, // All roots must have rank 0
-            1, // Sequence number
+            0,
+            1,
             1000 + i as i64,
         );
         let effects = engine.handle_node(conv_id, node, &store, None).unwrap();
-        if i % 100 == 0 {
-            println!("Processed {} nodes, effects: {}", i, effects.len());
-        }
         merkle_tox_core::testing::apply_effects(effects, &store);
     }
 
     let (_, spec_count) = store.get_node_counts(&conv_id);
     assert_eq!(spec_count, MAX_SPECULATIVE_NODES_PER_CONVERSATION);
 
-    // 1001st node should be rejected
+    // Next node should be rejected
     let extra_pk = PhysicalDevicePk::from([0xFFu8; 32]);
     let extra_author = LogicalIdentityPk::from([0xFFu8; 32]);
     let extra_node = create_signed_content_node(
@@ -57,12 +77,15 @@ fn test_speculative_node_flooding_limit() {
         extra_pk,
         vec![],
         Content::Text("Extra Spam".to_string()),
-        0, // Root nodes must have rank 0
+        0,
         1,
         99999,
     );
     let res = engine.handle_node(conv_id, extra_node, &store, None);
-    assert!(res.is_err(), "1001st speculative node should be rejected");
+    assert!(
+        res.is_err(),
+        "Speculative node past limit should be rejected"
+    );
     assert!(
         matches!(
             res.unwrap_err(),
@@ -90,22 +113,24 @@ fn test_sequence_number_replay_attack() {
     );
     room.setup_engine(&mut engine, &store);
 
-    // 1. Receive a valid message with seq 1
+    // 1. Receive a valid message with seq 2
+    let admin_heads = store.get_admin_heads(&room.conv_id);
     let msg1 = create_signed_content_node(
         &room.conv_id,
         &room.keys,
         alice.master_pk,
         alice.device_pk,
-        vec![room.conv_id.to_node_hash()],
+        admin_heads.clone(),
         Content::Text("Original Message".to_string()),
-        1,
-        1,
+        2, // Rank 2
+        2, // Seq 2
         1000,
     );
     let effects = engine
         .handle_node(room.conv_id, msg1.clone(), &store, None)
         .unwrap();
     assert!(merkle_tox_core::testing::is_verified_in_effects(&effects));
+    merkle_tox_core::testing::apply_effects(effects, &store);
 
     // 2. Try to replay with a DIFFERENT node but same sequence number
     let msg1_replay = create_signed_content_node(
@@ -113,10 +138,10 @@ fn test_sequence_number_replay_attack() {
         &room.keys,
         alice.master_pk,
         alice.device_pk,
-        vec![room.conv_id.to_node_hash()],
+        admin_heads,
         Content::Text("Replayed Sequence Number".to_string()),
-        1,
-        1,
+        2, // Rank 2
+        2, // Seq 2
         1001,
     );
     let res = engine.handle_node(room.conv_id, msg1_replay, &store, None);
@@ -144,24 +169,45 @@ fn test_authorized_node_flooding_limit() {
     );
     room.setup_engine(&mut engine, &store);
 
-    // Flood up to the limit
-    let mut last_hash = room.conv_id.to_node_hash();
-    for i in 1..tox_proto::constants::MAX_VERIFIED_NODES_PER_DEVICE {
+    let max = tox_proto::constants::MAX_VERIFIED_NODES_PER_DEVICE;
+
+    // Seed the store's last_sequence_number near the limit so we only need
+    // a few handle_node iterations instead of 1000.
+    // Sequence numbers and topological ranks are independent: ranks must
+    // be max(parent_rank)+1, but sequence numbers can start anywhere.
+    let seq_start = max - 5;
+    store
+        .last_sequence_numbers
+        .write()
+        .unwrap()
+        .insert(alice.device_pk, seq_start);
+
+    // Process 5 nodes near the sequence boundary through handle_node.
+    let mut parents = store.get_admin_heads(&room.conv_id);
+    for (idx, seq) in (seq_start..max).enumerate() {
+        let rank = idx as u64 + 2; // rank starts at 2 (parent admin nodes have rank 1)
         let node = create_signed_content_node(
             &room.conv_id,
             &room.keys,
             alice.master_pk,
             alice.device_pk,
-            vec![last_hash],
-            Content::Text(format!("Authorized Flood {}", i)),
-            i,
-            i + 1, // Start from 2
-            1000 + i as i64,
+            parents,
+            Content::Text(format!("Authorized Flood {}", seq)),
+            rank,
+            seq + 1,
+            1000 + seq as i64,
         );
-        last_hash = node.hash();
-        engine
+        parents = vec![node.hash()];
+        let effects = engine
             .handle_node(room.conv_id, node, &store, None)
             .unwrap();
+        assert!(
+            merkle_tox_core::testing::is_verified_in_effects(&effects),
+            "Node seq={} should be verified",
+            seq + 1
+        );
+        merkle_tox_core::testing::apply_effects(effects, &store);
+        engine.clear_pending();
     }
 
     // Next node should be rejected
@@ -170,10 +216,10 @@ fn test_authorized_node_flooding_limit() {
         &room.keys,
         alice.master_pk,
         alice.device_pk,
-        vec![last_hash],
+        parents.clone(),
         Content::Text("One too many".to_string()),
-        tox_proto::constants::MAX_VERIFIED_NODES_PER_DEVICE,
-        tox_proto::constants::MAX_VERIFIED_NODES_PER_DEVICE + 1,
+        7, // rank continues
+        max + 1,
         999999,
     );
     let res = engine.handle_node(room.conv_id, extra_node, &store, None);
@@ -214,5 +260,55 @@ fn test_iblt_peeling_torture() {
         assert_eq!(stats.iterations, 1025);
     } else {
         panic!("Expected DecodingFailed error");
+    }
+}
+
+#[test]
+fn test_dos_experimental() {
+    let tp = Arc::new(ManualTimeProvider::new(Instant::now(), 0));
+    let store = InMemoryStore::new();
+    let room = merkle_tox_core::testing::TestRoom::new(2);
+    let alice = &room.identities[0];
+    let observer = &room.identities[1];
+
+    let mut engine = MerkleToxEngine::new(
+        observer.device_pk,
+        observer.master_pk,
+        StdRng::seed_from_u64(0),
+        tp.clone(),
+    );
+    room.setup_engine(&mut engine, &store);
+
+    let mut parents = store.get_admin_heads(&room.conv_id);
+    for i in 1..200 {
+        let start_create = std::time::Instant::now();
+        let node = create_signed_content_node(
+            &room.conv_id,
+            &room.keys,
+            alice.master_pk,
+            alice.device_pk,
+            parents,
+            Content::Text(format!("Authorized Flood {}", i)),
+            i + 1, // Rank starts at 2
+            i + 1, // Start from 2
+            1000 + i as i64,
+        );
+        parents = vec![node.hash()];
+        let start_handle = std::time::Instant::now();
+        let effects = engine
+            .handle_node_internal_ext(room.conv_id, node, &store, None, false)
+            .unwrap();
+        let start_apply = std::time::Instant::now();
+        merkle_tox_core::testing::apply_effects(effects, &store);
+        let end = std::time::Instant::now();
+        if i % 20 == 0 {
+            println!(
+                "i: {}, create: {:?}, handle: {:?}, apply: {:?}",
+                i,
+                start_handle.duration_since(start_create),
+                start_apply.duration_since(start_handle),
+                end.duration_since(start_apply)
+            );
+        }
     }
 }

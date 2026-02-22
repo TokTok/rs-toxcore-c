@@ -1,15 +1,13 @@
 # Merkle-Tox Design Rationale & Dismissed Considerations
 
-This document records the architectural decisions made during the design of
-Merkle-Tox v1. It specifically focuses on "rejected" paths or simplifications to
-prevent future redesigns from re-introducing known vulnerabilities or
-redundancies.
+This document records architectural decisions and "rejected" paths to prevent
+future redesigns from re-introducing known vulnerabilities or redundancies.
 
 ## 1. SyncKey Obfuscation (Dismissed)
 
 *   **Original Proposal**: Derive a `SyncKey = KDF(ConversationID)` to hide the
     room ID from network observers.
-*   **Decision**: Dismissed as mathematically redundant.
+*   **Decision**: Dismissed as redundant.
 *   **Rationale**:
     1.  **Transport Blinding**: Merkle-Tox runs inside an encrypted Tox tunnel.
         Observers on the internet already see only encrypted noise.
@@ -24,15 +22,14 @@ redundancies.
 ## 2. Cleartext epoch in WireNode (Dismissed)
 
 *   **Original Proposal**: Add a cleartext `epoch` field to the `WireNode`
-    header to allow for instant filtering and decryption without
-    trial-and-error.
+    header to allow instant filtering and decryption without trial-and-error.
 *   **Decision**: Dismissed for security and protocol integrity.
 *   **Rationale**:
     1.  **Metadata Leakage**: Exposing the epoch allows untrusted peers (e.g.,
         SyncBots) to observe key rotation frequency and interaction patterns.
     2.  **Ghost Content**: Decrypting nodes before their parents arrive (using
-        the epoch hint) would allow for "floating" messages that have no
-        verifiable topological context, compromising the Merkle trust model.
+        the epoch hint) would allow "floating" messages that have no verifiable
+        topological context, compromising the Merkle trust model.
     3.  **Redundancy**: In a high-end topological sync, the "Active Epoch" is a
         property of the verified state. The system inherently knows the correct
         key to apply to the next logical child.
@@ -59,7 +56,7 @@ redundancies.
 *   **Rationale**: An attacker could flood the buffer with "Future" high-rank
     junk to push out legitimate historical nodes.
 *   **Result**: Use **Contiguity-based Eviction**. Prioritize nodes close to the
-    Local Low-Water Mark (LLWM). This forces an attacker to possess the room's
+    Local Low-Water Mark (LLWM), forcing an attacker to possess the room's
     history to maintain their nodes in the victim's buffer.
 
 ## 5. Unbound Structural Vouching (Dismissed)
@@ -78,8 +75,7 @@ redundancies.
     block sending and wait for a fresh handshake.
 *   **Decision**: Dismissed for UX (Availability).
 *   **Rationale**: Blocking the UI until a peer comes online to provide fresh
-    keys destroys the "Instant Messaging" feel and breaks asynchronous
-    store-and-forward.
+    keys breaks asynchronous store-and-forward.
 *   **Result**: Use **Opportunistic Handshakes** for 1-on-1. Send the first
     message using the Last Resort key but attach a `HandshakePulse` to force a
     secure rotation immediately.
@@ -107,8 +103,8 @@ redundancies.
     creating complex caching deadlocks.
 *   **Result**: Use **Per-Sender Linear Ratchets**. Each device maintains its
     own strictly linear hash chain. DAG merges remain logical (sync/integrity)
-    but not cryptographic (encryption). This achieves Signal-grade Forward
-    Secrecy with zero race conditions.
+    but not cryptographic (encryption), achieving Signal-grade Forward Secrecy
+    with zero race conditions.
 
 ## 9. Application-Layer Time Sync (Dismissed)
 
@@ -116,9 +112,52 @@ redundancies.
     messages (TIME_SYNC_REQ/RES) over the reliable ARQ transport.
 *   **Decision**: Dismissed to avoid **ARQ Jitter**.
 *   **Rationale**: ARQ transports retransmit lost packets, which introduces
-    variable and unpredictable delays. This makes accurate RTT and offset
+    variable and unpredictable delays, making accurate RTT and offset
     calculations impossible. By moving time sync to the transport-layer
     heartbeats (PING/PONG), we get "free" measurements that bypass
     retransmission buffers and reflect the pure wire latency.
 *   **Result**: Move time measurement to the `tox-sequenced` transport layer.
     The logic layer now only handles the **Median Consensus** and **Slewing**.
+
+## 10. Admin-Only Anchoring (Dismissed)
+
+*   **Original Proposal**: Strictly require Admin nodes every 500 hops. If no
+    Admin is online, the room stalls for blind relays, requiring an "always-on"
+    Admin Bot.
+*   **Decision**: Dismissed in favor of Level 2 `SoftAnchor`s.
+*   **Rationale**: Centralized bots violate decentralization. Sacrificing a
+    small amount of "presence deniability" (L2 users signing a SoftAnchor with
+    their permanent key) is an acceptable trade-off to guarantee decentralized
+    availability. The "Hop Reset Topology" (where SoftAnchors only parent the
+    previous Admin node) ensures actual message *content* remains perfectly
+    deniable.
+*   **Result**: Introduced `SoftAnchor` with a 3-chain cap and parallel topology
+    to maintain availability without Centralized Admin Bots.
+
+## 11. Deterministic Tie-Breakers for Soft Anchors (Dismissed)
+
+*   **Original Proposal**: When 400 hops are reached, use a deterministic rule
+    (e.g., mathematical distance of `device_pk` to `basis_hash`) to select
+    exactly one Level 2 user to author the `SoftAnchor`, preventing a
+    "thundering herd".
+*   **Decision**: Dismissed in favor of probabilistic jitter.
+*   **Rationale**: In a lossy, asynchronous network like Tox, you never have a
+    perfect view of exactly *who* is currently online. If the "mathematically
+    chosen" user happens to be offline or partitioned, the whole room would
+    stall waiting for them.
+*   **Result**: Clients trigger `SoftAnchor` creation at a uniformly randomized
+    interval between 400 and 450 hops, effectively trading a small amount of
+    network noise for guaranteed robustness.
+
+## 12. Proof-of-Work for Extending Ancestry Cap (Dismissed)
+
+*   **Original Proposal**: Allow any node to extend the 500-hop buffer
+    exhaustion cap by computing a heavy Proof-of-Work (PoW), avoiding the need
+    for `SoftAnchor` signatures entirely.
+*   **Decision**: Dismissed for mobile performance and effectiveness.
+*   **Rationale**: PoW drains mobile batteries and proves only CPU time
+    expenditure, not history legitimacy. A determined attacker with server
+    resources could still trivially overwhelm the buffer limit of honest nodes.
+*   **Result**: Relied strictly on cryptographic authentication (`SoftAnchor`
+    Anti-Branching rule) which is computationally cheap to verify ($O(1)$) and
+    strictly bounds the attack surface.

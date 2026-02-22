@@ -1,5 +1,6 @@
 use merkle_tox_core::dag::{
-    Content, ConversationId, LogicalIdentityPk, MerkleNode, NodeAuth, NodeMac, PhysicalDevicePk,
+    Content, ConversationId, Ed25519Signature, LogicalIdentityPk, MerkleNode, NodeAuth,
+    PhysicalDevicePk,
 };
 use merkle_tox_core::sync::NodeStore;
 use merkle_tox_core::vfs::StdFileSystem;
@@ -28,7 +29,8 @@ fn test_fs_store_concurrent_access() {
                 network_timestamp: 100,
                 content: Content::Text(format!("Concurrent {}", i)),
                 metadata: vec![],
-                authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+                authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+                pow_nonce: 0,
             };
             store.put_node(&sync_key, node, true).unwrap();
         }));

@@ -1,8 +1,14 @@
 use merkle_tox_core::cas::{BlobInfo, BlobStatus, SwarmSync};
-use merkle_tox_core::dag::{ConversationId, NodeHash, PhysicalDevicePk};
+use merkle_tox_core::clock::ManualTimeProvider;
+use merkle_tox_core::dag::{
+    ConversationId, MessageKey, NodeHash, PhysicalDevicePk, PhysicalDeviceSk,
+};
 use merkle_tox_core::engine::session::{Handshake, PeerSession, SyncSession};
+use merkle_tox_core::engine::{Conversation, MerkleToxEngine};
 use merkle_tox_core::sync::{POW_CHALLENGE_TIMEOUT, RECONCILIATION_INTERVAL};
-use merkle_tox_core::testing::InMemoryStore;
+use merkle_tox_core::testing::{InMemoryStore, TestRoom};
+use rand::SeedableRng;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[test]
@@ -14,6 +20,7 @@ fn test_swarm_sync_next_wakeup() {
         bao_root: None,
         status: BlobStatus::Pending,
         received_mask: None,
+        decryption_key: None,
     };
     let mut sync = SwarmSync::new(info);
 
@@ -140,6 +147,7 @@ fn test_swarm_sync_throttling_no_loop() {
         bao_root: None,
         status: BlobStatus::Pending,
         received_mask: None,
+        decryption_key: None,
     };
     let mut sync = SwarmSync::new(info);
     let peer_a = PhysicalDevicePk::from([1u8; 32]);
@@ -212,7 +220,6 @@ fn test_sync_session_challenge_timeout_no_loop() {
         conversation_id: conv_id,
         cells: Vec::new(),
         range: tox_reconcile::SyncRange {
-            epoch: 0,
             min_rank: 0,
             max_rank: 100,
         },
@@ -248,6 +255,9 @@ fn test_engine_poll_failure_no_loop() {
             None
         }
         fn get_rank(&self, _: &NodeHash) -> Option<u64> {
+            None
+        }
+        fn get_admin_distance(&self, _: &NodeHash) -> Option<u64> {
             None
         }
         fn contains_node(&self, _: &NodeHash) -> bool {
@@ -510,6 +520,117 @@ fn test_engine_poll_failure_no_loop() {
         wakeup > now,
         "Tight loop detected after engine poll failure!"
     );
+}
+
+/// `poll()` should walk every established conversation and drop any
+/// `skipped_keys` entry whose insertion timestamp is older than 24 hours.
+#[test]
+fn test_poll_evicts_stale_skipped_keys() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let rng = rand::rngs::StdRng::seed_from_u64(42);
+
+    // Start the network clock at ms = 0.
+    let base_instant = Instant::now();
+    let tp = Arc::new(ManualTimeProvider::new(base_instant, 0i64));
+
+    let room = TestRoom::new(2);
+    let alice_id = &room.identities[0];
+
+    let mut alice_engine = MerkleToxEngine::with_sk(
+        alice_id.device_pk,
+        alice_id.master_pk,
+        PhysicalDeviceSk::from(alice_id.device_sk.to_bytes()),
+        rng.clone(),
+        tp.clone(),
+    );
+    let alice_store = InMemoryStore::new();
+    room.setup_engine(&mut alice_engine, &alice_store);
+
+    // Inject a skipped key with insertion timestamp 0 (the epoch's birth).
+    let dummy_sender = room.identities[1].device_pk;
+    let stale_seq: u64 = 99;
+    let dummy_key = MessageKey::from([0x99u8; 32]);
+
+    if let Some(Conversation::Established(em)) = alice_engine.conversations.get_mut(&room.conv_id) {
+        em.state
+            .skipped_keys
+            .insert((dummy_sender, stale_seq), (dummy_key, 0i64));
+    }
+
+    // Advance both the Instant and the network ms by 25 hours -- the key is stale.
+    tp.advance(Duration::from_millis(86_400_001));
+
+    // poll() should proactively sweep and evict expired entries.
+    let poll_instant = base_instant + Duration::from_millis(86_400_001);
+    let _effects = alice_engine.poll(poll_instant, &alice_store).unwrap();
+
+    if let Some(Conversation::Established(em)) = alice_engine.conversations.get(&room.conv_id) {
+        assert!(
+            !em.state
+                .skipped_keys
+                .contains_key(&(dummy_sender, stale_seq)),
+            "poll() must proactively evict skipped_keys entries older than 24 h; \
+             currently cleanup only happens inside peek_keys() during message processing, \
+             so stale keys accumulate forever in conversations that go quiet",
+        );
+    }
+}
+
+/// TTL eviction of skipped_keys happens in `peek_keys`, which is called with
+/// the real `now_ms` from the caller.  This test verifies that stale keys
+/// (older than 24 h) are evicted when `peek_keys` is invoked with an up-to-date
+/// timestamp.
+#[test]
+fn test_peek_keys_evicts_stale_skipped_keys() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let rng = rand::rngs::StdRng::seed_from_u64(42);
+
+    // Epoch is created at ms = 1000.
+    let epoch_ms: i64 = 1000;
+    let base_instant = Instant::now();
+    let tp = Arc::new(ManualTimeProvider::new(base_instant, epoch_ms));
+
+    let room = TestRoom::new(2);
+    let alice_id = &room.identities[0];
+
+    let mut alice_engine = MerkleToxEngine::with_sk(
+        alice_id.device_pk,
+        alice_id.master_pk,
+        PhysicalDeviceSk::from(alice_id.device_sk.to_bytes()),
+        rng.clone(),
+        tp.clone(),
+    );
+    let alice_store = InMemoryStore::new();
+    room.setup_engine(&mut alice_engine, &alice_store);
+
+    // Inject a skipped key stamped at epoch creation time.
+    let dummy_sender = room.identities[1].device_pk;
+    let stale_seq: u64 = 42;
+    let dummy_key = MessageKey::from([0x42u8; 32]);
+
+    if let Some(Conversation::Established(em)) = alice_engine.conversations.get_mut(&room.conv_id) {
+        em.state
+            .skipped_keys
+            .insert((dummy_sender, stale_seq), (dummy_key, epoch_ms));
+        // Sanity: last_rotation_time_ms == epoch_ms.
+        assert_eq!(em.state.last_rotation_time_ms, epoch_ms);
+    }
+
+    // Advance the clock to 25 h after the key was inserted.
+    tp.advance(Duration::from_millis(86_400_001));
+    let real_now_ms = epoch_ms + 86_400_001i64;
+
+    // Call peek_keys with the real current time to trigger TTL eviction.
+    if let Some(Conversation::Established(em)) = alice_engine.conversations.get_mut(&room.conv_id) {
+        let _ = em.peek_keys(&dummy_sender, 1, real_now_ms);
+        assert!(
+            !em.state
+                .skipped_keys
+                .contains_key(&(dummy_sender, stale_seq)),
+            "peek_keys must evict skipped_keys entries older than 24 h \
+             when called with the real current time",
+        );
+    }
 }
 
 // end of file

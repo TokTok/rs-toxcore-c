@@ -1,6 +1,6 @@
 use blake3::derive_key;
 use merkle_tox_core::clock::ManualTimeProvider;
-use merkle_tox_core::dag::{Content, KConv, PhysicalDeviceSk};
+use merkle_tox_core::dag::{Content, PhysicalDeviceSk};
 use merkle_tox_core::engine::MerkleToxEngine;
 use merkle_tox_core::sync::NodeStore;
 use merkle_tox_core::testing::{InMemoryStore, TestRoom};
@@ -122,6 +122,7 @@ fn test_ratchet_state_isolation_after_rotation() {
     room.setup_engine(&mut engine, &store);
 
     // 1. Author a message in Epoch 0
+    //    JIT piggybacking may produce an SKD before the text node.
     let effects = engine
         .author_node(
             room.conv_id,
@@ -130,7 +131,8 @@ fn test_ratchet_state_isolation_after_rotation() {
             &store,
         )
         .unwrap();
-    let node_e0 = merkle_tox_core::testing::get_node_from_effects(effects.clone());
+    let all_nodes = merkle_tox_core::testing::get_all_nodes_from_effects(&effects);
+    let node_e0 = all_nodes.last().unwrap(); // Text node is last
     merkle_tox_core::testing::apply_effects(effects, &store);
     let (k_chain_e0, _) = store
         .get_ratchet_key(&room.conv_id, &node_e0.hash())
@@ -152,7 +154,8 @@ fn test_ratchet_state_isolation_after_rotation() {
             &store,
         )
         .unwrap();
-    let node_e1 = merkle_tox_core::testing::get_node_from_effects(effects.clone());
+    let all_nodes = merkle_tox_core::testing::get_all_nodes_from_effects(&effects);
+    let node_e1 = all_nodes.last().unwrap(); // Text node is last
     merkle_tox_core::testing::apply_effects(effects, &store);
     let (k_chain_e1, _) = store
         .get_ratchet_key(&room.conv_id, &node_e1.hash())
@@ -188,6 +191,7 @@ fn test_ratchet_purge_after_merge() {
     room.setup_engine(&mut engine, &store);
 
     // 1. Create two parallel heads from DIFFERENT senders
+    //    JIT piggybacking may produce SKD before text; use last node (text).
     let effects = engine
         .author_node(
             room.conv_id,
@@ -196,7 +200,8 @@ fn test_ratchet_purge_after_merge() {
             &store,
         )
         .unwrap();
-    let node_a = merkle_tox_core::testing::get_node_from_effects(effects.clone());
+    let all_a = merkle_tox_core::testing::get_all_nodes_from_effects(&effects);
+    let node_a = all_a.last().unwrap();
     merkle_tox_core::testing::apply_effects(effects, &store);
     let hash_a = node_a.hash();
 
@@ -224,14 +229,17 @@ fn test_ratchet_purge_after_merge() {
             &store,
         )
         .unwrap();
-    let node_b = merkle_tox_core::testing::get_node_from_effects(effects.clone());
+    let all_b = merkle_tox_core::testing::get_all_nodes_from_effects(&effects);
+    let node_b = all_b.last().unwrap();
     merkle_tox_core::testing::apply_effects(effects, &store);
     let hash_b = node_b.hash();
 
-    // Alice receives Bob's node
-    engine
-        .handle_node(room.conv_id, node_b.clone(), &store, None)
-        .unwrap();
+    // Alice receives ALL of Bob's nodes (JIT SKD + text)
+    for node in &all_b {
+        let _ = engine
+            .handle_node(room.conv_id, node.clone(), &store, None)
+            .unwrap();
+    }
 
     // Verify both have ratchet keys
     assert!(
@@ -256,7 +264,8 @@ fn test_ratchet_purge_after_merge() {
             &store,
         )
         .unwrap();
-    let merge_node = merkle_tox_core::testing::get_node_from_effects(effects.clone());
+    let all_merge = merkle_tox_core::testing::get_all_nodes_from_effects(&effects);
+    let merge_node = all_merge.last().unwrap();
     merkle_tox_core::testing::apply_effects(effects, &store);
     let merge_hash = merge_node.hash();
 
@@ -305,6 +314,7 @@ fn test_immediate_forward_secrecy_vulnerability() {
     room.setup_engine(&mut engine, &store);
 
     // 1. Alice authors a secret message
+    //    JIT piggybacking may produce SKD before text; use last node (text).
     let effects = engine
         .author_node(
             room.conv_id,
@@ -313,7 +323,8 @@ fn test_immediate_forward_secrecy_vulnerability() {
             &store,
         )
         .unwrap();
-    let node = merkle_tox_core::testing::get_node_from_effects(effects.clone());
+    let all_nodes = merkle_tox_core::testing::get_all_nodes_from_effects(&effects);
+    let node = all_nodes.last().unwrap();
     merkle_tox_core::testing::apply_effects(effects.clone(), &store);
     let hash = node.hash();
 
@@ -326,12 +337,10 @@ fn test_immediate_forward_secrecy_vulnerability() {
 
     // 3. TRY TO RECOVER MESSAGE KEY
     // If the implementation is vulnerable, k_chain_from_db is the one used for the current message.
-    let k_msg_derived = derive_key("merkle-tox v1 message-key", k_chain_from_db.as_bytes());
-    let derived_keys =
-        merkle_tox_core::crypto::ConversationKeys::derive(&KConv::from(k_msg_derived));
+    let k_msg_derived = merkle_tox_core::crypto::ratchet_message_key(&k_chain_from_db);
 
     // 4. VERIFY FORWARD SECRECY
-    // We attempt to unpack the wire format using the derived key.
+    // We attempt to unpack the wire format using the derived (wrong) message key.
     // DESIGN: This MUST FAIL because the key in the DB should already be one step ahead.
     let wire = effects
         .iter()
@@ -344,7 +353,14 @@ fn test_immediate_forward_secrecy_vulnerability() {
         })
         .expect("Wire node missing from effects");
 
-    let result = merkle_tox_core::dag::MerkleNode::unpack_wire(&wire, &derived_keys);
+    // Try to decrypt with the stolen-and-derived k_msg: should produce garbage
+    let result = merkle_tox_core::dag::MerkleNode::unpack_wire_content(
+        &wire,
+        alice_id.device_pk,
+        alice_id.master_pk,
+        node.sequence_number,
+        &k_msg_derived,
+    );
 
     assert!(
         result.is_err(),

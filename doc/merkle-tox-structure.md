@@ -2,10 +2,8 @@
 
 ## Overview
 
-This document outlines the directory structure and Bazel targets for the
-Merkle-Tox project. The project is split into three libraries located within the
-`rs-toxcore-c` directory, following the established pattern of sibling projects
-like `toxcore` and `toxxi`.
+Directory structure and Bazel targets for Merkle-Tox. The project is split into
+independent libraries in `rs-toxcore-c`.
 
 ## 1. Directory Layout
 

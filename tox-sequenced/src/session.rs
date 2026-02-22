@@ -872,8 +872,25 @@ impl<C: CongestionControl> SequenceSession<C> {
     }
 
     pub fn get_packets_to_send(&mut self, now: Instant, now_ms: u64) -> Vec<Packet> {
-        let mut to_send = Vec::new();
+        let mut packets = Vec::new();
+        self.flush_packets(now, now_ms, &mut |p| {
+            packets.push(p);
+            true
+        });
+        packets
+    }
 
+    /// Push-model packet sending with inline failure handling.
+    ///
+    /// For each packet that needs to be sent, calls `sender(packet)`. If the sender
+    /// returns `true`, the session state is updated to reflect successful delivery.
+    /// If the sender returns `false` (e.g., transport SENDQ full), the session stops
+    /// producing packets and leaves internal state consistent: `in_flight` only
+    /// increments for packets that were actually accepted by the transport.
+    pub fn flush_packets<F>(&mut self, now: Instant, now_ms: u64, sender: &mut F)
+    where
+        F: FnMut(Packet) -> bool,
+    {
         let is_active = !self.outgoing.is_empty() || !self.incoming.is_empty();
         let ping_interval = if is_active {
             PING_INTERVAL_ACTIVE
@@ -881,27 +898,34 @@ impl<C: CongestionControl> SequenceSession<C> {
             PING_INTERVAL_IDLE
         };
 
+        // Ping
         if now.saturating_duration_since(self.last_ping) >= ping_interval {
-            to_send.push(Packet::Ping {
+            let packet = Packet::Ping {
                 t1: TimestampMs(now_ms as i64),
-            });
-            self.last_ping = now;
-            self.last_ping_sent = Some(now);
-            self.last_activity = now;
+            };
+            if sender(packet) {
+                self.last_ping = now;
+                self.last_ping_sent = Some(now);
+                self.last_activity = now;
+            }
         }
 
-        while let Some(dg) = self.datagram_queue.front() {
+        // Datagrams
+        while self.datagram_queue.front().is_some() {
             if now < self.next_pacing_time {
                 break;
             }
-            let dg_len = if let Packet::Datagram { data, .. } = dg {
+            let dg_len = if let Some(Packet::Datagram { data, .. }) = self.datagram_queue.front() {
                 data.len() + 10
             } else {
                 0
             };
-            let pacing_rate = self.congestion_control.pacing_rate();
-            to_send.push(self.datagram_queue.pop_front().unwrap());
+            let dg = self.datagram_queue.pop_front().unwrap();
+            if !sender(dg) {
+                break;
+            }
             self.last_activity = now;
+            let pacing_rate = self.congestion_control.pacing_rate();
             let gap_secs = if pacing_rate > 0.0 && pacing_rate.is_finite() {
                 (dg_len as f32 / pacing_rate).min(1.0)
             } else {
@@ -911,6 +935,7 @@ impl<C: CongestionControl> SequenceSession<C> {
                 self.next_pacing_time.max(now) + Duration::from_secs_f32(gap_secs);
         }
 
+        // Zero-window probe
         if self.peer_rwnd < ESTIMATED_PAYLOAD_SIZE && !self.outgoing.is_empty() {
             let probe_delay = self.rtt.rto_with_backoff(self.zero_window_probes_sent);
             if now >= self.next_pacing_time
@@ -930,7 +955,7 @@ impl<C: CongestionControl> SequenceSession<C> {
                     }
                 }
                 if let Some((id, idx, is_new)) = probe_target
-                    && self.transmit_fragment(id, idx, now, &mut to_send)
+                    && self.try_send_fragment(id, idx, now, sender)
                 {
                     if is_new && let Some(msg) = self.find_outgoing_mut(id) {
                         msg.next_fragment.0 += 1;
@@ -941,9 +966,9 @@ impl<C: CongestionControl> SequenceSession<C> {
             }
         }
 
+        // Main data loop
         let mut any_data_sent = false;
         loop {
-            // State for the ready-check closure
             let next_pacing_time = self.next_pacing_time;
             let peer_rwnd = self.peer_rwnd;
             let in_flight = self.in_flight;
@@ -967,7 +992,6 @@ impl<C: CongestionControl> SequenceSession<C> {
                     let is_oldest_hole = idx == msg.highest_cumulative_ack;
 
                     if is_oldest_hole {
-                        // Oldest hole bypasses peer_rwnd and cwnd to prevent deadlock if it's the first packet in the burst
                         if in_flight / ESTIMATED_PAYLOAD_SIZE < cwnd || !any_data_sent {
                             return Some(fragment_len);
                         }
@@ -991,7 +1015,6 @@ impl<C: CongestionControl> SequenceSession<C> {
                     {
                         let fragment_len = msg.fragment_len(idx);
 
-                        // For RTO recovery, we allow one fragment even if window is full to break deadlocks.
                         if (in_flight / ESTIMATED_PAYLOAD_SIZE < cwnd
                             && in_flight + fragment_len <= peer_rwnd)
                             || !any_data_sent
@@ -1022,7 +1045,7 @@ impl<C: CongestionControl> SequenceSession<C> {
 
             if let Some(id) = next_id {
                 let m_id = MessageId(id);
-                if self.send_next_fragment_for_message(m_id, now, &mut to_send) {
+                if self.send_next_fragment_for_message(m_id, now, sender) {
                     any_data_sent = true;
                 } else {
                     break;
@@ -1032,6 +1055,7 @@ impl<C: CongestionControl> SequenceSession<C> {
             }
         }
 
+        // Tail Loss Probe
         if !any_data_sent && self.in_flight > 0 {
             let srtt = self.rtt.srtt();
             let tlp_threshold = srtt.mul_f32(1.5).max(Duration::from_millis(10));
@@ -1045,13 +1069,15 @@ impl<C: CongestionControl> SequenceSession<C> {
                 }
             }
             if let Some((id, idx)) = tlp_target {
-                self.transmit_fragment(id, idx, now, &mut to_send);
+                self.try_send_fragment(id, idx, now, sender);
             }
         }
 
-        self.send_pending_acks(now, &mut to_send);
-        self.send_pending_nacks(now, &mut to_send);
+        // ACKs and NACKs
+        self.flush_pending_acks(now, sender);
+        self.flush_pending_nacks(now, sender);
 
+        // App-limited detection
         let cwnd = self.congestion_control.cwnd();
         if self.in_flight < cwnd * ESTIMATED_PAYLOAD_SIZE {
             let mut has_more_data = false;
@@ -1065,22 +1091,25 @@ impl<C: CongestionControl> SequenceSession<C> {
                 self.app_limited = true;
             }
         }
-
-        to_send
     }
 
-    fn send_next_fragment_for_message(
+    fn send_next_fragment_for_message<F>(
         &mut self,
         id: MessageId,
         now: Instant,
-        to_send: &mut Vec<Packet>,
-    ) -> bool {
+        sender: &mut F,
+    ) -> bool
+    where
+        F: FnMut(Packet) -> bool,
+    {
+        // A. Retransmission (peek, don't pop yet)
         let retransmit_idx = self
             .outgoing
             .get(&id)
             .and_then(|m| m.retransmit_queue.front().copied());
         if let Some(idx) = retransmit_idx {
-            if self.transmit_fragment(id, idx, now, to_send) {
+            if self.try_send_fragment(id, idx, now, sender) {
+                // Pop on success
                 if let Some(msg) = self.outgoing.get_mut(&id) {
                     let popped = msg.retransmit_queue.pop_front();
                     if let Some(p_idx) = popped {
@@ -1092,6 +1121,7 @@ impl<C: CongestionControl> SequenceSession<C> {
             return false;
         }
 
+        // B. RTO timeout (peek, don't pop yet)
         let timeout_info = self
             .outgoing
             .get(&id)
@@ -1101,7 +1131,8 @@ impl<C: CongestionControl> SequenceSession<C> {
             let retries = msg.fragment_states[idx.0 as usize].rto_backoff;
             let current_rto = self.rtt.rto_with_backoff(retries);
             if now.saturating_duration_since(last_sent) >= current_rto {
-                if self.transmit_fragment(id, idx, now, to_send) {
+                if self.try_send_fragment(id, idx, now, sender) {
+                    // Apply mutations on success
                     if let Some(msg) = self.outgoing.get_mut(&id) {
                         msg.fragment_states[idx.0 as usize].rto_backoff += 1;
                         msg.in_flight_queue.pop_front();
@@ -1113,6 +1144,7 @@ impl<C: CongestionControl> SequenceSession<C> {
             }
         }
 
+        // C. New data (peek, don't advance yet)
         let next_idx = self.outgoing.get(&id).and_then(|m| {
             if m.next_fragment.0 < m.num_fragments.0 {
                 Some(m.next_fragment)
@@ -1121,7 +1153,8 @@ impl<C: CongestionControl> SequenceSession<C> {
             }
         });
         if let Some(idx) = next_idx {
-            if self.transmit_fragment(id, idx, now, to_send) {
+            if self.try_send_fragment(id, idx, now, sender) {
+                // Advance on success
                 if let Some(msg) = self.outgoing.get_mut(&id) {
                     msg.next_fragment.0 += 1;
                 }
@@ -1231,67 +1264,85 @@ impl<C: CongestionControl> SequenceSession<C> {
         self.outgoing.get_mut(&id)
     }
 
-    fn transmit_fragment(
+    /// Build a fragment packet, call sender, and only apply state mutations on success.
+    /// Returns true if the sender accepted the packet.
+    fn try_send_fragment<F>(
         &mut self,
         id: MessageId,
         idx: FragmentIndex,
         now: Instant,
-        to_send: &mut Vec<Packet>,
-    ) -> bool {
-        let pacing_rate = self.congestion_control.pacing_rate();
-        let cwnd = self.congestion_control.cwnd();
-        let fragment_len = if let Some(msg) = self.find_outgoing(id) {
-            msg.fragment_len(idx)
+        sender: &mut F,
+    ) -> bool
+    where
+        F: FnMut(Packet) -> bool,
+    {
+        // 1. Read fragment data and metadata (immutable)
+        let (fragment, total, fragment_len) = if let Some(msg) = self.find_outgoing(id) {
+            (
+                msg.get_fragment(idx),
+                msg.num_fragments,
+                msg.fragment_len(idx),
+            )
         } else {
             return false;
         };
+
+        // 2. Build packet
+        let packet = Packet::Data {
+            message_id: id,
+            fragment_index: idx,
+            total_fragments: total,
+            data: fragment,
+        };
+
+        // 3. Try to send
+        if !sender(packet) {
+            return false;
+        }
+
+        // 4. Apply mutations (only on success)
+        let pacing_rate = self.congestion_control.pacing_rate();
+        let cwnd = self.congestion_control.cwnd();
         if self.in_flight + fragment_len >= cwnd * ESTIMATED_PAYLOAD_SIZE {
             self.app_limited = false;
         }
-        let in_flight = self.in_flight;
         let delivered_bytes = self.delivered_bytes;
         let last_delivery_time = self.last_delivery_time;
         let app_limited = self.app_limited;
         if let Some(msg) = self.find_outgoing_mut(id) {
-            let (fragment, total, _is_retransmission, was_in_flight) = msg
-                .prepare_fragment_for_send(
-                    idx,
-                    now,
-                    delivered_bytes,
-                    last_delivery_time,
-                    app_limited,
-                );
+            let (_is_retransmission, was_in_flight) = msg.mark_fragment_sent(
+                idx,
+                now,
+                delivered_bytes,
+                last_delivery_time,
+                app_limited,
+                fragment_len,
+            );
             if was_in_flight {
-                self.in_flight = in_flight.saturating_sub(fragment_len);
+                self.in_flight = self.in_flight.saturating_sub(fragment_len);
                 self.retransmit_count += 1;
             }
-            self.congestion_control.on_fragment_sent(fragment_len, now);
-            debug!(
-                "Sending fragment {} of message {} (len {})",
-                idx, id, fragment_len
-            );
-            to_send.push(Packet::Data {
-                message_id: id,
-                fragment_index: idx,
-                total_fragments: total,
-                data: fragment,
-            });
-            self.in_flight += fragment_len;
-            self.last_activity = now;
-            let gap_secs = if pacing_rate > 0.0 && pacing_rate.is_finite() {
-                (fragment_len as f32 / pacing_rate).min(1.0)
-            } else {
-                0.0
-            };
-            self.next_pacing_time =
-                self.next_pacing_time.max(now) + Duration::from_secs_f32(gap_secs);
-            true
-        } else {
-            false
         }
+        self.congestion_control.on_fragment_sent(fragment_len, now);
+        debug!(
+            "Sending fragment {} of message {} (len {})",
+            idx, id, fragment_len
+        );
+        self.in_flight += fragment_len;
+        self.last_activity = now;
+        let gap_secs = if pacing_rate > 0.0 && pacing_rate.is_finite() {
+            (fragment_len as f32 / pacing_rate).min(1.0)
+        } else {
+            0.0
+        };
+        self.next_pacing_time = self.next_pacing_time.max(now) + Duration::from_secs_f32(gap_secs);
+        true
     }
 
-    fn send_pending_acks(&mut self, now: Instant, to_send: &mut Vec<Packet>) {
+    fn flush_pending_acks<F>(&mut self, now: Instant, sender: &mut F)
+    where
+        F: FnMut(Packet) -> bool,
+    {
         let current_rwnd = self.current_rwnd();
         let mut ids_to_ack = Vec::new();
         for (id, (count, first_pending_at)) in self.pending_acks.iter() {
@@ -1303,19 +1354,32 @@ impl<C: CongestionControl> SequenceSession<C> {
             }
         }
         for id in ids_to_ack {
-            self.pending_acks.remove(&id);
-            self.pending_nacks.remove(&id);
-            if let Some(reassembler) = self.incoming.get(&id) {
-                let ack = reassembler.create_ack(current_rwnd);
-                to_send.push(Packet::Ack(ack));
+            let packet = if let Some(reassembler) = self.incoming.get(&id) {
+                Some(Packet::Ack(reassembler.create_ack(current_rwnd)))
             } else if let Some((mut ack, _)) = self.completed_incoming.get(&id).cloned() {
                 ack.rwnd = current_rwnd;
-                to_send.push(Packet::Ack(ack));
+                Some(Packet::Ack(ack))
+            } else {
+                None
+            };
+            if let Some(packet) = packet {
+                if sender(packet) {
+                    self.pending_acks.remove(&id);
+                    self.pending_nacks.remove(&id);
+                } else {
+                    break;
+                }
+            } else {
+                self.pending_acks.remove(&id);
+                self.pending_nacks.remove(&id);
             }
         }
     }
 
-    fn send_pending_nacks(&mut self, now: Instant, to_send: &mut Vec<Packet>) {
+    fn flush_pending_nacks<F>(&mut self, now: Instant, sender: &mut F)
+    where
+        F: FnMut(Packet) -> bool,
+    {
         let mut ids_to_nack = Vec::new();
         for (id, first_pending_at) in self.pending_nacks.iter() {
             if now.saturating_duration_since(*first_pending_at)
@@ -1325,13 +1389,18 @@ impl<C: CongestionControl> SequenceSession<C> {
             }
         }
         for id in ids_to_nack {
-            self.pending_nacks.remove(&id);
             if let Some(nack) = self
                 .incoming
                 .get(&id)
                 .and_then(|reassembler| reassembler.create_nack(reassembler.buffer.base_index()))
             {
-                to_send.push(Packet::Nack(nack));
+                if sender(Packet::Nack(nack)) {
+                    self.pending_nacks.remove(&id);
+                } else {
+                    break;
+                }
+            } else {
+                self.pending_nacks.remove(&id);
             }
         }
     }
@@ -1364,8 +1433,12 @@ fn peek_message_type(data: &[u8]) -> Option<MessageType> {
         0x0B => Some(MessageType::SyncReconFail),
         0x0C => Some(MessageType::SyncShardChecksums),
         0x0D => Some(MessageType::HandshakeError),
-        0x0E => Some(MessageType::ReconPowChallenge),
-        0x0F => Some(MessageType::ReconPowSolution),
+        0x0E => Some(MessageType::SyncRateLimited),
+        0x0F => Some(MessageType::KeywrapAck),
+        0x10 => Some(MessageType::ReinclusionRequest),
+        0x11 => Some(MessageType::ReinclusionResponse),
+        0x12 => Some(MessageType::ReconPowChallenge),
+        0x13 => Some(MessageType::ReconPowSolution),
         _ => None,
     }
 }

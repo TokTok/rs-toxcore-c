@@ -1,5 +1,5 @@
 use merkle_tox_core::dag::{
-    Content, ConversationId, KConv, LogicalIdentityPk, MerkleNode, NodeAuth, NodeMac,
+    Content, ConversationId, Ed25519Signature, KConv, LogicalIdentityPk, MerkleNode, NodeAuth,
     PhysicalDevicePk,
 };
 use merkle_tox_core::sync::{NodeStore, ReconciliationStore, SyncRange};
@@ -24,7 +24,8 @@ fn test_payload_length_in_index() {
         network_timestamp: 100,
         content: Content::Text("Testing payload length".to_string()),
         metadata: vec![0u8; 128], // Add some metadata to ensure non-trivial length
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
     let hash = node.hash();
 
@@ -76,7 +77,6 @@ fn test_reconciliation_sketches_persistence() {
     let conv_id = ConversationId::from([3u8; 32]);
 
     let range = SyncRange {
-        epoch: 0,
         min_rank: 100,
         max_rank: 200,
     };

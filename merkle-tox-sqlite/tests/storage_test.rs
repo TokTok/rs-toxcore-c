@@ -1,5 +1,5 @@
 use merkle_tox_core::dag::{
-    Content, ConversationId, LogicalIdentityPk, MerkleNode, NodeAuth, NodeHash, NodeMac,
+    Content, ConversationId, Ed25519Signature, LogicalIdentityPk, MerkleNode, NodeAuth, NodeHash,
     PhysicalDevicePk,
 };
 use merkle_tox_core::sync::{GlobalStore, NodeStore, ReconciliationStore, SyncRange};
@@ -19,7 +19,8 @@ fn test_insert_and_get_node() {
         network_timestamp: 123456789,
         content: Content::Text("Persistence test".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
 
     let hash = node.hash();
@@ -46,7 +47,8 @@ fn test_edges_insertion() {
         network_timestamp: 123456789,
         content: Content::Text("Child node".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
 
     storage
@@ -69,7 +71,6 @@ fn test_reconciliation_store() {
     let storage = Storage::open_in_memory().expect("Failed to open storage");
     let conv_id = ConversationId::from([1u8; 32]);
     let range = SyncRange {
-        epoch: 1,
         min_rank: 100,
         max_rank: 200,
     };
@@ -85,7 +86,6 @@ fn test_reconciliation_store() {
     assert_eq!(retrieved, Some(sketch_data));
 
     let unknown_range = SyncRange {
-        epoch: 1,
         min_rank: 500,
         max_rank: 600,
     };

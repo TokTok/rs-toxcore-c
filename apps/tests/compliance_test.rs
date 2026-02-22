@@ -1,7 +1,7 @@
 use merkle_tox_core::cas::{BlobData, BlobInfo, BlobStatus};
 use merkle_tox_core::dag::{
     ChainKey, Content, ConversationId, Ed25519Signature, KConv, LogicalIdentityPk, MerkleNode,
-    NodeAuth, NodeHash, NodeMac, NodeType, PhysicalDevicePk, WireFlags, WireNode,
+    NodeAuth, NodeHash, NodeType, PhysicalDevicePk, WireFlags, WireNode,
 };
 use merkle_tox_core::sync::{FullStore, SyncRange};
 use merkle_tox_core::vfs::StdFileSystem;
@@ -30,7 +30,8 @@ fn make_node(parents: Vec<NodeHash>, seq: u64, rank: u64) -> MerkleNode {
         network_timestamp: 1000,
         content: Content::Text(format!("Node {}", seq)),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     }
 }
 
@@ -198,6 +199,7 @@ fn test_store_compliance_blobs() {
             bao_root: Some([0xCCu8; 32]),
             status: BlobStatus::Downloading,
             received_mask: None,
+            decryption_key: None,
         };
 
         let data = vec![0x42u8; 1024];
@@ -263,6 +265,7 @@ fn test_store_compliance_blob_transitions() {
             bao_root: None,
             status: BlobStatus::Pending,
             received_mask: None,
+            decryption_key: None,
         };
 
         store.put_blob_info(info).unwrap();
@@ -303,6 +306,7 @@ fn test_store_compliance_boundary_conditions() {
             bao_root: None,
             status: BlobStatus::Available,
             received_mask: None,
+            decryption_key: None,
         };
 
         store.put_blob_info(info).unwrap();
@@ -405,12 +409,12 @@ fn test_store_compliance_wire_nodes() {
         let hash = NodeHash::from([0x77u8; 32]);
         let wire = WireNode {
             parents: vec![],
-            author_pk: LogicalIdentityPk::from([1u8; 32]),
-            encrypted_payload: vec![1, 2, 3, 4],
+            sender_hint: [0u8; 4],
+            encrypted_routing: vec![0u8; 40],
+            payload_data: vec![0u8; 8],
             topological_rank: 5,
-            network_timestamp: 1000,
             flags: WireFlags::ENCRYPTED,
-            authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+            authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
         };
 
         store.put_wire_node(&conv_id, &hash, wire.clone()).unwrap();
@@ -422,7 +426,7 @@ fn test_store_compliance_wire_nodes() {
         );
 
         let retrieved = store.get_wire_node(&hash).unwrap();
-        assert_eq!(retrieved.encrypted_payload, wire.encrypted_payload);
+        assert_eq!(retrieved.encrypted_routing, wire.encrypted_routing);
 
         store.remove_wire_node(&conv_id, &hash).unwrap();
         assert!(store.get_wire_node(&hash).is_none());
@@ -451,7 +455,6 @@ fn test_store_compliance_advanced_queries() {
 
         // Test get_node_hashes_in_range
         let range = SyncRange {
-            epoch: 0,
             min_rank: 2,
             max_rank: 4,
         };
@@ -483,7 +486,6 @@ fn test_store_compliance_reconciliation_sketches() {
     run_compliance_test(|store| {
         let conv_id = ConversationId::from([0xCCu8; 32]);
         let range = SyncRange {
-            epoch: 1,
             min_rank: 10,
             max_rank: 20,
         };
@@ -535,6 +537,7 @@ fn test_store_compliance_blob_proofs() {
             bao_root: None,
             status: BlobStatus::Available,
             received_mask: None,
+            decryption_key: None,
         };
 
         store.put_blob_info(info).unwrap();
@@ -593,7 +596,6 @@ fn test_store_compliance_range_edge_cases() {
 
         // Exact match
         let range = SyncRange {
-            epoch: 0,
             min_rank: 2,
             max_rank: 2,
         };
@@ -607,7 +609,6 @@ fn test_store_compliance_range_edge_cases() {
 
         // Reversed range
         let range = SyncRange {
-            epoch: 0,
             min_rank: 3,
             max_rank: 1,
         };
@@ -621,7 +622,6 @@ fn test_store_compliance_range_edge_cases() {
 
         // Out of bounds
         let range = SyncRange {
-            epoch: 0,
             min_rank: 10,
             max_rank: 20,
         };
@@ -676,6 +676,7 @@ fn test_store_compliance_blob_chunk_proofs() {
             bao_root: None,
             status: BlobStatus::Pending,
             received_mask: None,
+            decryption_key: None,
         };
 
         store.put_blob_info(info).unwrap();
@@ -738,12 +739,12 @@ fn test_store_compliance_multiple_opaque_nodes() {
         let h2 = NodeHash::from([0x22u8; 32]);
         let wire = WireNode {
             parents: vec![],
-            author_pk: LogicalIdentityPk::from([1u8; 32]),
-            encrypted_payload: vec![1, 2, 3, 4],
+            sender_hint: [0u8; 4],
+            encrypted_routing: vec![0u8; 40],
+            payload_data: vec![0u8; 8],
             topological_rank: 5,
-            network_timestamp: 1000,
             flags: WireFlags::ENCRYPTED,
-            authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+            authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
         };
 
         store.put_wire_node(&conv_id, &h1, wire.clone()).unwrap();
@@ -779,6 +780,7 @@ fn test_store_compliance_bao_verification() {
             bao_root: None,
             status: BlobStatus::Pending,
             received_mask: None,
+            decryption_key: None,
         };
 
         store.put_blob_info(info).unwrap();
@@ -822,10 +824,10 @@ fn test_store_compliance_opaque_eviction() {
         // 1. Add an Admin node (Anchor)
         let admin_wire = WireNode {
             parents: vec![],
-            author_pk: LogicalIdentityPk::from([0u8; 32]),
-            encrypted_payload: vec![0u8; 32],
+            sender_hint: [0u8; 4],
+            encrypted_routing: vec![0u8; 40],
+            payload_data: vec![0u8; 8],
             topological_rank: 0,
-            network_timestamp: 0,
             flags: WireFlags::NONE,
             authentication: NodeAuth::Signature(Ed25519Signature::from([1u8; 64])),
         };
@@ -840,15 +842,15 @@ fn test_store_compliance_opaque_eviction() {
         for i in 0..110 {
             let mut junk_wire = WireNode {
                 parents: vec![],
-                author_pk: LogicalIdentityPk::from([1u8; 32]),
-                encrypted_payload: junk_payload.clone(),
+                sender_hint: [0u8; 4],
+                encrypted_routing: junk_payload.clone(),
+                payload_data: vec![0u8; 8],
                 topological_rank: i as u64 + 1,
-                network_timestamp: i as i64 + 1,
                 flags: WireFlags::ENCRYPTED,
-                authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+                authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
             };
             // Ensure unique hash
-            junk_wire.encrypted_payload[0] = (i % 256) as u8;
+            junk_wire.encrypted_routing[0] = (i % 256) as u8;
             let data = tox_proto::serialize(&junk_wire).unwrap();
             let hash = NodeHash::from(*blake3::hash(&data).as_bytes());
             store.put_wire_node(&conv_id, &hash, junk_wire).unwrap();

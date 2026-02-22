@@ -58,7 +58,6 @@ impl Tier {
 
 #[derive(Debug, Clone, ToxProto, PartialEq, Eq, Hash)]
 pub struct SyncRange {
-    pub epoch: u64,
     pub min_rank: u64,
     pub max_rank: u64,
 }
@@ -73,6 +72,10 @@ pub struct SyncSketch {
 pub struct IbltSketch {
     pub cells: Vec<IbltCell>,
     k: usize,
+    /// Optional keyed hash for IBLT indices/checksums.
+    /// When set, the IBLT uses a conversation-specific key derived from K_conv
+    /// so external parties cannot forge valid sketches.
+    k_iblt: Option<[u8; 32]>,
 }
 
 const K: usize = 4;
@@ -84,11 +87,35 @@ impl IbltSketch {
         Self {
             cells: vec![IbltCell::default(); cell_count],
             k: K,
+            k_iblt: None,
+        }
+    }
+
+    /// Creates a keyed IBLT sketch. When `k_iblt` is `Some`, indices and
+    /// checksums are derived from this key instead of the static context,
+    /// preventing external parties from crafting valid sketches.
+    pub fn new_keyed(cell_count: usize, k_iblt: Option<[u8; 32]>) -> Self {
+        Self {
+            cells: vec![IbltCell::default(); cell_count],
+            k: K,
+            k_iblt,
         }
     }
 
     pub fn from_cells(cells: Vec<IbltCell>) -> Self {
-        Self { cells, k: K }
+        Self {
+            cells,
+            k: K,
+            k_iblt: None,
+        }
+    }
+
+    pub fn from_cells_keyed(cells: Vec<IbltCell>, k_iblt: Option<[u8; 32]>) -> Self {
+        Self {
+            cells,
+            k: K,
+            k_iblt,
+        }
     }
 
     pub fn into_cells(self) -> Vec<IbltCell> {
@@ -121,7 +148,11 @@ impl IbltSketch {
         let mut indices = Vec::with_capacity(self.k);
         let num_cells = self.cells.len();
 
-        let mut hasher = blake3::Hasher::new_keyed(&blake3_key(HASH_CONTEXT_INDICES));
+        let key = match &self.k_iblt {
+            Some(k) => blake3::derive_key("merkle-tox v1 iblt indices", k),
+            None => blake3_key(HASH_CONTEXT_INDICES),
+        };
+        let mut hasher = blake3::Hasher::new_keyed(&key);
         hasher.update(id);
         let mut xof = hasher.finalize_xof();
 
@@ -139,7 +170,11 @@ impl IbltSketch {
     }
 
     fn get_checksum(&self, id: &[u8; 32]) -> u64 {
-        let mut hasher = blake3::Hasher::new_keyed(&blake3_key(HASH_CONTEXT_CHECKSUM));
+        let key = match &self.k_iblt {
+            Some(k) => blake3::derive_key("merkle-tox v1 iblt checksum", k),
+            None => blake3_key(HASH_CONTEXT_CHECKSUM),
+        };
+        let mut hasher = blake3::Hasher::new_keyed(&key);
         hasher.update(id);
         let hash = hasher.finalize();
         u64::from_le_bytes(hash.as_bytes()[0..8].try_into().unwrap())

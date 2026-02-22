@@ -156,18 +156,18 @@ impl<F: FileSystem> OpaqueStore<F> {
                     .flags
                     .contains(merkle_tox_core::dag::WireFlags::ENCRYPTED)
                 {
-                    let mut payload = wire.encrypted_payload.clone();
-                    if merkle_tox_core::dag::remove_padding(&mut payload).is_ok() {
+                    let mut payload_data = wire.payload_data.clone();
+                    if merkle_tox_core::dag::remove_padding(&mut payload_data).is_ok() {
                         if wire
                             .flags
                             .contains(merkle_tox_core::dag::WireFlags::COMPRESSED)
-                            && let Ok(decompressed) = zstd::decode_all(&payload[..])
+                            && let Ok(decompressed) = zstd::decode_all(&payload_data[..])
                         {
-                            payload = decompressed;
+                            payload_data = decompressed;
                         }
 
-                        if payload.len() >= 40 {
-                            let mut cursor = std::io::Cursor::new(&payload[40..]);
+                        if payload_data.len() >= 8 {
+                            let mut cursor = std::io::Cursor::new(&payload_data[8..]);
                             if let Ok(content) = <merkle_tox_core::dag::Content as tox_proto::ToxDeserialize>::deserialize(&mut cursor, &tox_proto::ToxContext::empty())
                                 && matches!(content, merkle_tox_core::dag::Content::KeyWrap { .. })
                             {

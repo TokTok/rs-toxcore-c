@@ -35,7 +35,6 @@ fn test_identity_reconstruction() {
                 permissions: Permissions::ALL,
                 flags: 0,
                 created_at: 1000,
-                pow_nonce: 0,
             },
             0,
             1,

@@ -1,8 +1,9 @@
 use crate::crypto::ConversationKeys;
 use crate::dag::{
-    ChainKey, ConversationId, KConv, MerkleNode, MessageKey, NodeAuth, NodeHash, PhysicalDevicePk,
-    WireNode,
+    ChainKey, ConversationId, HeaderKey, KConv, LogicalIdentityPk, MerkleNode, MessageKey,
+    NodeAuth, NodeHash, PhysicalDevicePk, SenderKey, WireNode,
 };
+use ed25519_dalek::Verifier;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone)]
@@ -15,10 +16,24 @@ pub struct Pending {
 pub struct Established {
     pub epochs: HashMap<u64, ConversationKeys>,
     pub sender_ratchets: HashMap<PhysicalDevicePk, (u64, ChainKey, Option<NodeHash>, u64)>, // (last_seq, next_chain_key, last_node_hash, epoch_id)
+    pub skipped_keys: HashMap<(PhysicalDevicePk, u64), (MessageKey, i64)>,
     pub current_epoch: u64,
     pub message_count: u32,
     pub last_rotation_time_ms: i64,
     pub vouchers: HashMap<NodeHash, HashSet<PhysicalDevicePk>>,
+    /// Per-sender SenderKeys received via SenderKeyDistribution.
+    /// (sender_pk, epoch) → random SenderKey used to seed the ratchet.
+    pub sender_keys: HashMap<(PhysicalDevicePk, u64), SenderKey>,
+    /// Tracks which devices have been sent our SenderKey/ratchet state in the
+    /// current epoch (JIT piggybacking). Cleared on epoch rotation.
+    pub shared_keys_sent_to: HashSet<PhysicalDevicePk>,
+    /// JIT K_header overrides for senders who distributed their ratchet mid-epoch.
+    /// (sender_pk, epoch) → K_header bytes.
+    pub jit_headers: HashMap<(PhysicalDevicePk, u64), HeaderKey>,
+    /// True when the conversation was established via a KeyWrap from an unverified
+    /// sender. Content should be surfaced as "identity pending" until the admin chain
+    /// is fully verified.
+    pub identity_pending: bool,
 }
 
 #[derive(Clone)]
@@ -28,6 +43,7 @@ pub struct ConversationData<S> {
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum Conversation {
     Pending(ConversationData<Pending>),
     Established(ConversationData<Established>),
@@ -84,10 +100,15 @@ impl ConversationData<Pending> {
             state: Established {
                 epochs,
                 sender_ratchets: HashMap::new(),
+                skipped_keys: HashMap::new(),
                 current_epoch: epoch,
                 message_count: 0,
                 last_rotation_time_ms: now_ms,
                 vouchers: self.state.vouchers,
+                sender_keys: HashMap::new(),
+                shared_keys_sent_to: HashSet::new(),
+                jit_headers: HashMap::new(),
+                identity_pending: false,
             },
         }
     }
@@ -106,10 +127,15 @@ impl ConversationData<Established> {
             state: Established {
                 epochs,
                 sender_ratchets: HashMap::new(),
+                skipped_keys: HashMap::new(),
                 current_epoch: 0,
                 message_count: 0,
                 last_rotation_time_ms: now_ms,
                 vouchers: HashMap::new(),
+                sender_keys: HashMap::new(),
+                shared_keys_sent_to: HashSet::new(),
+                jit_headers: HashMap::new(),
+                identity_pending: false,
             },
         }
     }
@@ -131,6 +157,8 @@ impl ConversationData<Established> {
         self.state.sender_ratchets.clear(); // Safe because seq resets to 1 in new epoch
         self.state.message_count = 0;
         self.state.last_rotation_time_ms = now_ms;
+        self.state.shared_keys_sent_to.clear(); // Epoch change invalidates JIT tracking
+        self.state.jit_headers.clear();
         self.state.current_epoch
     }
 
@@ -146,29 +174,78 @@ impl ConversationData<Established> {
     }
 
     pub fn peek_keys(
-        &self,
+        &mut self,
         sender_pk: &PhysicalDevicePk,
         seq: u64,
+        now_ms: i64,
     ) -> Option<(MessageKey, ChainKey)> {
         let epoch = seq >> 32;
         let counter = seq & 0xFFFFFFFF;
 
+        // Optional TTL cleanup
+        self.state
+            .skipped_keys
+            .retain(|_, &mut (_, timestamp)| now_ms - timestamp <= 86_400_000);
+
         if let Some(&(last_seq, ref next_key, _, last_epoch)) =
             self.state.sender_ratchets.get(sender_pk)
-            && seq == last_seq + 1
             && last_epoch == epoch
         {
-            let k_msg = crate::crypto::ratchet_message_key(next_key);
-            let k_next = crate::crypto::ratchet_step(next_key);
-            return Some((k_msg, k_next));
+            if seq == last_seq + 1 {
+                let k_msg = crate::crypto::ratchet_message_key(next_key);
+                let k_next = crate::crypto::ratchet_step(next_key);
+                return Some((k_msg, k_next));
+            } else if seq <= last_seq {
+                // Past message. Check cache.
+                if let Some((k_msg, _)) = self.state.skipped_keys.get(&(*sender_pk, seq)) {
+                    // Return a dummy next_chain_key. It won't be used since seq <= last_seq.
+                    return Some((k_msg.clone(), ChainKey::from([0u8; 32])));
+                }
+                return None;
+            } else {
+                // Forward Skip
+                let skip_count = seq - (last_seq + 1);
+                if skip_count > 2000 {
+                    tracing::debug!("Ratchet skip too large: {}", skip_count);
+                    return None;
+                }
+
+                let mut chain_key = next_key.clone();
+                for s in (last_seq + 1)..seq {
+                    let k_msg = crate::crypto::ratchet_message_key(&chain_key);
+                    chain_key = crate::crypto::ratchet_step(&chain_key);
+                    self.state
+                        .skipped_keys
+                        .insert((*sender_pk, s), (k_msg, now_ms));
+                }
+
+                let k_msg = crate::crypto::ratchet_message_key(&chain_key);
+                let k_next = crate::crypto::ratchet_step(&chain_key);
+                return Some((k_msg, k_next));
+            }
         }
 
-        // Re-initialize from the node's epoch root and step counter-1 times.
+        // Re-initialize from the sender's SenderKey (if received via SKD),
+        // falling back to the deterministic derivation from k_conv.
         let keys = self.get_keys(epoch)?;
-        let mut chain_key = crate::crypto::ratchet_init_sender(&keys.k_conv, sender_pk);
+        let mut chain_key =
+            if let Some(sender_key) = self.state.sender_keys.get(&(*sender_pk, epoch)) {
+                ChainKey::from(*sender_key.as_bytes())
+            } else {
+                crate::crypto::ratchet_init_sender(&keys.k_conv, sender_pk)
+            };
 
-        for _ in 1..counter {
+        if counter > 2000 {
+            tracing::debug!("Ratchet initial skip too large: {}", counter);
+            return None;
+        }
+
+        for s in 1..counter {
+            let k_msg = crate::crypto::ratchet_message_key(&chain_key);
             chain_key = crate::crypto::ratchet_step(&chain_key);
+            self.state
+                .skipped_keys
+                .insert((*sender_pk, (epoch << 32) | s), (k_msg, now_ms));
         }
 
         let k_msg = crate::crypto::ratchet_message_key(&chain_key);
@@ -185,6 +262,22 @@ impl ConversationData<Established> {
         node_hash: NodeHash,
         epoch_id: u64,
     ) -> Option<NodeHash> {
+        self.state.skipped_keys.remove(&(sender_pk, seq));
+
+        if let Some(&(last_seq, _, _, last_epoch)) = self.state.sender_ratchets.get(&sender_pk) {
+            if last_epoch > epoch_id {
+                // Don't regress to an older epoch (e.g. when an admin node's
+                // side-effects trigger a rotation that advances the ratchet to
+                // epoch N+1, and then the admin node's own epoch-N ratchet
+                // advance runs afterwards).
+                return None;
+            }
+            if last_epoch == epoch_id && seq <= last_seq {
+                // Out-of-order message processed, DO NOT advance the ratchet head.
+                return None;
+            }
+        }
+
         self.state
             .sender_ratchets
             .insert(sender_pk, (seq, next_chain_key, Some(node_hash), epoch_id))
@@ -205,97 +298,158 @@ impl ConversationData<Established> {
             .unwrap_or(0)
     }
 
-    pub fn verify_node_mac(&self, conversation_id: &ConversationId, node: &MerkleNode) -> bool {
-        let mac = match &node.authentication {
-            NodeAuth::Mac(m) => m,
-            _ => return true, // Signatures are "authentic" for this layer
+    /// Verifies the ephemeral signature on a content node.
+    ///
+    /// Admin/KeyWrap/SKD nodes use `NodeAuth::Signature` and are verified elsewhere.
+    /// Content nodes use `NodeAuth::EphemeralSignature` and are verified against the
+    /// per-epoch ephemeral signing key distributed via SenderKeyDistribution.
+    ///
+    /// The `peer_eph_keys` map contains `(sender_pk, epoch) → verifying_key_bytes`.
+    pub fn verify_node_ephemeral_sig(
+        &mut self,
+        _conversation_id: &ConversationId,
+        node: &MerkleNode,
+        peer_eph_keys: &std::collections::HashMap<
+            (PhysicalDevicePk, u64),
+            crate::dag::EphemeralSigningPk,
+        >,
+        _now_ms: i64,
+    ) -> bool {
+        let sig_bytes = match &node.authentication {
+            NodeAuth::EphemeralSignature(s) => s,
+            NodeAuth::Signature(_) => return true, // Admin signatures verified separately
         };
 
-        if let Some((k_msg, _)) = self.peek_keys(&node.sender_pk, node.sequence_number) {
-            let keys = ConversationKeys::derive(&KConv::from(*k_msg.as_bytes()));
-            if keys.verify_mac(&node.serialize_for_auth(conversation_id), mac) {
+        let epoch = node.sequence_number >> 32;
+        if let Some(vk_bytes) = peer_eph_keys.get(&(node.sender_pk, epoch))
+            && let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(vk_bytes.as_bytes())
+        {
+            let sig = ed25519_dalek::Signature::from_bytes(sig_bytes.as_ref());
+            let auth_data = node.serialize_for_auth();
+            if vk.verify(&auth_data, &sig).is_ok() {
                 return true;
             }
         }
 
-        let auth_data = node.serialize_for_auth(conversation_id);
-        let mut epochs: Vec<_> = self.state.epochs.keys().copied().collect();
-        epochs.sort_unstable_by(|a, b| b.cmp(a));
-
-        for epoch in epochs {
-            if let Some(keys) = self.state.epochs.get(&epoch) {
-                // Try root key (for 1-on-1 Genesis and legacy tests)
-                if keys.verify_mac(&auth_data, mac) {
-                    tracing::debug!("Node verified using root key of epoch {}", epoch);
-                    return true;
-                }
-
-                // Try initializing from this epoch's root
-                let mut chain_key =
-                    crate::crypto::ratchet_init_sender(&keys.k_conv, &node.sender_pk);
-                let counter = node.sequence_number & 0xFFFFFFFF;
-                for _ in 1..counter {
-                    chain_key = crate::crypto::ratchet_step(&chain_key);
-                }
-
-                let k_msg = crate::crypto::ratchet_message_key(&chain_key);
-                let msg_keys = ConversationKeys::derive(&KConv::from(*k_msg.as_bytes()));
-                if msg_keys.verify_mac(&auth_data, mac) {
-                    tracing::debug!("Node verified using linear ratchet from epoch {}", epoch);
-                    return true;
-                }
-            }
-        }
-
         tracing::debug!(
-            "MAC verification failed for node {} (sender={}, seq={})",
+            "Ephemeral signature verification failed for node {} (sender={}, seq={}, epoch={})",
             hex::encode(node.hash().as_bytes()),
             hex::encode(node.sender_pk.as_bytes()),
-            node.sequence_number
+            node.sequence_number,
+            epoch,
         );
         false
     }
 
-    pub fn unpack_node(
+    /// Identifies the sender and decrypts a content wire node.
+    ///
+    /// For exception nodes (not ENCRYPTED), calls `unpack_wire_exception` directly.
+    /// For encrypted content nodes, uses the sender_hint for O(1) lookup, with an
+    /// O(N) AEAD fallback when the hint doesn't match.
+    pub fn identify_sender_and_unpack(
         &self,
         wire: &WireNode,
-        candidate_devices: &[PhysicalDevicePk],
+        all_senders: &[(PhysicalDevicePk, LogicalIdentityPk)],
     ) -> Option<MerkleNode> {
+        // Exception nodes: cleartext routing/payload
+        if !wire.flags.contains(crate::dag::WireFlags::ENCRYPTED) {
+            return MerkleNode::unpack_wire_exception(wire).ok();
+        }
+
         let mut epochs: Vec<_> = self.state.epochs.keys().copied().collect();
         epochs.sort_unstable_by(|a, b| b.cmp(a));
 
-        for epoch in epochs {
-            if let Some(keys) = self.state.epochs.get(&epoch) {
-                // Try root key (for KeyWraps and Admin nodes)
-                if let Ok(node) = MerkleNode::unpack_wire(wire, keys) {
+        // Phase 1: Try provided candidates first
+        for &(sender_pk, logical_pk) in all_senders {
+            if let Some(node) = self.try_sender_for_wire(wire, sender_pk, logical_pk, &epochs) {
+                return Some(node);
+            }
+        }
+
+        // Phase 2: Try senders from ratchet state not in the provided list
+        for sender_pk in self.state.sender_ratchets.keys() {
+            if !all_senders.iter().any(|(d, _)| d == sender_pk) {
+                let logical_pk = sender_pk.to_logical();
+                if let Some(node) = self.try_sender_for_wire(wire, *sender_pk, logical_pk, &epochs)
+                {
+                    return Some(node);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Maximum forward-step attempts when searching for the right ratchet position.
+    const MAX_RATCHET_SKIP: u32 = 2000;
+
+    /// Tries to decrypt a wire node assuming a specific sender.
+    ///
+    /// For each epoch, starts from the known ratchet position (or re-init for
+    /// seq=1) and steps forward up to MAX_RATCHET_SKIP positions. At each
+    /// position, checks the sender_hint first (cheap), then tries AEAD
+    /// routing decryption on hint match.
+    ///
+    /// k_header is derived from the NEXT chain key (after stepping), matching
+    /// how authoring packs wire nodes: peek_keys returns (k_msg, k_next) and
+    /// k_header = derive_k_header_epoch(k_conv, k_next).
+    fn try_sender_for_wire(
+        &self,
+        wire: &WireNode,
+        sender_pk: PhysicalDevicePk,
+        logical_pk: LogicalIdentityPk,
+        epochs: &[u64],
+    ) -> Option<MerkleNode> {
+        for &epoch in epochs {
+            let keys = self.state.epochs.get(&epoch)?;
+
+            // Determine starting chain key: from sender_ratchets, SenderKey, or deterministic init
+            let start_key = if let Some(&(_, ref next_key, _, epoch_id)) =
+                self.state.sender_ratchets.get(&sender_pk)
+                && epoch_id == epoch
+            {
+                next_key.clone()
+            } else if let Some(sender_key) = self.state.sender_keys.get(&(sender_pk, epoch)) {
+                ChainKey::from(*sender_key.as_bytes())
+            } else {
+                crate::crypto::ratchet_init_sender(&keys.k_conv, &sender_pk)
+            };
+
+            // K_header: check JIT override first, then derive from SenderKey
+            let k_header = if let Some(h) = self.state.jit_headers.get(&(sender_pk, epoch)) {
+                h.clone()
+            } else {
+                let sender_key = self
+                    .state
+                    .sender_keys
+                    .get(&(sender_pk, epoch))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        SenderKey::from(
+                            *crate::crypto::ratchet_init_sender(&keys.k_conv, &sender_pk)
+                                .as_bytes(),
+                        )
+                    });
+                crate::crypto::derive_k_header_epoch(&keys.k_conv, &sender_key)
+            };
+
+            // Step forward trying each position
+            let mut ck = start_key;
+            for _ in 0..Self::MAX_RATCHET_SKIP {
+                let k_msg = crate::crypto::ratchet_message_key(&ck);
+                let k_next = crate::crypto::ratchet_step(&ck);
+
+                // Fast path: check sender_hint first (4-byte comparison)
+                let hint = crate::crypto::compute_sender_hint(&k_msg);
+                if hint == wire.sender_hint
+                    && let Some(seq) = MerkleNode::try_decrypt_routing(wire, &k_header)
+                    && let Ok(node) =
+                        MerkleNode::unpack_wire_content(wire, sender_pk, logical_pk, seq, &k_msg)
+                {
                     return Some(node);
                 }
 
-                // Trial decrypt with all candidate devices
-                for &sender_pk in candidate_devices {
-                    if let Some(&(_, ref next_key, _, epoch_id)) =
-                        self.state.sender_ratchets.get(&sender_pk)
-                        && epoch_id == epoch
-                    {
-                        let k_msg = crate::crypto::ratchet_message_key(next_key);
-                        let msg_keys = ConversationKeys::derive(&KConv::from(*k_msg.as_bytes()));
-                        if let Ok(node) = MerkleNode::unpack_wire(wire, &msg_keys)
-                            && node.sender_pk == sender_pk
-                        {
-                            return Some(node);
-                        }
-                    }
-
-                    // Also try re-initializing from this epoch's root for each candidate device (seq=1)
-                    let chain_key = crate::crypto::ratchet_init_sender(&keys.k_conv, &sender_pk);
-                    let k_msg = crate::crypto::ratchet_message_key(&chain_key);
-                    let msg_keys = ConversationKeys::derive(&KConv::from(*k_msg.as_bytes()));
-                    if let Ok(node) = MerkleNode::unpack_wire(wire, &msg_keys)
-                        && node.sender_pk == sender_pk
-                    {
-                        return Some(node);
-                    }
-                }
+                ck = k_next;
             }
         }
 

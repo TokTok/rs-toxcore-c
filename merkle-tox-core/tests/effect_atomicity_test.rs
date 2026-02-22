@@ -1,6 +1,6 @@
 use merkle_tox_core::clock::ManualTimeProvider;
 use merkle_tox_core::dag::{
-    ChainKey, Content, ConversationId, KConv, MerkleNode, NodeHash, NodeMac, NodeType,
+    ChainKey, Content, ConversationId, Ed25519Signature, KConv, MerkleNode, NodeHash, NodeType,
     PhysicalDevicePk,
 };
 use merkle_tox_core::engine::{Effect, MerkleToxEngine};
@@ -52,6 +52,9 @@ impl merkle_tox_core::dag::NodeLookup for FailingStore {
     }
     fn get_rank(&self, hash: &NodeHash) -> Option<u64> {
         self.inner.get_rank(hash)
+    }
+    fn get_admin_distance(&self, hash: &NodeHash) -> Option<u64> {
+        self.inner.get_admin_distance(hash)
     }
     fn contains_node(&self, hash: &NodeHash) -> bool {
         self.inner.contains_node(hash)
@@ -232,7 +235,10 @@ fn test_pending_cache_not_cleared_on_failure() {
         network_timestamp: 1000,
         content: Content::Text("Fail me".to_string()),
         metadata: vec![],
-        authentication: merkle_tox_core::dag::NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: merkle_tox_core::dag::NodeAuth::EphemeralSignature(Ed25519Signature::from(
+            [0u8; 64],
+        )),
+        pow_nonce: 0,
     };
 
     // Populate pending cache
@@ -276,7 +282,10 @@ fn test_pending_cache_cleared_on_success() {
         network_timestamp: 1000,
         content: Content::Text("Success".to_string()),
         metadata: vec![],
-        authentication: merkle_tox_core::dag::NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: merkle_tox_core::dag::NodeAuth::EphemeralSignature(Ed25519Signature::from(
+            [0u8; 64],
+        )),
+        pow_nonce: 0,
     };
 
     node.engine.put_pending_node(node_data.clone());

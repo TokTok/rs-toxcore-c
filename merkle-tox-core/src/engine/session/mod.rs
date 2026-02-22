@@ -47,7 +47,7 @@ impl<S> SyncSession<S> {
     }
 }
 
-/// A type-erased session for use in the engine's session map.
+/// Type-erased session for use in engine's session map.
 pub enum PeerSession {
     Handshake(SyncSession<Handshake>),
     Active(SyncSession<Active>),

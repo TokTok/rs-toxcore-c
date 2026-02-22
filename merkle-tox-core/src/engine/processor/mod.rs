@@ -3,12 +3,12 @@ use crate::dag::{Content, MerkleNode, NodeHash};
 pub mod side_effects;
 pub mod verification;
 
-/// A private zero-sized type that can only be constructed within the processor module.
-/// This serves as the "Evidence" that a node has been cryptographically and logically verified.
+/// Private zero-sized type constructed only within processor module.
+/// Serves as "Evidence" that node is cryptographically and logically verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Evidence;
 
-/// A wrapper that serves as type-level proof that a MerkleNode has passed
+/// Wrapper serving as type-level proof that MerkleNode passed
 /// all cryptographic, identity, and protocol-rule checks.
 #[derive(Debug, Clone)]
 pub struct VerifiedNode<T = Content> {

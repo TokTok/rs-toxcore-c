@@ -60,8 +60,8 @@ fn test_epoch_prefixed_sequence_numbers() {
             }
         })
         .unwrap();
-    // Seq should be (1 << 32) | 1
-    assert_eq!(node2.sequence_number, (1u64 << 32) | 1);
+    // Rotation authors a SKD node at (1 << 32) | 1, so the first user content node is | 2.
+    assert_eq!(node2.sequence_number, (1u64 << 32) | 2);
     merkle_tox_core::testing::apply_effects(effects, &store);
 
     // 4. Author another node in Epoch 1
@@ -78,8 +78,8 @@ fn test_epoch_prefixed_sequence_numbers() {
             }
         })
         .unwrap();
-    // Seq should be (1 << 32) | 2
-    assert_eq!(node3.sequence_number, (1u64 << 32) | 2);
+    // Seq should be (1 << 32) | 3
+    assert_eq!(node3.sequence_number, (1u64 << 32) | 3);
 }
 
 #[test]
@@ -111,44 +111,33 @@ fn test_per_sender_ratchet_isolation() {
     room.setup_engine(&mut bob_engine, &bob_store);
 
     // 1. Alice authors Msg A1
+    //    JIT piggybacking authors a JIT SKD for Bob first (seq=1), then "A1" (seq=2).
     let effects = alice_engine
         .author_node(conv_id, Content::Text("A1".into()), vec![], &alice_store)
         .unwrap();
-    let node_a1 = effects
-        .iter()
-        .find_map(|e| {
-            if let Effect::WriteStore(_, n, _) = e {
-                Some(n.clone())
-            } else {
-                None
-            }
-        })
-        .unwrap();
-    assert_eq!(node_a1.sequence_number, 1);
+    let all_a_nodes = merkle_tox_core::testing::get_all_nodes_from_effects(&effects);
+    let node_a1 = all_a_nodes.last().unwrap();
+    assert_eq!(node_a1.sequence_number, 2); // JIT SKD at 1, text at 2
     merkle_tox_core::testing::apply_effects(effects, &alice_store);
 
     // 2. Bob authors Msg B1
+    //    Similarly: JIT SKD for Alice (seq=1), then "B1" (seq=2).
     let effects = bob_engine
         .author_node(conv_id, Content::Text("B1".into()), vec![], &bob_store)
         .unwrap();
-    let node_b1 = effects
-        .iter()
-        .find_map(|e| {
-            if let Effect::WriteStore(_, n, _) = e {
-                Some(n.clone())
-            } else {
-                None
-            }
-        })
-        .unwrap();
-    assert_eq!(node_b1.sequence_number, 1); // Bob's first node
+    let all_b_nodes = merkle_tox_core::testing::get_all_nodes_from_effects(&effects);
+    let node_b1 = all_b_nodes.last().unwrap();
+    assert_eq!(node_b1.sequence_number, 2); // Bob's text node
+    merkle_tox_core::testing::transfer_wire_nodes(&effects, &alice_store);
     merkle_tox_core::testing::apply_effects(effects, &bob_store);
 
-    // 3. Alice receives Bob's node
-    let effects = alice_engine
-        .handle_node(conv_id, node_b1.clone(), &alice_store, None)
-        .unwrap();
-    merkle_tox_core::testing::apply_effects(effects, &alice_store);
+    // 3. Alice receives ALL of Bob's nodes (JIT SKD + text)
+    for node in &all_b_nodes {
+        let effects = alice_engine
+            .handle_node(conv_id, node.clone(), &alice_store, None)
+            .unwrap();
+        merkle_tox_core::testing::apply_effects(effects, &alice_store);
+    }
 
     // 4. Verify Alice's internal state tracks Bob's ratchet
     let em = match alice_engine.conversations.get(&conv_id).unwrap() {
@@ -162,8 +151,8 @@ fn test_per_sender_ratchet_isolation() {
     let alice_state = em.state.sender_ratchets.get(&alice.device_pk).unwrap();
     let bob_state = em.state.sender_ratchets.get(&bob.device_pk).unwrap();
 
-    assert_eq!(alice_state.0, 1); // last_seq
-    assert_eq!(bob_state.0, 1); // last_seq
+    assert_eq!(alice_state.0, 2); // last_seq (JIT SKD + text)
+    assert_eq!(bob_state.0, 2); // last_seq (JIT SKD + text)
 }
 
 #[test]
@@ -195,41 +184,26 @@ fn test_out_of_order_reverification() {
     room.setup_engine(&mut bob_engine, &bob_store);
 
     // Bob authors B1 and B2
+    // JIT piggybacking: first author_node produces [JIT_SKD, B1], second produces [B2]
     let effects = bob_engine
         .author_node(conv_id, Content::Text("B1".into()), vec![], &bob_store)
         .unwrap();
-    let node_b1 = effects
-        .iter()
-        .find_map(|e| {
-            if let Effect::WriteStore(_, n, _) = e {
-                Some(n.clone())
-            } else {
-                None
-            }
-        })
-        .unwrap()
-        .clone();
+    let all_b1_nodes = merkle_tox_core::testing::get_all_nodes_from_effects(&effects);
+    let node_b1_text = all_b1_nodes.last().unwrap().clone();
+    merkle_tox_core::testing::transfer_wire_nodes(&effects, &alice_store);
     merkle_tox_core::testing::apply_effects(effects, &bob_store);
 
     let effects = bob_engine
         .author_node(conv_id, Content::Text("B2".into()), vec![], &bob_store)
         .unwrap();
-    let node_b2 = effects
-        .iter()
-        .find_map(|e| {
-            if let Effect::WriteStore(_, n, _) = e {
-                Some(n.clone())
-            } else {
-                None
-            }
-        })
-        .unwrap()
-        .clone();
+    let all_b2_nodes = merkle_tox_core::testing::get_all_nodes_from_effects(&effects);
+    let node_b2_text = all_b2_nodes.last().unwrap().clone();
+    merkle_tox_core::testing::transfer_wire_nodes(&effects, &alice_store);
     merkle_tox_core::testing::apply_effects(effects, &bob_store);
 
-    // Alice receives B2 FIRST (out of order sequence)
+    // Alice receives B2 text FIRST (out of order sequence)
     let effects = alice_engine
-        .handle_node(conv_id, node_b2.clone(), &alice_store, None)
+        .handle_node(conv_id, node_b2_text.clone(), &alice_store, None)
         .unwrap();
     // B2 should be speculative because B1 is missing (cannot derive key)
     assert!(effects.iter().any(|e| matches!(
@@ -237,16 +211,17 @@ fn test_out_of_order_reverification() {
         Effect::EmitEvent(merkle_tox_core::NodeEvent::NodeSpeculative { .. })
     )));
     merkle_tox_core::testing::apply_effects(effects, &alice_store);
-    assert!(!alice_store.is_verified(&node_b2.hash()));
+    assert!(!alice_store.is_verified(&node_b2_text.hash()));
 
-    // Alice receives B1
-    let effects = alice_engine
-        .handle_node(conv_id, node_b1.clone(), &alice_store, None)
-        .unwrap();
-    // B1 should be verified
-    merkle_tox_core::testing::apply_effects(effects, &alice_store);
-    assert!(alice_store.is_verified(&node_b1.hash()));
+    // Alice receives ALL of Bob's first batch (JIT SKD + B1 text)
+    for node in &all_b1_nodes {
+        let effects = alice_engine
+            .handle_node(conv_id, node.clone(), &alice_store, None)
+            .unwrap();
+        merkle_tox_core::testing::apply_effects(effects, &alice_store);
+    }
+    assert!(alice_store.is_verified(&node_b1_text.hash()));
 
     // B2 should now be automatically verified via reverify_speculative_for_conversation
-    assert!(alice_store.is_verified(&node_b2.hash()));
+    assert!(alice_store.is_verified(&node_b2_text.hash()));
 }

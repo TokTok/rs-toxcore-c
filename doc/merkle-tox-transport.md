@@ -3,8 +3,7 @@
 ## Overview
 
 Tox custom packets are lossy and have a limited MTU (~1.3KB). The
-`tox-sequenced` layer provides a reliable delivery mechanism over these packets
-to support syncing large Merkle nodes and binary blobs.
+`tox-sequenced` layer provides reliable delivery over these packets.
 
 ## 1. Transport Header
 
@@ -35,14 +34,12 @@ Datagram | `msg_type`    | `data`           | -                 | -       | -
 
 ## 2. Reliability Mechanism: Selective Repeat ARQ
 
-To handle loss efficiently without stalling the stream:
-
 -   **Fragmentation**: Large messages (Nodes, Blobs, Sync Batches) are split
     into fragments.
--   **Acknowledgments**: Receivers send `ACK` packets containing a bitset (map)
-    of received fragments for a specific `message_id`.
--   **Retransmission**: The sender only re-sends fragments that were not
-    acknowledged after the dynamic RTO expires or upon receiving a `NACK`.
+-   **Acknowledgments**: Receivers send `ACK` packets containing a bitmask of
+    received fragments for a specific `message_id`.
+-   **Retransmission**: The sender re-sends fragments not acknowledged after the
+    dynamic RTO expires or upon receiving a `NACK`.
 -   **Reassembly**: Once all fragments for a `message_id` are received, the
     original data is reconstructed and passed to the logic layer.
 
@@ -93,15 +90,18 @@ Type** to route it to the correct subsystem:
 | `0x0C` | `SYNC_SHARD_CHECKSUMS` | Sync         | Shard Checksums for large  |
 :        :                        :              : history                    :
 | `0x0D` | `HANDSHAKE_ERROR`      | Capabilities | Signal for invalid pre-key |
-:        :                        :              : during X3DH exchange       :
-| `0x0E` | `RECON_POW_CHALLENGE`  | Sync         | IBLT Anti-DoS Challenge    |
-| `0x0F` | `RECON_POW_SOLUTION`   | Sync         | IBLT Anti-DoS Solution     |
+:        :                        :              : during ECIES exchange      :
+| `0x0E` | `SYNC_RATE_LIMITED`    | Sync         | Per-peer CPU budget        |
+:        :                        :              : exhausted; includes retry  :
+:        :                        :              : delay in ms                :
+| `0x0F` | `KEYWRAP_ACK`          | Capabilities | Confirms successful        |
+:        :                        :              : decryption of a WrappedKey :
+:        :                        :              : entry (off-DAG)            :
 
 ## 6. Heartbeats & Keep-alive
 
-To ensure the stability of the `NetworkClock` and maintain the reliability
-session during idle periods, implementations MUST adhere to the following
-heartbeat rules:
+To stabilize `NetworkClock` and maintain reliability sessions during idle
+periods, implementations MUST adhere to these heartbeat rules:
 
 *   **Mandatory PING**: A session MUST send a `PING` packet at least once every
     **60 seconds** if no other traffic has been sent.
@@ -113,22 +113,19 @@ heartbeat rules:
 
 ## 7. Pipelining & Multi-Source Rules
 
-To maximize efficiency in a swarm-based synchronization:
-
 -   **Message Parallelism**: `tox-sequenced` MUST support multiple concurrent
-    `message_id`s. This allows fetching a DAG batch (Msg 1) while simultaneously
-    downloading blob chunks (Msg 2, 3, 4) from the same peer.
+    `message_id`s, allowing simultaneous DAG batch fetching and blob chunk
+    downloading from the same peer.
 -   **Peer Aggregation**: When downloading a single blob from multiple sources,
     the logic layer allocates unique `fragment_index` ranges or separate
     `message_id`s per peer to avoid collisions during reassembly.
--   **Congestion Window**: The sliding window is managed per-peer to ensure that
-    one slow member of a swarm doesn't stall the overall progress.
+-   **Congestion Window**: The sliding window is managed per-peer to ensure one
+    slow member does not stall overall progress.
 
 ## 8. Hard Limits and Constraints
 
-To prevent Denial of Service (DoS) and resource exhaustion attacks, the
-following limits are enforced (see `merkle-tox.md` for the full list of Protocol
-Constants):
+The following limits are enforced (see `merkle-tox.md` for the full list of
+Protocol Constants):
 
 -   **MAX_MESSAGE_SIZE**: Total reassembled message size limit.
 -   **MAX_INFLIGHT_MESSAGES**: Maximum concurrent reassemblies per peer.

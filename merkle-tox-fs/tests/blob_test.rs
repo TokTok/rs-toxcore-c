@@ -28,6 +28,7 @@ fn test_fs_store_put_get_blob_info() {
         bao_root: Some([2u8; 32]),
         status: BlobStatus::Pending,
         received_mask: Some(vec![0u8; 1]),
+        decryption_key: None,
     };
 
     store.put_blob_info(info.clone()).unwrap();
@@ -51,6 +52,7 @@ fn test_fs_store_put_get_chunk() {
         bao_root: None,
         status: BlobStatus::Downloading,
         received_mask: None,
+        decryption_key: None,
     };
     store.put_blob_info(info).unwrap();
 
@@ -93,6 +95,7 @@ fn test_fs_store_has_blob() {
         bao_root: Some([0u8; 32]),
         status: BlobStatus::Pending,
         received_mask: None,
+        decryption_key: None,
     };
     store.put_blob_info(info).unwrap();
     assert!(!store.has_blob(&blob_hash));
@@ -128,6 +131,7 @@ fn test_fs_store_chunk_offset() {
             bao_root: None,
             status: BlobStatus::Downloading,
             received_mask: None,
+            decryption_key: None,
         })
         .unwrap();
 
@@ -168,6 +172,7 @@ fn test_fs_store_blob_persistence() {
                 bao_root: None,
                 status: BlobStatus::Downloading,
                 received_mask: None,
+                decryption_key: None,
             })
             .unwrap();
         store
@@ -180,6 +185,7 @@ fn test_fs_store_blob_persistence() {
             bao_root: None,
             status: BlobStatus::Downloading,
             received_mask: None,
+            decryption_key: None,
         };
         store.put_blob_info(info).unwrap();
         store.finalize_blob(&blob_hash).unwrap();
@@ -208,6 +214,7 @@ fn test_fs_store_get_chunk_out_of_bounds() {
             bao_root: None,
             status: BlobStatus::Downloading,
             received_mask: None,
+            decryption_key: None,
         })
         .unwrap();
 
@@ -243,6 +250,7 @@ fn test_fs_store_finalize_updates_info() {
         bao_root: None,
         status: BlobStatus::Downloading,
         received_mask: None,
+        decryption_key: None,
     };
     store.put_blob_info(info).unwrap();
 
@@ -274,6 +282,7 @@ fn test_fs_store_small_blob_optimization() {
         bao_root: None,
         status: BlobStatus::Downloading,
         received_mask: None,
+        decryption_key: None,
     };
     store.put_blob_info(info).unwrap();
 
@@ -306,6 +315,7 @@ fn test_fs_store_blob_info_sharding() {
         bao_root: None,
         status: BlobStatus::Pending,
         received_mask: None,
+        decryption_key: None,
     };
     store.put_blob_info(info).unwrap();
 
@@ -334,6 +344,7 @@ fn test_fs_store_bao_outboard_creation() {
             bao_root: None,
             status: BlobStatus::Downloading,
             received_mask: None,
+            decryption_key: None,
         })
         .unwrap();
 
@@ -347,6 +358,7 @@ fn test_fs_store_bao_outboard_creation() {
         bao_root: None,
         status: BlobStatus::Downloading,
         received_mask: None,
+        decryption_key: None,
     };
     store.put_blob_info(info).unwrap();
 
@@ -396,6 +408,7 @@ fn test_fs_store_blob_cross_finalization() {
             bao_root: None,
             status: BlobStatus::Downloading,
             received_mask: None,
+            decryption_key: None,
         })
         .unwrap();
 
@@ -409,6 +422,7 @@ fn test_fs_store_blob_cross_finalization() {
         bao_root: None,
         status: BlobStatus::Downloading,
         received_mask: None,
+        decryption_key: None,
     };
     store1.put_blob_info(info).unwrap();
     store1.finalize_blob(&blob_hash).unwrap();
@@ -436,6 +450,7 @@ fn test_fs_store_missing_data_no_put_chunk() {
             bao_root: None,
             status: BlobStatus::Downloading,
             received_mask: None,
+            decryption_key: None,
         })
         .unwrap();
 
@@ -465,6 +480,7 @@ fn test_fs_store_partial_data_with_info() {
             bao_root: None,
             status: BlobStatus::Downloading,
             received_mask: None,
+            decryption_key: None,
         })
         .unwrap();
 

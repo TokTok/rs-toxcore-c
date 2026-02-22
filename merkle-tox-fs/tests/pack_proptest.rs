@@ -1,4 +1,3 @@
-use merkle_tox_core::dag::NodeHash;
 use merkle_tox_fs::pack::{IndexRecord, RECORD_SIZE};
 use proptest::prelude::*;
 
@@ -11,16 +10,16 @@ proptest! {
         payload_length in 0u32..,
         node_type in 0u8..2,
         status in 0u8..2,
-        flags in 0u8..
-    ) {
+        admin_distance in 0u16..
+        ) {
         let record = IndexRecord {
-            hash: NodeHash::from(hash),
+            hash: hash.into(),
             offset,
             rank,
             payload_length,
             node_type,
             status,
-            flags,
+            admin_distance,
         };
 
         let mut buf = [0u8; RECORD_SIZE];

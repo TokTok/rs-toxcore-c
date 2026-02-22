@@ -17,12 +17,21 @@ fn test_identity_authorization() {
 
     let conv_id = ConversationId::from([0xAAu8; 32]);
     let mut manager = IdentityManager::new();
+    let ctx = merkle_tox_core::identity::CausalContext::global();
     manager
-        .authorize_device(conv_id, logical_pk, &cert, 1000000000000, 0)
+        .authorize_device(
+            &ctx,
+            conv_id,
+            logical_pk,
+            &cert,
+            1000000000000,
+            0,
+            merkle_tox_core::dag::NodeHash::from([0u8; 32]),
+        )
         .expect("Should authorize");
 
-    assert!(manager.is_authorized(conv_id, &device_pk, &logical_pk, 1100000000000, 0));
-    assert!(!manager.is_authorized(conv_id, &device_pk, &logical_pk, 3000000000000, 0)); // Expired
+    assert!(manager.is_authorized(&ctx, conv_id, &device_pk, &logical_pk, 1100000000000, 0));
+    assert!(!manager.is_authorized(&ctx, conv_id, &device_pk, &logical_pk, 3000000000000, 0)); // Expired
 }
 
 // end of file

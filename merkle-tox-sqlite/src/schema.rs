@@ -8,6 +8,7 @@ pub const CREATE_TABLES: &str = "
         network_timestamp INTEGER NOT NULL,
         sequence_number INTEGER NOT NULL,
         topological_rank INTEGER NOT NULL,
+        admin_distance INTEGER NOT NULL DEFAULT 0,
         parents BLOB NOT NULL,
         verification_status INTEGER NOT NULL,
         raw_data BLOB NOT NULL
@@ -57,11 +58,10 @@ pub const CREATE_TABLES: &str = "
 
     CREATE TABLE IF NOT EXISTS reconciliation_sketches (
         conversation_id BLOB NOT NULL,
-        epoch INTEGER NOT NULL,
         min_rank INTEGER NOT NULL,
         max_rank INTEGER NOT NULL,
         sketch BLOB NOT NULL,
-        PRIMARY KEY (conversation_id, epoch, min_rank, max_rank)
+        PRIMARY KEY (conversation_id, min_rank, max_rank)
     );
 
     CREATE TABLE IF NOT EXISTS ratchet_keys (

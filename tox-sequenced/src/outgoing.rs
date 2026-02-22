@@ -162,10 +162,32 @@ impl OutgoingMessage {
         last_delivery_time: Instant,
         app_limited: bool,
     ) -> (Vec<u8>, FragmentCount, bool, bool) {
-        let start = idx.0 as usize * self.payload_mtu;
-        let end = (start + self.payload_mtu).min(self.data.len());
-        let fragment = self.data[start..end].to_vec();
+        let fragment = self.get_fragment(idx);
         let total = self.num_fragments;
+        let fragment_size = fragment.len();
+        let (is_retransmission, was_in_flight) = self.mark_fragment_sent(
+            idx,
+            now,
+            delivered_bytes,
+            last_delivery_time,
+            app_limited,
+            fragment_size,
+        );
+        (fragment, total, is_retransmission, was_in_flight)
+    }
+
+    /// Applies mutation effects of sending a fragment.
+    /// Call this AFTER confirming the packet was successfully delivered to the transport.
+    /// Returns (is_retransmission, was_in_flight).
+    pub fn mark_fragment_sent(
+        &mut self,
+        idx: FragmentIndex,
+        now: Instant,
+        delivered_bytes: usize,
+        last_delivery_time: Instant,
+        app_limited: bool,
+        fragment_size: usize,
+    ) -> (bool, bool) {
         let state = &mut self.fragment_states[idx.0 as usize];
         let is_retransmission = state.delivery_info.is_some();
         let was_in_flight = state.last_sent.is_some();
@@ -177,13 +199,13 @@ impl OutgoingMessage {
                 delivered_at_send: delivered_bytes,
                 delivery_time_at_send: last_delivery_time,
                 first_sent_time: now,
-                size: fragment.len(),
+                size: fragment_size,
                 app_limited,
             });
         }
         state.last_sent = Some(now);
         self.in_flight_queue.push_back((idx, now));
-        (fragment, total, is_retransmission, was_in_flight)
+        (is_retransmission, was_in_flight)
     }
 
     pub fn on_ack(

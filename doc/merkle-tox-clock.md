@@ -2,33 +2,42 @@
 
 ## Overview
 
-Merkle-Tox requires a tamper-resistant, monotonic, and globally consistent clock
-to linearize concurrent events in a decentralized Directed Acyclic Graph (DAG).
-Since system clocks are unreliable and easily manipulated, we implement a
-**Median-based Consensus Clock** with Round-Trip Time (RTT) compensation.
+Merkle-Tox requires a globally consistent clock to linearize concurrent events
+in a decentralized Directed Acyclic Graph (DAG). Implements a **Median-based
+Consensus Clock** with Round-Trip Time (RTT) compensation. Monotonicity is
+enforced via slewing (§3), while causal display ordering uses
+`effective_timestamp` (§3).
 
 ## 1. Algorithm: Byzantine-Resilient Median
 
 Each node maintains a single, global view of "Network Time" ($T_{net}$) derived
-from the offsets of all trusted peers.
+from the offsets of a strictly bounded set of trusted peers.
 
-### Calculation
+### Calculation (The "Trusted Core" Approach)
 
-1.  **Offset Discovery**: Node A measures the time difference (offset) between
-    itself and Peer B using a time synchronization exchange to compensate for
-    network latency (RTT).
-2.  **Sample Collection**: Node A maintains a global table of offsets for all
-    active, authenticated peers.
-3.  **Median Selection**: The consensus offset is the **weighted median** of all
-    collected samples.
-    -   *Weighting*: Peers with longer-standing connections or higher trust
-        (e.g., manually verified friends) may be given higher weight.
-4.  **$T_{net}$ Derivation**: $T_{net} = T_{local} + Median(Offsets)$.
+1.  **Offset Discovery**: Node A measures time offset with Peer B, compensating
+    for network latency (RTT).
+2.  **Sample Collection (Primary Consensus)**: Node A maintains a global table
+    of offsets, *exclusively* including peers in the user's explicit Tox
+    **Friend List** (bidirectional consent established).
+    -   **Fallback Consensus**: If the user has 0 online friends, the client
+        pools authorized identities across all shared rooms.
+3.  **Per-Identity Grouping**: Offsets MUST be grouped by **Logical Identity**
+    (`author_pk` / Master Seed). Multiple devices per identity are averaged into
+    a single offset, ensuring one vote per user.
+4.  **Median Selection**: The consensus offset is the **median** of the
+    per-identity offsets from the selected consensus pool.
+5.  **Strict Sanity Bound**: The final median offset MUST be **hard-capped** at
+    $\pm 5$ minutes from the local OS system clock. If consensus attempts to
+    drag the clock further, the engine clamps the offset and SHOULD flag a UI
+    warning.
+6.  **$T_{net}$ Derivation**: $T_{net} = T_{local} +
+    \text{Clamped\_Median}(Offsets)$.
 
 ## 2. Measurement (Transport Integration)
 
 Time synchronization measurements are integrated into the `tox-sequenced`
-transport layer. This eliminates "ARQ Jitter" (retransmission delay) and uses
+transport layer, eliminating "ARQ Jitter" (retransmission delay) and using
 existing RTT heartbeats.
 
 1.  **Transport PING/PONG**: The transport layer exchanges timestamps (Origin,
@@ -44,9 +53,8 @@ existing RTT heartbeats.
 ### Byzantine Fault Tolerance (BFT)
 
 By using the **Median** instead of the Mean, an attacker must control $> 50\%$
-of your authenticated peer connections to significantly shift your clock.
-Outliers (e.g., a peer claiming the year 1970 or 2038) are naturally ignored by
-the median calculation.
+of authenticated peer connections to significantly shift the clock. Outliers are
+naturally ignored.
 
 ### Clock Slewing (Monotonicity)
 
@@ -64,9 +72,15 @@ $T_{net}$ is updated via **slewing**:
 
 ### Sybil Resistance
 
-Only offsets from peers with a valid Tox `PublicKey` who are present in the
-user's friend list or a shared conversation are included in the consensus. This
-prevents an anonymous attacker from flooding the network with fake time samples.
+**External Sybil Resistance**: **Friend List** prioritization resists external
+Sybil attacks. Attackers cannot force users to add Sybils as explicit friends,
+isolating timelines from public rooms.
+
+**Internal Sybil Resistance**: Per-identity grouping (§1, Step 3) prevents
+authorized users from amplifying votes via multiple devices. In the fallback
+consensus scenario, an attacker must control $>50\%$ of the distinct **logical
+identities** across all shared rooms to shift the clock, and their maximum
+impact is strictly contained by the 5-minute hard bound.
 
 ### Temporal Fingerprinting Protection
 
@@ -80,31 +94,64 @@ Jitter**:
     a PONG.
 -   **Impact**: This prevents a peer from calculating the sub-millisecond
     hardware clock drift that is unique to specific hardware oscillators.
--   **Resolution**: While this reduces the precision of the raw offset sample,
-    the jitter is negligible for DAG linearization and is naturally smoothed out
-    by the **Median Consensus** algorithm.
+-   **Resolution**: While this reduces raw offset precision, the jitter is
+    negligible for DAG linearization and is smoothed out by the Median
+    Consensus.
 
-### Hard Monotonicity & Quarantine Rules
+### Observer-Relative Validity & Quarantine Rules
 
-To prevent attackers from manipulating history by camping in the future or
-rewriting the past with bogus timestamps, Merkle-Tox enforces **Hard
-Monotonicity**:
+**Observer-Relative Validity Window** prevents timestamp manipulation
+(backdating/future-dating). Timestamp validity is checked against the observer's
+$T_{net}$, **not** against parent timestamps, preventing a fast clock from
+ratcheting downstream timestamps into the future.
 
-1.  **Lower Bound**: A node's `network_timestamp` MUST be $\ge$ the maximum
-    `network_timestamp` of all its parent nodes.
+1.  **Causal Lower Bound**: A strict wall-clock lower bound would quarantine
+    legitimate offline messages. Instead, a node's timestamp MUST be $\ge$ the
+    timestamp of its oldest parent minus 10 minutes (allowing for clock skew
+    between parent author and replier), preventing backdating before the
+    conversation started while allowing offline sync.
 2.  **Upper Bound**: A node's `network_timestamp` MUST NOT be more than **10
     minutes** in the future relative to the observer's current $T_{net}$.
-3.  **Quarantine**: Nodes that violate these rules are **Quarantined**:
+3.  **No Parent-Relative Constraint**: There is deliberately **no** requirement
+    that a node's timestamp be $\ge$ the maximum timestamp of its parents. A
+    reply authored at 12:00 to a message timestamped at 12:05 (due to clock
+    skew) is valid as long as both timestamps fall within the $\pm 10$ minute
+    window at the time of observation. Causal ordering is enforced by the DAG
+    structure (topological rank), not by timestamps.
+4.  **Quarantine**: Nodes that violate these rules are **Quarantined**:
     -   They are stored in the `Speculative` area of the database.
     -   They are **not** displayed in the UI.
     -   They **cannot** be used as parents for new nodes authored by the local
         client.
     -   **Vouching Exception**: A quarantined Admin node **STILL provides a
         structural vouch** for its parents (up to the cap defined in
-        `merkle-tox-sync.md`). This ensures that an attacker cannot "hide"
-        legitimate history by referencing it from a future-dated node.
+        `merkle-tox-sync.md`), ensuring an attacker cannot "hide" legitimate
+        history by referencing it from a future-dated node.
     -   Once the network time catches up (for future-dated nodes), they are
         automatically moved out of quarantine and into the active DAG.
+
+### Effective Timestamp (Display Ordering)
+
+The raw `network_timestamp` on the wire may occasionally violate causal
+intuition due to legitimate clock skew (e.g., a reply timestamped *before* its
+parent). Clients compute an **effective timestamp** for monotonic UI rendering
+without contaminating protocol logic:
+
+$$T_{eff}(N) = \max\bigl(N.\text{network\_timestamp},\; \max_{P \in \text{parents}(N)} T_{eff}(P)\bigr)$$
+
+-   **Presentation-Layer Only**: `effective_timestamp` is used exclusively for
+    display ordering and MUST NOT be used for any protocol-level decision
+    (quarantine evaluation, key expiration, rotation triggers, `expires_at`
+    checks, or Median Consensus input). All protocol logic uses the raw
+    `network_timestamp` or $T_{net}$.
+-   **Bounded Ratchet**: The effective timestamp can drift at most 10 minutes
+    ahead of reality (due to the upper bound). It converges back to reality
+    purely because real-world time continues to advance; once true network time
+    surpasses the spoofed timestamp, new nodes naturally begin using their own
+    current, accurate timestamps.
+-   **Not Persisted**: `effective_timestamp` is computed on-the-fly from the DAG
+    structure. It does not need to be stored, transmitted, or agreed upon by
+    peers.
 
 ## 4. Usage in Merkle-Tox
 
@@ -116,10 +163,10 @@ moment of creation.
 When a client renders a conversation, it sorts nodes by:
 
 1.  **Topological Rank**: A node always appears after its parents.
-2.  **Network Time**: If nodes are concurrent (neither is a parent of the
-    other), sort by `network_timestamp`.
-3.  **Hash Tie-break**: If timestamps are identical, sort lexicographically by
-    the Blake3 `hash`.
+2.  **Effective Timestamp**: If nodes are concurrent (neither is a parent of the
+    other), sort by `effective_timestamp` (Section 3).
+3.  **Hash Tie-break**: If effective timestamps are identical, sort
+    lexicographically by the Blake3 `hash`.
 
 ## 5. Persistence
 

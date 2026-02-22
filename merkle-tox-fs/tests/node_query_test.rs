@@ -1,6 +1,6 @@
 use merkle_tox_core::dag::{
-    Content, ConversationId, LogicalIdentityPk, MerkleNode, NodeAuth, NodeHash, NodeMac, NodeType,
-    PhysicalDevicePk,
+    Content, ConversationId, Ed25519Signature, LogicalIdentityPk, MerkleNode, NodeAuth, NodeHash,
+    NodeType, PhysicalDevicePk,
 };
 use merkle_tox_core::sync::{NodeStore, SyncRange};
 use merkle_tox_core::vfs::StdFileSystem;
@@ -28,6 +28,7 @@ fn test_fs_store_get_verified_nodes_by_type() {
         authentication: NodeAuth::Signature(merkle_tox_core::dag::Ed25519Signature::from(
             [0u8; 64],
         )),
+        pow_nonce: 0,
     };
 
     let content_node = MerkleNode {
@@ -39,7 +40,8 @@ fn test_fs_store_get_verified_nodes_by_type() {
         network_timestamp: 101,
         content: Content::Text("Content".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
 
     store.put_node(&sync_key, admin_node, true).unwrap();
@@ -75,14 +77,14 @@ fn test_fs_store_get_node_hashes_in_range() {
             network_timestamp: 100 + i as i64,
             content: Content::Text(format!("Node {}", i)),
             metadata: vec![],
-            authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+            authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+            pow_nonce: 0,
         };
         hashes.push(node.hash());
         store.put_node(&sync_key, node, true).unwrap();
     }
 
     let range = SyncRange {
-        epoch: 0,
         min_rank: 3,
         max_rank: 7,
     };
@@ -102,12 +104,12 @@ fn test_fs_store_get_opaque_node_hashes() {
 
     let wire_node = merkle_tox_core::dag::WireNode {
         parents: vec![],
-        author_pk: LogicalIdentityPk::from([1u8; 32]),
-        encrypted_payload: vec![0u8; 32],
+        sender_hint: [0u8; 4],
+        encrypted_routing: vec![0u8; 40],
+        payload_data: vec![0u8; 8],
         topological_rank: 0,
-        network_timestamp: 100,
         flags: merkle_tox_core::dag::WireFlags::NONE,
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
     };
     let hash = NodeHash::from([0xDDu8; 32]);
 
@@ -133,7 +135,8 @@ fn test_fs_store_node_counts() {
         network_timestamp: 100,
         content: Content::Text("V1".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
     let n2 = MerkleNode {
         parents: vec![],
@@ -144,7 +147,8 @@ fn test_fs_store_node_counts() {
         network_timestamp: 101,
         content: Content::Text("S1".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
 
     store.put_node(&sync_key, n1, true).unwrap();

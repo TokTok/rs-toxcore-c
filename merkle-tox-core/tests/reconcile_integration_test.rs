@@ -1,5 +1,6 @@
 use merkle_tox_core::dag::{
-    Content, ConversationId, LogicalIdentityPk, MerkleNode, NodeAuth, NodeMac, PhysicalDevicePk,
+    Content, ConversationId, Ed25519Signature, LogicalIdentityPk, MerkleNode, NodeAuth,
+    PhysicalDevicePk,
 };
 use merkle_tox_core::engine::session::{Handshake, SyncSession};
 use merkle_tox_core::sync::{DecodingResult, NodeStore, SyncRange, Tier};
@@ -14,7 +15,6 @@ fn test_adaptive_tier_scaling() {
     let mut session =
         SyncSession::<Handshake>::new(conversation_id, &store, false, Instant::now()).activate(0);
     let range = SyncRange {
-        epoch: 0,
         min_rank: 0,
         max_rank: 100,
     };
@@ -50,7 +50,6 @@ fn test_iblt_fallback_logic() {
     let mut session =
         SyncSession::<Handshake>::new(conversation_id, &store, false, Instant::now()).activate(0);
     let range = SyncRange {
-        epoch: 0,
         min_rank: 0,
         max_rank: 100,
     };
@@ -83,7 +82,8 @@ fn test_sharded_reconciliation() {
         network_timestamp: 100,
         content: Content::Text("s0".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
     let node_s1 = MerkleNode {
         parents: vec![],
@@ -94,7 +94,8 @@ fn test_sharded_reconciliation() {
         network_timestamp: 100,
         content: Content::Text("s1".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
 
     store_a
@@ -150,7 +151,8 @@ fn test_full_reconciliation_loop() {
             network_timestamp: 100,
             content: Content::Text(format!("common {}", i)),
             metadata: vec![],
-            authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+            authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+            pow_nonce: 0,
         };
         store_a
             .put_node(&conversation_id, node.clone(), true)
@@ -172,7 +174,8 @@ fn test_full_reconciliation_loop() {
             network_timestamp: 100,
             content: Content::Text(format!("alice {}", i)),
             metadata: vec![],
-            authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+            authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+            pow_nonce: 0,
         };
         store_a
             .put_node(&conversation_id, node.clone(), true)
@@ -192,7 +195,8 @@ fn test_full_reconciliation_loop() {
             network_timestamp: 100,
             content: Content::Text(format!("bob {}", i)),
             metadata: vec![],
-            authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+            authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+            pow_nonce: 0,
         };
         store_b
             .put_node(&conversation_id, node.clone(), true)
@@ -207,7 +211,6 @@ fn test_full_reconciliation_loop() {
         SyncSession::<Handshake>::new(conversation_id, &store_b, false, now).activate(0);
 
     let range = SyncRange {
-        epoch: 0,
         min_rank: 0,
         max_rank: 1000,
     };
@@ -268,4 +271,83 @@ fn test_full_reconciliation_loop() {
     // Final check: both stores should have all 20 nodes
     assert_eq!(store_a.get_node_counts(&conversation_id).0, 20);
     assert_eq!(store_b.get_node_counts(&conversation_id).0, 20);
+}
+
+/// Verify that two IBLT sketches with the same key and identical contents
+/// subtract to an empty difference.
+#[test]
+fn test_iblt_keyed_sketch_decodes() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let key = [42u8; 32];
+    let cell_count = tox_reconcile::Tier::Small.cell_count();
+
+    let mut sketch_a = tox_reconcile::IbltSketch::new_keyed(cell_count, Some(key));
+    let mut sketch_b = tox_reconcile::IbltSketch::new_keyed(cell_count, Some(key));
+
+    // Insert the same hashes into both
+    let hash1 = [1u8; 32];
+    let hash2 = [2u8; 32];
+    let hash3 = [3u8; 32];
+
+    sketch_a.insert(&hash1);
+    sketch_a.insert(&hash2);
+    sketch_a.insert(&hash3);
+
+    sketch_b.insert(&hash1);
+    sketch_b.insert(&hash2);
+    sketch_b.insert(&hash3);
+
+    // Subtract b from a -- identical sets should decode to empty
+    sketch_a.subtract(&sketch_b).unwrap();
+    let (in_a_not_b, in_b_not_a, _stats) = sketch_a.decode().unwrap();
+    assert!(
+        in_a_not_b.is_empty(),
+        "Identical keyed sets should produce empty difference (a-b)"
+    );
+    assert!(
+        in_b_not_a.is_empty(),
+        "Identical keyed sets should produce empty difference (b-a)"
+    );
+}
+
+/// Verify that subtracting a keyed sketch from an unkeyed sketch (or vice versa)
+/// produces a failed or non-empty decode, since the hash positions differ.
+#[test]
+fn test_iblt_unkeyed_mismatch() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let key = [42u8; 32];
+    let cell_count = tox_reconcile::Tier::Small.cell_count();
+
+    let mut sketch_keyed = tox_reconcile::IbltSketch::new_keyed(cell_count, Some(key));
+    let mut sketch_unkeyed = tox_reconcile::IbltSketch::new_keyed(cell_count, None);
+
+    // Insert the same hashes into both
+    let hash1 = [1u8; 32];
+    let hash2 = [2u8; 32];
+
+    sketch_keyed.insert(&hash1);
+    sketch_keyed.insert(&hash2);
+
+    sketch_unkeyed.insert(&hash1);
+    sketch_unkeyed.insert(&hash2);
+
+    // Subtract -- the different key derivation should produce garbage
+    sketch_keyed.subtract(&sketch_unkeyed).unwrap();
+    let result = sketch_keyed.decode();
+
+    // Either decode fails, or it produces non-empty (incorrect) differences.
+    // The key mismatch means the XOR checksums and indices don't cancel out.
+    match result {
+        Err(_) => {} // Expected: decode failure
+        Ok((in_a, in_b, _)) => {
+            // If it somehow decodes, the sets should NOT be empty because the
+            // keyed hash positions differ
+            assert!(
+                !in_a.is_empty() || !in_b.is_empty(),
+                "Key mismatch should produce non-empty or failed decode"
+            );
+        }
+    }
 }

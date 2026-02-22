@@ -1,7 +1,27 @@
 use merkle_tox_core::ProtocolMessage;
 use merkle_tox_core::clock::{ManualTimeProvider, TimeProvider};
-use merkle_tox_core::dag::{Content, ConversationId, KConv, NodeHash, PhysicalDevicePk};
+use merkle_tox_core::dag::{
+    Content, ConversationId, KConv, NodeHash, PhysicalDevicePk, PhysicalDeviceSk,
+};
 use merkle_tox_core::engine::MerkleToxEngine;
+
+/// Creates an engine with a proper Ed25519 keypair from a seed byte.
+fn engine_with_sk(
+    seed: u8,
+    rng_seed: u64,
+    time_provider: Arc<dyn TimeProvider>,
+) -> (PhysicalDevicePk, MerkleToxEngine) {
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+    let pk = PhysicalDevicePk::from(sk.verifying_key().to_bytes());
+    let engine = MerkleToxEngine::with_sk(
+        pk,
+        pk.to_logical(),
+        PhysicalDeviceSk::from(sk.to_bytes()),
+        StdRng::seed_from_u64(rng_seed),
+        time_provider,
+    );
+    (pk, engine)
+}
 use merkle_tox_core::node::MerkleToxNode;
 use merkle_tox_core::sync::{BlobStore, NodeStore};
 use merkle_tox_core::testing::{
@@ -17,33 +37,23 @@ fn test_node_to_node_sync() {
     let time_provider = Arc::new(ManualTimeProvider::new(Instant::now(), 1000));
     let hub = Arc::new(VirtualHub::new(time_provider.clone()));
 
-    let alice_pk = PhysicalDevicePk::from([1u8; 32]);
+    let (alice_pk, alice_engine) = engine_with_sk(1, 1, time_provider.clone());
     let alice_rx = hub.register(alice_pk);
     let alice_transport = SimulatedTransport::new(alice_pk, hub.clone());
     let alice_store = InMemoryStore::new();
     let alice_node = Arc::new(Mutex::new(MerkleToxNode::new(
-        MerkleToxEngine::new(
-            alice_pk,
-            alice_pk.to_logical(),
-            StdRng::seed_from_u64(1),
-            time_provider.clone(),
-        ),
+        alice_engine,
         alice_transport,
         alice_store,
         time_provider.clone(),
     )));
 
-    let bob_pk = PhysicalDevicePk::from([2u8; 32]);
+    let (bob_pk, bob_engine) = engine_with_sk(2, 2, time_provider.clone());
     let bob_rx = hub.register(bob_pk);
     let bob_transport = SimulatedTransport::new(bob_pk, hub.clone());
     let bob_store = InMemoryStore::new();
     let bob_node = Arc::new(Mutex::new(MerkleToxNode::new(
-        MerkleToxEngine::new(
-            bob_pk,
-            bob_pk.to_logical(),
-            StdRng::seed_from_u64(2),
-            time_provider.clone(),
-        ),
+        bob_engine,
         bob_transport,
         bob_store,
         time_provider.clone(),
@@ -104,6 +114,30 @@ fn test_node_to_node_sync() {
         }
     }
 
+    // Transfer Alice's ephemeral signing keys to Bob so he can verify
+    {
+        let a = alice_node.lock().unwrap();
+        let eph_keys: Vec<_> = a
+            .engine
+            .self_ephemeral_signing_keys
+            .iter()
+            .map(|(epoch, sk)| {
+                (
+                    a.engine.self_pk,
+                    *epoch,
+                    merkle_tox_core::dag::EphemeralSigningPk::from(sk.verifying_key().to_bytes()),
+                )
+            })
+            .collect();
+        drop(a);
+        let mut b = bob_node.lock().unwrap();
+        for (sender_pk, epoch, vk) in eph_keys {
+            b.engine
+                .peer_ephemeral_signing_keys
+                .insert((sender_pk, epoch), vk);
+        }
+    }
+
     // 2. Process simulation
     let virtual_start = time_provider.now_instant();
     let virtual_timeout = Duration::from_secs(10);
@@ -143,33 +177,23 @@ fn test_node_blob_sync() {
     let time_provider = Arc::new(ManualTimeProvider::new(Instant::now(), 1000));
     let hub = Arc::new(VirtualHub::new(time_provider.clone()));
 
-    let alice_pk = PhysicalDevicePk::from([1u8; 32]);
+    let (alice_pk, alice_engine) = engine_with_sk(1, 1, time_provider.clone());
     let alice_rx = hub.register(alice_pk);
     let alice_transport = SimulatedTransport::new(alice_pk, hub.clone());
     let alice_store = InMemoryStore::new();
     let alice_node = Arc::new(Mutex::new(MerkleToxNode::new(
-        MerkleToxEngine::new(
-            alice_pk,
-            alice_pk.to_logical(),
-            StdRng::seed_from_u64(1),
-            time_provider.clone(),
-        ),
+        alice_engine,
         alice_transport,
         alice_store,
         time_provider.clone(),
     )));
 
-    let bob_pk = PhysicalDevicePk::from([2u8; 32]);
+    let (bob_pk, bob_engine) = engine_with_sk(2, 2, time_provider.clone());
     let bob_rx = hub.register(bob_pk);
     let bob_transport = SimulatedTransport::new(bob_pk, hub.clone());
     let bob_store = InMemoryStore::new();
     let bob_node = Arc::new(Mutex::new(MerkleToxNode::new(
-        MerkleToxEngine::new(
-            bob_pk,
-            bob_pk.to_logical(),
-            StdRng::seed_from_u64(2),
-            time_provider.clone(),
-        ),
+        bob_engine,
         bob_transport,
         bob_store,
         time_provider.clone(),
@@ -310,13 +334,17 @@ fn test_node_long_hibernation() {
     let alice_rx = hub.register(alice_id.device_pk);
     let alice_transport = SimulatedTransport::new(alice_id.device_pk, hub.clone());
     let alice_store = InMemoryStore::new();
-    let mut alice_engine = MerkleToxEngine::new(
+    let mut alice_engine = MerkleToxEngine::with_sk(
         alice_id.device_pk,
         alice_id.master_pk,
+        PhysicalDeviceSk::from(alice_id.device_sk.to_bytes()),
         StdRng::seed_from_u64(1),
         time_provider.clone(),
     );
     room.setup_engine(&mut alice_engine, &alice_store);
+    // Clear test ephemeral keys: the JIT SKD mechanism will distribute real keys
+    // when author_node() is used with self_sk.
+    alice_engine.peer_ephemeral_signing_keys.clear();
     let alice_node = Arc::new(Mutex::new(MerkleToxNode::new(
         alice_engine,
         alice_transport,
@@ -327,13 +355,17 @@ fn test_node_long_hibernation() {
     let bob_rx = hub.register(bob_id.device_pk);
     let bob_transport = SimulatedTransport::new(bob_id.device_pk, hub.clone());
     let bob_store = InMemoryStore::new();
-    let mut bob_engine = MerkleToxEngine::new(
+    let mut bob_engine = MerkleToxEngine::with_sk(
         bob_id.device_pk,
         bob_id.master_pk,
+        PhysicalDeviceSk::from(bob_id.device_sk.to_bytes()),
         StdRng::seed_from_u64(2),
         time_provider.clone(),
     );
     room.setup_engine(&mut bob_engine, &bob_store);
+    // Clear test ephemeral keys: the JIT SKD mechanism will distribute real keys
+    // when author_node() is used with self_sk.
+    bob_engine.peer_ephemeral_signing_keys.clear();
     let bob_node = Arc::new(Mutex::new(MerkleToxNode::new(
         bob_engine,
         bob_transport,
@@ -478,7 +510,7 @@ fn test_node_long_hibernation() {
         .store
         .get_node_counts(&room.conv_id)
         .0
-        < 12
+        < 16
     {
         if time_provider.now_instant().duration_since(start) > timeout {
             let counts = bob_node
@@ -509,6 +541,7 @@ fn test_node_long_hibernation() {
         time_provider.advance(Duration::from_millis(100));
     }
 
+    // 1 genesis + 2 admin + 1 Bob msg + 10 Alice msgs + 2 JIT SKDs = 16
     assert_eq!(
         bob_node
             .lock()
@@ -516,7 +549,7 @@ fn test_node_long_hibernation() {
             .store
             .get_node_counts(&room.conv_id)
             .0,
-        12
+        16
     );
 }
 
@@ -533,13 +566,15 @@ fn test_node_ratchet_merge() {
     let alice_rx = hub.register(alice_id.device_pk);
     let alice_transport = SimulatedTransport::new(alice_id.device_pk, hub.clone());
     let alice_store = InMemoryStore::new();
-    let mut alice_engine = MerkleToxEngine::new(
+    let mut alice_engine = MerkleToxEngine::with_sk(
         alice_id.device_pk,
         alice_id.master_pk,
+        PhysicalDeviceSk::from(alice_id.device_sk.to_bytes()),
         StdRng::seed_from_u64(1),
         tp.clone(),
     );
     room.setup_engine(&mut alice_engine, &alice_store);
+    alice_engine.peer_ephemeral_signing_keys.clear();
     let alice_node = Arc::new(Mutex::new(MerkleToxNode::new(
         alice_engine,
         alice_transport,
@@ -550,13 +585,15 @@ fn test_node_ratchet_merge() {
     let bob_rx = hub.register(bob_id.device_pk);
     let bob_transport = SimulatedTransport::new(bob_id.device_pk, hub.clone());
     let bob_store = InMemoryStore::new();
-    let mut bob_engine = MerkleToxEngine::new(
+    let mut bob_engine = MerkleToxEngine::with_sk(
         bob_id.device_pk,
         bob_id.master_pk,
+        PhysicalDeviceSk::from(bob_id.device_sk.to_bytes()),
         StdRng::seed_from_u64(2),
         tp.clone(),
     );
     room.setup_engine(&mut bob_engine, &bob_store);
+    bob_engine.peer_ephemeral_signing_keys.clear();
     let bob_node = Arc::new(Mutex::new(MerkleToxNode::new(
         bob_engine,
         bob_transport,
@@ -672,7 +709,8 @@ fn test_node_ratchet_merge() {
             .store
             .get_node_counts(&room.conv_id)
             .0;
-        if ac >= 3 && bc >= 3 {
+        // 3 setup + 2 own (JIT SKD + msg) + 2 peer (JIT SKD + msg) = 7
+        if ac >= 7 && bc >= 7 {
             break;
         }
 
@@ -722,7 +760,11 @@ fn test_node_ratchet_merge() {
         }
         node_c.unwrap()
     };
-    assert_eq!(node_c.parents.len(), 2, "Node C must have two parents");
+    assert_eq!(
+        node_c.parents.len(),
+        3,
+        "Node C must have three parents (A, B, and the setup_engine auth node)"
+    );
 
     // 6. Run simulation until Bob receives and verifies C
     let start = tp.now_instant();
@@ -733,7 +775,8 @@ fn test_node_ratchet_merge() {
             .store
             .get_node_counts(&room.conv_id)
             .0;
-        if bc >= 4 {
+        // 7 (from sync phase) + 1 node C = 8
+        if bc >= 8 {
             break;
         }
 

@@ -2,16 +2,13 @@
 
 ## Overview
 
-Merkle-Tox primarily uses a heads-based reconciliation strategy
-(`merkle-tox-sync.md`). While effective for small groups, this approach scales
-linearly with the number of concurrent branches (heads). To support large group
-chats and background synchronization of large histories, we introduce
-**Invertible Bloom Lookup Tables (IBLT)** via the `tox-reconcile` library.
+Merkle-Tox primarily uses heads-based reconciliation (`merkle-tox-sync.md`),
+which scales linearly with concurrent branches. To support large groups,
+Merkle-Tox uses **Invertible Bloom Lookup Tables (IBLT)** via `tox-reconcile`.
 
-`tox-reconcile` provides a way for two peers to identify the differences between
-their sets of message hashes in $O(1)$ or $O(D)$ communication (where $D$ is the
-number of differences), regardless of the total number of messages in the
-history.
+`tox-reconcile` identifies differences between sets of message hashes in $O(1)$
+or $O(D)$ communication (where $D$ is the number of differences), regardless of
+total history size.
 
 ## 1. Algorithm: Invertible Bloom Lookup Tables
 
@@ -20,9 +17,8 @@ set difference.
 
 ### A. Structure
 
-An IBLT "Sketch" consists of an array of **Cells**. To align with Merkle-Tox
-compact serialization, `IbltCell` is serialized as a **MessagePack Array
-(Positional)**.
+An IBLT "Sketch" consists of an array of **Cells**. `IbltCell` is serialized as
+a **MessagePack Array**.
 
 ```rust
 struct IbltCell {
@@ -37,42 +33,54 @@ struct IbltCell {
 
 #### HashSum Details
 
--   **Algorithm**: The `hash_sum` is derived from the first 8 bytes of a **Keyed
-    Blake3** hash.
--   **Context**: `"merkle-tox v1 iblt checksum"`.
--   **Execution**: While the mapping functions ($k_n$) and the `hash_sum` use
-    different contexts, they are computed in a single pass over the element ID
-    to minimize CPU overhead.
+-   **Algorithm**: The `hash_sum` is derived from the first 8 bytes of
+    `blake3::keyed_hash(K_iblt, element_id)`: `K_iblt = Blake3-KDF("merkle-tox
+    v1 iblt-conv-key", K_conv || conversation_id)`
+-   **Security**: Keying `hash_sum` with $K_{iblt}$ (derived from $K_{conv}$)
+    ensures unauthorized parties cannot precompute valid `hash_sum` values,
+    preventing external sketch poisoning.
+-   **Residual Risk**: All authorized members of a conversation share the same
+    $K_{iblt}$. An authorized-but-adversarial member can compute valid
+    `hash_sum` values for their own crafted sketches. The residual risk is
+    bounded by the per-peer CPU budget on sketch decoding (§3.C) and the
+    exponential blacklist escalation defined in `merkle-tox-sync.md`.
+-   **Execution**: The mapping functions ($k_n$) use separate public context
+    strings (e.g., `"merkle-tox v1 iblt k0"`). The `hash_sum` uses the keyed
+    hash above. Both are computed in a single pass over the element ID to
+    minimize CPU overhead.
 
 ### B. Hashing Strategy
 
-To map an ID to $K$ cells ($K=3$ or $K=4$): - We use **Keyed Blake3** for
-performance and security. - **Contexts**: Each of the $K$ mapping functions uses
-a unique context string (e.g., `"merkle-tox v1 iblt k0"`, `"merkle-tox v1 iblt
-k1"`, etc.). - This ensures independent distribution across cells without
-requiring multiple hash implementations.
+To map an ID to $K$ cells ($K=3$ or $K=4$), implementations MUST use **Keyed
+Blake3**. Each of the $K$ mapping functions uses a unique context string (e.g.,
+`"merkle-tox v1 iblt k0"`). This ensures independent distribution across cells
+using a single hash primitive.
 
 ### C. Operations
 
 -   **Insert(ID)**: Map the ID to $K$ cells (using independent hash functions)
     and increment their counts, XOR the ID into `IdSum`, and XOR the secondary
     hash into `HashSum`.
--   **Difference(SketchA, SketchB)**: Subtracting two sketches is done by
-    performing a cell-wise subtraction of `Count` and XORing `IdSum` and
-    `HashSum`. The resulting "Difference Sketch" represents the set $(A
-    \setminus B) \cup (B \setminus A)$.
--   **Peeling (Decoding)**: Iteratively find cells with a `Count` of 1 or -1.
-    -   If `Count == 1`: The `IdSum` is an element present in A but missing in
-        B.
-    -   If `Count == -1`: The `IdSum` is an element present in B but missing in
-        A.
-    -   After extracting an element, its effect is removed from all $K$ cells it
-        was mapped to.
+-   **Difference(SketchA, SketchB)**: Subtracting two sketches performs
+    cell-wise subtraction of `Count` and XORing of `IdSum` and `HashSum`. The
+    result represents the set $(A \setminus B) \cup (B \setminus A)$.
+-   **Peeling (Decoding)**: Implementations MUST use a **Queue-Based (Linear)
+    Peeling Algorithm** to guarantee O(m) worst-case CPU:
+    1.  **Seed**: Scan all $m$ cells once. Enqueue cells where `Count == ±1`.
+    2.  **Peel**: Dequeue a cell. `Count == 1` indicates an element in A but not
+        B; `Count == -1` indicates B but not A. Validate the `HashSum`. Remove
+        the element's effect from its $K$ mapped cells; enqueue any that become
+        `Count == ±1`.
+    3.  **Terminate**: The queue empties naturally. No outer retry loop exists.
+    4.  **Extracted Capacity Cap ($D_{max}$)**: If extracted elements exceed the
+        tier's $D_{max}$ (§2.B), the decoder MUST abort and return
+        `SYNC_RECON_FAIL`, bounding output size and memory.
+    5.  **Complexity**: Initial scan is O(m). Each extraction touches $K$ cells.
+        Total work is O(m + K × D), which is O(m) since D ≤ D_max ≈ m / 1.5.
 
 ## 2. Integration with Merkle-Tox
 
-IBLTs are used to augment or replace the `SYNC_HEADS` exchange in large-scale
-swarms.
+IBLTs augment or replace the `SYNC_HEADS` exchange in large-scale swarms.
 
 ### A. The `SYNC_SKETCH` Message
 
@@ -98,26 +106,28 @@ struct SyncRange {
 
 ### B. Standard Sizing Tiers
 
-To ensure wire compatibility and transport, Merkle-Tox uses fixed sizing tiers.
-A tier is selected based on the estimated difference size $D$.
+Merkle-Tox uses fixed sizing tiers. A tier is selected based on the estimated
+difference size $D$.
 
-Tier   | Cells ($m$) | Max Diff ($D$) | Wire Size | Transport Method
-:----- | :---------- | :------------- | :-------- | :-------------------------
-Tiny   | 16          | ~10            | ~700B     | Lossy Multicast (1 packet)
-Small  | 64          | ~40            | ~2.8KB    | Reliable Unicast (3 pkts)
-Medium | 256         | ~170           | ~11KB     | Reliable Unicast
-Large  | 1024        | ~680           | ~45KB     | Reliable Unicast
+Tier   | Cells ($m$) | $D_{max}$ | Wire Size | Transport Method
+:----- | :---------- | :-------- | :-------- | :-------------------------
+Tiny   | 16          | 10        | ~700B     | Lossy Multicast (1 packet)
+Small  | 64          | 40        | ~2.8KB    | Reliable Unicast (3 pkts)
+Medium | 256         | 170       | ~11KB     | Reliable Unicast
+Large  | 1024        | 680       | ~45KB     | Reliable Unicast
 
--   **Heuristic**: $m \approx 1.5 \times D$ ensures a decoding success
-    probability $> 99\%$.
+-   **Heuristic**: $m \approx 1.5 \times D_{max}$ ensures a decoding success
+    probability $> 99\%$ for legitimate sketches.
+-   **$D_{max}$ (Extracted Capacity Cap)**: The decoder MUST abort if the number
+    of extracted elements exceeds $D_{max}$ for the tier (the hard upper bound
+    enforced by the queue-based peeling algorithm, §1.C).
 -   **MTU Constraint**: Only the **Tiny** tier is guaranteed to fit within a
     single Tox custom packet (MTU ~1300B). Larger tiers require `tox-sequenced`
     reassembly.
 
 ### C. Multi-Level Reconciliation
 
-To handle cases where the number of differences exceeds the capacity of a single
-sketch:
+When differences exceed single sketch capacity:
 
 1.  **Level 0 (Heads)**: Exchange current tips (standard sync).
 2.  **Level 1 (Recent History Sketch)**: A small IBLT covering the last ~500
@@ -151,50 +161,57 @@ the set difference:
 3.  If the `Large` tier fails, the initiator SHOULD fallback to **Level 0
     (Heads-based)** sync for that specific range or shard.
 
-### C. Adaptive Proof-of-Work (PoW) Binding
+### C. Per-Peer CPU Budget (Token Bucket)
 
 To prevent Denial of Service (DoS) attacks where an attacker floods a peer with
-large, complex sketches to exhaust their CPU, Merkle-Tox uses **Adaptive
-Reconciliation PoW**:
+large sketches to exhaust their CPU, each responder enforces a **strict per-peer
+CPU budget** using a token bucket, directly capping the defender's resource
+consumption regardless of attacker behavior. No PoW challenge/response protocol
+is needed.
 
-1.  **Tiered Access**:
-    -   **Tiny/Small Tiers**: Always free to process.
-    -   **Medium/Large Tiers**: Requires a PoW solution bound to the specific
-        sync request.
-2.  **Dynamic Difficulty Consensus**:
-    -   Difficulty is not a fixed constant. Instead, peers include a
-        **Difficulty Recommendation** ($D_{rec}$) in their `Announcement` or
-        `SYNC_HEADS`.
-    -   A node calculates the **Effective Difficulty** ($D_{eff}$) as the
-        **weighted median** of all recommendations from authorized members of
-        the conversation.
-3.  **Hysteresis & Slewing**:
-    -   $D_{eff}$ can only change by **±1 bit** per 24-hour period to prevent
-        instability or "Difficulty Flapping".
-4.  **Mechanism**:
-    -   Responder sends a `RECON_POW_CHALLENGE` containing a unique nonce and
-        the current $D_{eff}$.
-    -   Initiator must solve the puzzle and reply with the solution.
-    -   This ensures that "Sketch Spamming" is computationally expensive for an
-        attacker (scaling with the group's collective experience of spam) but
-        negligible for a legitimate peer performing a deep sync.
+1.  **Budget**:
+    -   Each authorized peer is assigned a token bucket of
+        `SKETCH_CPU_BUDGET_MS` (500) milliseconds of IBLT decoding time per
+        `SKETCH_CPU_WINDOW_MS` (60,000 = 1 minute).
+    -   The bucket refills at a steady rate (≈8.3ms per second). Tokens are
+        consumed by the wall-clock time spent decoding that peer's sketches.
+2.  **Tiered Cost**:
+    -   **Tiny/Small Tiers**: Negligible decoding cost (~0.01ms). Effectively
+        free under the budget.
+    -   **Medium/Large Tiers**: Non-trivial decoding cost (~0.1–1ms). A peer
+        sending legitimate Medium sketches at normal sync intervals
+        (`RECONCILE_UNICAST_INTERVAL_MS = 300000`) consumes a negligible
+        fraction of their budget.
+3.  **Enforcement**:
+    -   Before decoding a sketch, the responder checks the sender's remaining
+        budget. If insufficient tokens remain, the responder replies with
+        `SYNC_RATE_LIMITED` (including the number of milliseconds until the
+        bucket has enough tokens) and discards the sketch without decoding.
+    -   **Rationale**: A token bucket provides a hard cap on receiver CPU
+        consumption, whereas PoW only provides a probabilistic deterrent.
+4.  **Blacklisting Integration**:
+    -   If a peer's sketches consistently fail decoding (peeling failure or
+        $D_{max}$ cap exceeded), the existing blacklist escalation
+        (`merkle-tox-sync.md` §2) applies. Blacklisted peers have their budget
+        set to zero for the blacklist duration.
+    -   This separates rate-limiting (honest peers under normal load) from
+        punishment (peers sending garbage).
 
 ## 4. Sophistication & Evolution
 
-The `tox-reconcile` crate supports the following stages of synchronization
-sophistication:
+`tox-reconcile` supports the following synchronization stages:
 
 1.  **Unicast Reconciliation**: Peer A sends a sketch to Peer B. Peer B decodes
     the difference and immediately sends the missing nodes to A.
 2.  **Multicast Gossip**: A node multicasts a small sketch to a Tox Group. All
-    group members compare it against their local state. This allows a single
-    packet to identify missing data across a 1,000-node swarm.
+    group members compare it against their local state, allowing a single packet
+    to identify missing data across a 1,000-node swarm.
 3.  **IBLT-Fountain Hybrid**: For large sets, IBLT identifies *which* hashes are
-    missing, and Fountain Coding (Erasure Coding) is used to broadcast the
-    *content* of those nodes to ensure all peers converge simultaneously without
-    redundant data transmissions.
+    missing, and Fountain Coding (Erasure Coding) broadcasts the *content* of
+    those nodes to ensure all peers converge simultaneously without redundant
+    data transmissions.
 
-## 4. Maintenance & Persistence
+## 5. Maintenance & Persistence
 
 ### A. Computational Cost
 
@@ -215,8 +232,7 @@ Hashing every message into an IBLT can be CPU-intensive for mobile devices.
 
 ### B. Storage Interfaces
 
-To avoid hard dependencies on specific database engines, `merkle-tox-core`
-provides a storage-agnostic interface for sketches.
+`merkle-tox-core` provides a storage-agnostic interface for sketches.
 
 #### `ReconciliationStore` (Sketch Index)
 
@@ -228,7 +244,7 @@ Handles the storage and retrieval of serialized IBLT sketches.
 Both `merkle-tox-sqlite` and `merkle-tox-fs` implement this trait to provide
 durable reconciliation state.
 
-## 5. Transport & Multicast Strategy
+## 6. Transport & Multicast Strategy
 
 Set reconciliation is deployed differently depending on the network context:
 
@@ -247,13 +263,24 @@ Set reconciliation is deployed differently depending on the network context:
 -   These are sent via `tox-sequenced` to ensure all fragments arrive and the
     sketch is whole before decoding.
 
-## 6. Security & Privacy
+## 7. Security & Privacy
 
 ### A. Poisoning Resistance
 
-An attacker could send a "garbage" sketch designed to make the peeling process
-consume excessive CPU.
+Mitigations against algorithmic CPU/memory poisoning:
 
--   **Protection**: The decoder enforces a strict limit on the number of peeling
-    iterations and validates the `HashSum` of every extracted ID to ensure it
-    hasn't been tampered with.
+-   **Against external/unauthorized parties**: The `hash_sum` is computed via
+    `blake3::keyed_hash(K_iblt, element_id)` where $K_{iblt}$ is derived from
+    $K_{conv}$. An external party without $K_{conv}$ cannot compute valid
+    `hash_sum` values, so any sketch they craft will fail the `HashSum`
+    validation on the first extracted element and be rejected immediately.
+-   **Against authorized members**: The mandatory **Queue-Based Peeling
+    Algorithm** (§1.C) eliminates algorithmic poisoning as an attack vector. The
+    decoder performs O(m) work regardless of sketch contents. There is no
+    iterative loop an attacker can force into worst-case behavior. The
+    **Extracted Capacity Cap** ($D_{max}$, §2.B) bounds output size per tier.
+    Together, an authorized member with full knowledge of $K_{iblt}$ cannot make
+    the decoder perform more work or allocate more memory than an honest sketch
+    of the same tier. Aggregate CPU consumption from any single peer is
+    hard-capped by the per-peer token bucket (§3.C), and persistent offenders
+    are subject to exponential blacklist escalation (see `merkle-tox-sync.md`).

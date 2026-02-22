@@ -37,16 +37,16 @@ fn test_retroactive_revocation_validation() {
         10000,
     );
 
-    let genesis_hash = room.conv_id.to_node_hash();
+    let admin_heads = store.get_admin_heads(&room.conv_id);
 
     let auth_a_node = create_admin_node(
         &room.conv_id,
         alice.master_pk,
         &alice.master_sk,
-        vec![genesis_hash],
+        admin_heads,
         ControlAction::AuthorizeDevice { cert: cert_a },
-        1,
-        1,
+        2,
+        2,
         100,
     );
     let effects = engine
@@ -68,7 +68,7 @@ fn test_retroactive_revocation_validation() {
         &admin_a.device_sk,
         vec![auth_a_node.hash()],
         ControlAction::AuthorizeDevice { cert: cert_b },
-        2,
+        3,
         1,
         200,
     );
@@ -76,6 +76,13 @@ fn test_retroactive_revocation_validation() {
         .handle_node(room.conv_id, auth_b_node.clone(), &store, None)
         .unwrap();
     merkle_tox_core::testing::apply_effects(effects, &store);
+
+    // Register device_b's test ephemeral key so its content nodes can be verified
+    merkle_tox_core::testing::register_test_ephemeral_key(
+        &mut engine,
+        &room.keys,
+        &device_b.device_pk,
+    );
 
     // 4. Device B authors 10 messages (rank 3 to 12)
     let mut pre_rev_hashes = Vec::new();
@@ -88,7 +95,7 @@ fn test_retroactive_revocation_validation() {
             device_b.device_pk,
             vec![last_hash],
             Content::Text(format!("Pre-revocation {}", i)),
-            (3 + i) as u64,
+            (4 + i) as u64, // Rank starts at 4
             (i + 1) as u64,
             1000 + i as i64,
         );
@@ -110,8 +117,8 @@ fn test_retroactive_revocation_validation() {
             target_device_pk: admin_a.device_pk,
             reason: "Compromised".to_string(),
         },
-        2,
-        2,
+        3, // Rank 3
+        3, // Seq 3
         5000,
     );
 
@@ -125,7 +132,7 @@ fn test_retroactive_revocation_validation() {
             device_b.device_pk,
             vec![last_hash],
             Content::Text(format!("Post-revocation {}", i)),
-            (13 + i) as u64,
+            (14 + i) as u64, // Rank starts at 14
             (i + 11) as u64,
             6000 + i as i64,
         );
@@ -145,13 +152,12 @@ fn test_retroactive_revocation_validation() {
     // 8. Trigger re-verification
     engine.reverify_speculative_for_conversation(room.conv_id, &store);
 
-    // 9. Verification: ALL messages following the revocation rank (Rank 2)
-    // should NO LONGER be verified, even if they were authored BEFORE
-    // the observer received the revocation.
+    // 9. Verification: Under Causal Identity, messages on a concurrent branch
+    // that do not have the revocation in their causal history remain verified.
     for h in pre_rev_hashes.iter().chain(post_rev_hashes.iter()) {
         assert!(
-            !store.is_verified(h),
-            "Message {} should be invalidated due to retroactive revocation of its issuer's parent",
+            store.is_verified(h),
+            "Message {} should REMAIN verified because the revocation is not in its causal history",
             hex::encode(h.as_bytes())
         );
     }
@@ -180,11 +186,11 @@ fn test_malicious_snapshot_poisoning() {
         alice.master_pk,
         &alice.master_sk,
         vec![room.conv_id.to_node_hash()],
-        ControlAction::Snapshot {
+        ControlAction::Snapshot(merkle_tox_core::dag::SnapshotData {
             basis_hash: room.conv_id.to_node_hash(),
             members: vec![], // EMPTY members list!
             last_seq_numbers: vec![],
-        },
+        }),
         1,
         1,
         1000,

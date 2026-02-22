@@ -5,7 +5,7 @@ use crate::engine::{Effect, EngineStore, MerkleToxEngine};
 use crate::error::MerkleToxResult;
 use crate::sync::{BlobStore, DecodingResult, NodeStore, Tier};
 use crate::{NodeEvent, ProtocolMessage};
-use tracing::debug;
+use tracing::{debug, info};
 
 impl MerkleToxEngine {
     /// Handles an incoming protocol message from a peer.
@@ -191,6 +191,8 @@ impl MerkleToxEngine {
                             }
                             _ => None,
                         };
+                        let k_iblt =
+                            keys.map(|k| crate::crypto::derive_k_iblt(&k.k_conv, &conv_id));
 
                         process_sketch(
                             s,
@@ -201,6 +203,7 @@ impl MerkleToxEngine {
                                 cache: &self.pending_cache,
                             },
                             keys,
+                            k_iblt,
                             &mut effects,
                         )?;
                     }
@@ -252,17 +255,45 @@ impl MerkleToxEngine {
                             store,
                             cache: &self.pending_cache,
                         };
+                        let k_iblt = match self.conversations.get(&conv_id) {
+                            Some(crate::engine::Conversation::Established(em)) => em
+                                .get_keys(em.current_epoch())
+                                .map(|k| crate::crypto::derive_k_iblt(&k.k_conv, &conv_id)),
+                            _ => None,
+                        };
                         let different = s.handle_sync_shard_checksums(shards, &overlay)?;
                         for range in different {
                             if let Some(tier) = s.get_iblt_tier(&range) {
                                 effects.push(Effect::SendPacket(
                                     sender_pk,
                                     ProtocolMessage::SyncSketch(
-                                        s.make_sync_sketch(range, tier, &overlay)?,
+                                        s.make_sync_sketch_keyed(range, tier, &overlay, k_iblt)?,
                                     ),
                                 ));
                             }
                         }
+                    }
+                }
+            }
+            ProtocolMessage::SyncRateLimited { .. } => {
+                // TODO: Apply backoff for this peer based on retry_after_ms
+            }
+            ProtocolMessage::KeywrapAck {
+                keywrap_hash,
+                recipient_pk,
+            } => {
+                // Release KeyWrap Pending state for the conversation whose
+                // KeyWrap matches this ACK.
+                if let Some(pending) = self.keywrap_pending.remove(&keywrap_hash) {
+                    if pending.recipient_pk == recipient_pk {
+                        debug!(
+                            "KeywrapAck received from {:?} for {:?}",
+                            sender_pk,
+                            hex::encode(keywrap_hash.as_bytes()),
+                        );
+                    } else {
+                        // Mismatch: put it back
+                        self.keywrap_pending.insert(keywrap_hash, pending);
                     }
                 }
             }
@@ -299,6 +330,8 @@ impl MerkleToxEngine {
                             }
                             _ => None,
                         };
+                        let k_iblt =
+                            keys.map(|k| crate::crypto::derive_k_iblt(&k.k_conv, &conversation_id));
 
                         process_sketch(
                             session,
@@ -309,6 +342,7 @@ impl MerkleToxEngine {
                                 cache: &self.pending_cache,
                             },
                             keys,
+                            k_iblt,
                             &mut effects,
                         )?;
                     }
@@ -337,15 +371,9 @@ impl MerkleToxEngine {
                         }
 
                         // 2. Fallback: pack the node on the fly
-                        if let Some(node) = overlay.get_node(&hash)
-                            && let Some(crate::engine::Conversation::Established(em)) =
-                                self.conversations.get(&conv_id)
-                        {
-                            let keys = em.get_keys(em.current_epoch()).cloned();
-
-                            if let Some(keys) = keys
-                                && let Ok(wire_node) = node.pack_wire(&keys, true)
-                            {
+                        if let Some(node) = overlay.get_node(&hash) {
+                            let pack_keys = crate::crypto::PackKeys::Exception;
+                            if let Ok(wire_node) = node.pack_wire(&pack_keys, true) {
                                 effects.push(Effect::SendPacket(
                                     sender_pk,
                                     ProtocolMessage::MerkleNode {
@@ -380,37 +408,82 @@ impl MerkleToxEngine {
                         overlay.put_wire_node(&conv_id, &hash, wire_node.clone())?;
                     }
 
-                    if let Some(crate::engine::Conversation::Established(em)) =
-                        self.conversations.get(&conv_id)
+                    // Try exception (cleartext) unpack first: covers Admin, KeyWrap, etc.
+                    if !wire_node.flags.contains(crate::dag::WireFlags::ENCRYPTED)
+                        && let Ok(mut node) =
+                            crate::dag::MerkleNode::unpack_wire_exception(&wire_node)
                     {
-                        let candidate_devices = self
+                        // unpack_wire_exception sets author_pk = sender_pk.to_logical(),
+                        // which is only correct for admin nodes. For SKD/KeyWrap/HistoryExport
+                        // nodes, sender_pk is a device key and author_pk should be the
+                        // corresponding master (logical) key. Resolve via identity_manager.
+                        let all_senders = self
                             .identity_manager
-                            .list_authorized_devices_for_author(conv_id, wire_node.author_pk);
-                        unpacked = em.unpack_node(&wire_node, &candidate_devices);
-                    }
-                    if let Some(node) = unpacked {
-                        let node_effects = self.handle_node(conv_id, node, store, blob_store)?;
-                        effects.extend(node_effects);
-                    } else {
-                        // Admin nodes can be unpacked without keys because they aren't encrypted.
-                        if matches!(wire_node.authentication, crate::dag::NodeAuth::Signature(_)) {
-                            let dummy_keys = crate::crypto::ConversationKeys::derive(
-                                &crate::dag::KConv::from([0u8; 32]),
-                            );
-                            if let Ok(node) =
-                                crate::dag::MerkleNode::unpack_wire(&wire_node, &dummy_keys)
-                            {
-                                let node_effects =
-                                    self.handle_node(conv_id, node, store, blob_store)?;
-                                effects.extend(node_effects);
-                                return Ok(effects);
-                            }
+                            .list_all_authorized_sender_pairs(conv_id);
+                        if let Some((_, logical_pk)) =
+                            all_senders.iter().find(|(d, _)| *d == node.sender_pk)
+                        {
+                            node.author_pk = *logical_pk;
                         }
+                        unpacked = Some(node);
+                    }
 
+                    // For encrypted content nodes, use sender identification
+                    if unpacked.is_none()
+                        && let Some(crate::engine::Conversation::Established(em)) =
+                            self.conversations.get(&conv_id)
+                    {
+                        let mut all_senders = self
+                            .identity_manager
+                            .list_all_authorized_sender_pairs(conv_id);
+                        // Also try the network-level sender as a candidate
+                        if !all_senders.iter().any(|(d, _)| *d == sender_pk) {
+                            all_senders.push((sender_pk, sender_pk.to_logical()));
+                        }
+                        unpacked = em.identify_sender_and_unpack(&wire_node, &all_senders);
+                    }
+
+                    if let Some(node) = unpacked {
+                        // Use handle_node_internal_ext directly (not handle_node)
+                        // to avoid clearing the pending cache. The wire node was
+                        // stored in the cache above and must remain accessible
+                        // for encrypt-then-sign verification.
+                        let node_effects =
+                            self.handle_node_internal_ext(conv_id, node, store, blob_store, true)?;
+                        effects.extend(node_effects);
+                        // Remove from opaque tracking if it was previously stored
+                        if let Some((total, entries)) = self.opaque_store_usage.get_mut(&conv_id)
+                            && let Some(pos) = entries.iter().position(|(h, _, _)| *h == hash)
+                        {
+                            *total -= entries[pos].1;
+                            entries.swap_remove(pos);
+                        }
+                    } else {
                         debug!(
                             "Failed to unpack wire node: {}",
                             hex::encode(hash.as_bytes())
                         );
+                        // Track opaque store usage for quota enforcement
+                        let wire_size = wire_node.payload_data.len()
+                            + wire_node.encrypted_routing.len()
+                            + wire_node.parents.len() * 32;
+                        let now_ms = self.clock.network_time_ms();
+                        let (total, entries) = self
+                            .opaque_store_usage
+                            .entry(conv_id)
+                            .or_insert_with(|| (0, Vec::new()));
+                        *total += wire_size;
+                        entries.push((hash, wire_size, now_ms));
+                        // Evict oldest entries when quota is exceeded
+                        while *total > tox_proto::constants::OPAQUE_STORE_QUOTA
+                            && !entries.is_empty()
+                        {
+                            // Sort by timestamp ascending to evict oldest first
+                            entries.sort_by_key(|&(_, _, ts)| ts);
+                            let (evicted_hash, evicted_size, _) = entries.remove(0);
+                            *total -= evicted_size;
+                            effects.push(Effect::DeleteWireNode(conv_id, evicted_hash));
+                        }
                         if let Some(PeerSession::Active(session)) =
                             self.sessions.get_mut(&(sender_pk, conv_id))
                         {
@@ -503,6 +576,100 @@ impl MerkleToxEngine {
                     }
                 }
             }
+            ProtocolMessage::ReinclusionRequest {
+                conversation_id,
+                sender_pk: requester_pk,
+                healing_snapshot_hash,
+            } => {
+                // Verify: snapshot exists and is verified, self is admin, requester
+                // was in the snapshot's member list.
+                let now_ms = self.clock.network_time_ms();
+                let ctx = crate::identity::CausalContext::global();
+                let is_admin = self.identity_manager.is_admin(
+                    &ctx,
+                    conversation_id,
+                    &self.self_pk,
+                    &self.self_pk.to_logical(),
+                    now_ms,
+                    u64::MAX,
+                );
+                if is_admin {
+                    if let Some(snapshot_node) = store.get_node(&healing_snapshot_hash)
+                        && store.is_verified(&healing_snapshot_hash)
+                    {
+                        // Validate that the requester appears in the snapshot's member list.
+                        let requester_in_snapshot = if let crate::dag::Content::Control(
+                            crate::dag::ControlAction::AnchorSnapshot { data, .. },
+                        ) = &snapshot_node.content
+                        {
+                            data.members
+                                .iter()
+                                .any(|m| m.public_key == requester_pk.to_logical())
+                        } else {
+                            false
+                        };
+
+                        if !requester_in_snapshot {
+                            debug!("Reinclusion rejected: requester not in snapshot member list");
+                            effects.push(Effect::SendPacket(
+                                sender_pk,
+                                ProtocolMessage::ReinclusionResponse {
+                                    conversation_id,
+                                    accepted: false,
+                                },
+                            ));
+                        } else {
+                            // Issue a fresh KeyWrap via rotate_conversation_key
+                            match self.rotate_conversation_key(conversation_id, store) {
+                                Ok(rotation_effects) => {
+                                    effects.extend(rotation_effects);
+                                    effects.push(Effect::SendPacket(
+                                        sender_pk,
+                                        ProtocolMessage::ReinclusionResponse {
+                                            conversation_id,
+                                            accepted: true,
+                                        },
+                                    ));
+                                }
+                                Err(e) => {
+                                    debug!("Reinclusion rotation failed: {}", e);
+                                    effects.push(Effect::SendPacket(
+                                        sender_pk,
+                                        ProtocolMessage::ReinclusionResponse {
+                                            conversation_id,
+                                            accepted: false,
+                                        },
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        effects.push(Effect::SendPacket(
+                            sender_pk,
+                            ProtocolMessage::ReinclusionResponse {
+                                conversation_id,
+                                accepted: false,
+                            },
+                        ));
+                    }
+                }
+            }
+            ProtocolMessage::ReinclusionResponse {
+                conversation_id,
+                accepted,
+            } => {
+                if accepted {
+                    info!(
+                        "Reinclusion accepted for conversation {:?}",
+                        conversation_id
+                    );
+                } else {
+                    debug!(
+                        "Reinclusion rejected for conversation {:?}",
+                        conversation_id
+                    );
+                }
+            }
         }
 
         Ok(effects)
@@ -514,35 +681,31 @@ fn process_sketch(
     sender_pk: PhysicalDevicePk,
     sketch: tox_reconcile::SyncSketch,
     store: &dyn NodeStore,
-    keys: Option<&crate::crypto::ConversationKeys>,
+    _keys: Option<&crate::crypto::ConversationKeys>,
+    k_iblt: Option<[u8; 32]>,
     effects: &mut Vec<Effect>,
 ) -> MerkleToxResult<()> {
-    match session.handle_sync_sketch(sketch.clone(), store)? {
+    match session.handle_sync_sketch_keyed(sketch.clone(), store, k_iblt)? {
         DecodingResult::Success {
             missing_locally: _,
             missing_remotely,
         } => {
             for hash in missing_remotely {
-                if let Some(node) = store.get_node(&hash) {
-                    let wire_node = if let Some(keys) = keys {
-                        node.pack_wire(keys, true).ok()
-                    } else if node.node_type() == crate::dag::NodeType::Admin
-                        || matches!(node.content, crate::dag::Content::KeyWrap { .. })
-                    {
-                        // For Admin nodes we still use dummy keys because they are plaintext
-                        let dummy_keys = crate::crypto::ConversationKeys::derive(
-                            &crate::dag::KConv::from([0u8; 32]),
-                        );
-                        node.pack_wire(&dummy_keys, true).ok()
-                    } else {
-                        debug!(
-                            "Cannot pack node {} without keys",
-                            hex::encode(hash.as_bytes())
-                        );
-                        None
-                    };
-
-                    if let Some(wire_node) = wire_node {
+                // Prefer cached wire nodes; fall back to exception packing
+                if let Some(wire_node) = store.get_wire_node(&hash) {
+                    effects.push(Effect::SendPacket(
+                        sender_pk,
+                        ProtocolMessage::MerkleNode {
+                            conversation_id: sketch.conversation_id,
+                            hash,
+                            node: wire_node,
+                        },
+                    ));
+                } else if let Some(node) = store.get_node(&hash) {
+                    // Re-pack as exception (cleartext): content nodes should have
+                    // been stored as wire nodes when first authored/received.
+                    let pack_keys = crate::crypto::PackKeys::Exception;
+                    if let Ok(wire_node) = node.pack_wire(&pack_keys, true) {
                         debug!(
                             "Sending node {} as result of sketch",
                             hex::encode(hash.as_bytes())

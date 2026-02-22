@@ -64,6 +64,7 @@ struct ConversationContext<F: FileSystem> {
 struct JournalNodeInfo {
     node_type: NodeType,
     rank: u64,
+    admin_distance: u16,
     sender_pk: PhysicalDevicePk,
     sequence_number: u64,
     verified: bool,
@@ -198,7 +199,11 @@ impl<F: FileSystem> FsStore<F> {
                         0x02
                     },
                     status,
-                    flags: 0,
+                    admin_distance: ctx
+                        .volatile_nodes
+                        .get(&node_hash)
+                        .map(|i| i.admin_distance)
+                        .unwrap_or(0),
                 });
             } else if rec.record_type == JournalRecordType::RatchetAdvance {
                 let (hash, key, epoch): (NodeHash, ChainKey, u64) =
@@ -429,11 +434,40 @@ impl<F: FileSystem> ConversationContext<F> {
                         .map_err(|e| io::Error::other(e.to_string()))?;
                     let (status, node) = decoded;
                     let node_hash = node.hash();
+
+                    let mut admin_distance = 0u16;
+                    if node.node_type() == merkle_tox_core::dag::NodeType::Content {
+                        let mut min_dist = u64::MAX;
+                        for parent in &node.parents {
+                            let dist = if let Some(info) = self.volatile_nodes.get(parent) {
+                                Some(info.admin_distance as u64)
+                            } else {
+                                let mut found = None;
+                                for pack in &self.packs {
+                                    if let Some(record) = pack.index.lookup(parent) {
+                                        found = Some(record.admin_distance as u64);
+                                        break;
+                                    }
+                                }
+                                found
+                            };
+                            if let Some(d) = dist {
+                                min_dist = min_dist.min(d);
+                            }
+                        }
+                        if min_dist != u64::MAX {
+                            admin_distance = (min_dist + 1).min(u16::MAX as u64) as u16;
+                        } else {
+                            admin_distance = u16::MAX;
+                        }
+                    }
+
                     self.volatile_nodes.insert(
                         node_hash,
                         JournalNodeInfo {
                             node_type: node.node_type(),
                             rank: node.topological_rank,
+                            admin_distance,
                             sender_pk: node.sender_pk,
                             sequence_number: node.sequence_number,
                             verified: status == 0x01,
@@ -511,6 +545,23 @@ impl<F: FileSystem> NodeLookup for FsStore<F> {
         for pack in &ctx.packs {
             if let Some(record) = pack.index.lookup(hash) {
                 return Some(record.rank);
+            }
+        }
+        None
+    }
+
+    fn get_admin_distance(&self, hash: &NodeHash) -> Option<u64> {
+        let inner = self.inner.read();
+        let conv_id = inner.node_to_conv.get(hash)?;
+        let ctx = inner.conversations.get(conv_id)?;
+
+        if let Some(info) = ctx.volatile_nodes.get(hash) {
+            return Some(info.admin_distance as u64);
+        }
+
+        for pack in &ctx.packs {
+            if let Some(record) = pack.index.lookup(hash) {
+                return Some(record.admin_distance as u64);
             }
         }
         None
@@ -665,6 +716,34 @@ impl<F: FileSystem> NodeStore for FsStore<F> {
         let status = if verified { 0x01u8 } else { 0x02u8 };
         let payload = tox_proto::serialize(&(status, node.clone()))?;
 
+        let mut admin_distance = 0u16;
+        if node.node_type() == NodeType::Content {
+            let mut min_dist = u64::MAX;
+            let ctx = inner.conversations.get(conversation_id).unwrap();
+            for parent in &node.parents {
+                let dist = if let Some(info) = ctx.volatile_nodes.get(parent) {
+                    Some(info.admin_distance as u64)
+                } else {
+                    let mut found = None;
+                    for pack in &ctx.packs {
+                        if let Some(record) = pack.index.lookup(parent) {
+                            found = Some(record.admin_distance as u64);
+                            break;
+                        }
+                    }
+                    found
+                };
+                if let Some(d) = dist {
+                    min_dist = min_dist.min(d);
+                }
+            }
+            if min_dist != u64::MAX {
+                admin_distance = (min_dist + 1).min(u16::MAX as u64) as u16;
+            } else {
+                admin_distance = u16::MAX;
+            }
+        }
+
         {
             let ctx = inner.conversations.get_mut(conversation_id).unwrap();
             ctx.lock_file.try_lock_exclusive().map_err(|_| {
@@ -679,6 +758,7 @@ impl<F: FileSystem> NodeStore for FsStore<F> {
                 JournalNodeInfo {
                     node_type: node.node_type(),
                     rank: node.topological_rank,
+                    admin_distance,
                     sender_pk: node.sender_pk,
                     sequence_number: node.sequence_number,
                     verified,

@@ -42,12 +42,14 @@ rust_library(
         "@crates//:bitflags",
         "@crates//:blake3",
         "@crates//:chacha20",
+        "@crates//:chacha20poly1305",
         "@crates//:crossbeam",
         "@crates//:curve25519-dalek",
         "@crates//:ed25519-dalek",
         "@crates//:fs2",
         "@crates//:hex",
         "@crates//:hkdf",
+        "@crates//:lru",
         "@crates//:parking_lot",
         "@crates//:rand",
         "@crates//:rmp-serde",
@@ -65,10 +67,18 @@ rust_library(
 
 TEST_SRCS = glob(["tests/*.rs"])
 
+# Tests that mine many PoW nonces need more than the "small" 60s short-timeout.
+_POW_HEAVY_TESTS = [
+    "tests/engine_integration_test.rs",
+    "tests/adversarial_convergence_test.rs",
+    "tests/key_management_test.rs",
+    "tests/protocol_flows_test.rs",
+]
+
 [
     rust_test(
         name = src.replace("tests/", "").replace(".rs", "").replace("_", "-"),
-        size = "small",
+        size = "medium" if src in _POW_HEAVY_TESTS else "small",
         srcs = [src],
         edition = "2024",
         rustc_flags = ["-Clink-arg=-fuse-ld=bfd"],
@@ -79,6 +89,8 @@ TEST_SRCS = glob(["tests/*.rs"])
             "//rs-toxcore-c/tox-reconcile",
             "@crates//:bao",
             "@crates//:blake3",
+            "@crates//:chacha20",
+        "@crates//:chacha20poly1305",
             "@crates//:curve25519-dalek",
             "@crates//:ed25519-dalek",
             "@crates//:hex",

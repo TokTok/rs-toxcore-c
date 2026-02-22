@@ -34,18 +34,32 @@ impl TestHarness {
 
     pub fn add_tox(&mut self) {
         let index = self.toxes.len() as u32;
-        let logger = TestLogger { index };
 
-        let mut opts = Options::new().unwrap();
-        opts.set_ipv6_enabled(true);
-        opts.set_local_discovery_enabled(false);
-        let port = 43445 + index as u16 * 2;
-        opts.set_start_port(port);
-        opts.set_end_port(port + 10);
-        opts.set_tcp_port(port);
-        opts.set_logger(logger);
+        let mut tox = None;
+        let mut port = 43445 + index as u16 * 10;
 
-        let tox = Tox::new(opts).unwrap();
+        for _ in 0..100 {
+            let logger = TestLogger { index };
+            let mut opts = Options::new().unwrap();
+            opts.set_ipv6_enabled(true);
+            opts.set_local_discovery_enabled(false);
+            opts.set_start_port(port);
+            opts.set_end_port(port);
+            opts.set_tcp_port(port);
+            opts.set_logger(logger);
+
+            match Tox::new(opts) {
+                Ok(t) => {
+                    tox = Some(t);
+                    break;
+                }
+                Err(_) => {
+                    port += 1;
+                }
+            }
+        }
+
+        let tox = tox.expect("Failed to allocate a port for Tox");
         self.toxes.push(ToxEntry { tox, group: None });
     }
 

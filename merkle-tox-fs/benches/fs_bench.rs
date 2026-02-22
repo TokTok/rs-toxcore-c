@@ -1,6 +1,6 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use merkle_tox_core::dag::{
-    Content, ConversationId, LogicalIdentityPk, MerkleNode, NodeAuth, NodeHash, NodeMac,
+    Content, ConversationId, Ed25519Signature, LogicalIdentityPk, MerkleNode, NodeAuth, NodeHash,
     PhysicalDevicePk,
 };
 use merkle_tox_core::sync::{BlobStore, NodeStore};
@@ -20,7 +20,8 @@ fn make_node(i: u64) -> MerkleNode {
         network_timestamp: i as i64,
         content: Content::Text(format!("Message number {}", i)),
         metadata: vec![0; 64],
-        authentication: NodeAuth::Mac(NodeMac::from([2; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     }
 }
 
@@ -119,6 +120,7 @@ fn bench_blob_ops(c: &mut Criterion) {
         status: BlobStatus::Pending,
         received_mask: None,
         bao_root: None,
+        decryption_key: None,
     };
     store.put_blob_info(info).unwrap();
 

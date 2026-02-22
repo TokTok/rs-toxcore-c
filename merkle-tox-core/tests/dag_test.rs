@@ -1,5 +1,5 @@
 use merkle_tox_core::dag::{
-    Content, LogicalIdentityPk, MerkleNode, NodeAuth, NodeHash, NodeMac, PhysicalDevicePk,
+    Content, Ed25519Signature, LogicalIdentityPk, MerkleNode, NodeAuth, NodeHash, PhysicalDevicePk,
 };
 
 #[test]
@@ -13,7 +13,8 @@ fn test_node_hashing() {
         network_timestamp: 123456789,
         content: Content::Text("Hello Merkle-Tox".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
 
     let hash1 = node.hash();
@@ -34,7 +35,8 @@ fn test_node_serialization_roundtrip() {
         network_timestamp: 987654321,
         content: Content::Text("Roundtrip test".to_string()),
         metadata: vec![1, 2, 3],
-        authentication: NodeAuth::Mac(NodeMac::from([4u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
 
     let serialized = tox_proto::serialize(&node).expect("Failed to serialize");

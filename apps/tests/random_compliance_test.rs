@@ -1,7 +1,7 @@
 use merkle_tox_core::cas::{BlobInfo, BlobStatus, CHUNK_SIZE};
 use merkle_tox_core::dag::{
-    Content, ConversationId, KConv, LogicalIdentityPk, MerkleNode, NodeAuth, NodeHash, NodeMac,
-    PhysicalDevicePk,
+    Content, ConversationId, Ed25519Signature, KConv, LogicalIdentityPk, MerkleNode, NodeAuth,
+    NodeHash, PhysicalDevicePk,
 };
 use merkle_tox_core::testing::{ManagedStore, delegate_store};
 use merkle_tox_core::vfs::MemFileSystem;
@@ -215,7 +215,8 @@ fn test_store_random_compliance() {
                     network_timestamp: 1000 + i as i64,
                     content: Content::Text(format!("Node {}", i)),
                     metadata: vec![],
-                    authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+                    authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+                    pow_nonce: 0,
                 };
                 let hash = node.hash();
                 for s in &stores {
@@ -277,6 +278,7 @@ fn test_store_random_compliance() {
                     bao_root: None,
                     status: BlobStatus::Pending,
                     received_mask: None,
+                    decryption_key: None,
                 };
                 for s in &stores {
                     s.put_blob_info(info.clone()).unwrap();

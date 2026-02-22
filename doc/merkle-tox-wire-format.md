@@ -2,9 +2,8 @@
 
 ## Overview
 
-Merkle-Tox uses **MessagePack** as its primary serialization format for all
-non-trivial data structures. This provides a balance between binary efficiency,
-speed, and developer ergonomics.
+Merkle-Tox uses **MessagePack** as its primary serialization format for
+non-trivial data structures.
 
 ## 1. Serialization Standard: MessagePack
 
@@ -14,17 +13,13 @@ the `ToxProto` derive macro.
 
 ### Wire Efficiency (Arrays vs. Maps)
 
-To minimize the overhead within the limited ~1.3KB Tox packet size, Merkle-Tox
-strictly uses **MessagePack Arrays** (positional serialization) for the wire
-format.
+To minimize overhead within the ~1.3KB Tox packet MTU, Merkle-Tox strictly uses
+**MessagePack Arrays** (positional serialization).
 
--   **Rust Representation**: Named structs and enums are used in the code for
-    clarity.
--   **Wire Representation**: Fields are serialized in the order they are defined
-    in the Rust struct. Field names are NOT included in the binary stream.
--   **Implementation**: This is enforced by using `#[derive(ToxProto)]` on all
-    protocol structures. The `tox-proto::serialize` and `tox-proto::deserialize`
-    functions should be used as the primary entry points.
+-   **Rust Representation**: Named structs and enums are used in code.
+-   **Wire Representation**: Fields are serialized in definition order. Field
+    names are omitted.
+-   **Implementation**: Enforced via `#[derive(ToxProto)]`.
 
 ## 2. Transport Layer Framing (`tox-sequenced`)
 
@@ -64,11 +59,41 @@ MessagePack-encoded object.
 2.  **Payload Data**: The positional array representing the actual message
     content.
 
+### WireNode Field Index
+
+The `WireNode` is a MessagePack positional array with the following fields. The
+`authentication` field (field 8) covers fields 1–7 via EphemeralSignature or
+Signature.
+
+| Index | Field               | Type           | Notes                    |
+| :---- | :------------------ | :------------- | :----------------------- |
+| 1     | `parents`           | `Vec<[u8;32]>` | Parent node hashes       |
+| 2     | `sender_hint`       | `[u8; 4]`      | Per-message              |
+:       :                     :                : ratchet-derived hint;    :
+:       :                     :                : opaque to relays         :
+| 3     | `encrypted_routing` | `Vec<u8>`      | Encrypted                |
+:       :                     :                : `[sequence_number]`      :
+:       :                     :                : (cleartext `[sender_pk,  :
+:       :                     :                : seq]` for Admin nodes)   :
+| 4     | `payload_data`      | `Vec<u8>`      | Encrypted and/or         |
+:       :                     :                : compressed content       :
+| 5     | `topological_rank`  | `u64`          | Covered by               |
+:       :                     :                : authenticator;           :
+:       :                     :                : relay-manipulation-proof :
+| 6     | `flags`             | `u32`          | Covered by               |
+:       :                     :                : authenticator;           :
+:       :                     :                : relay-manipulation-proof :
+| 7     | `authentication`    | `NodeAuth`     | EphemeralSignature       |
+:       :                     :                : (content) or Signature   :
+:       :                     :                : (admin/keywrap)          :
+
+See `merkle-tox-dag.md` for the canonical signature input definition and
+`merkle-tox-deniability.md` for key derivations.
+
 ## 4. Optimized Binary Handling
 
-To ensure cryptographic data (hashes, keys, signatures) and payloads are
-serialized as MessagePack **Binary** types rather than arrays of integers, the
-following rules MUST be followed:
+To serialize cryptographic data and payloads as MessagePack **Binary** types
+rather than integer arrays, these rules MUST be followed:
 
 ### `serde_bytes` for Dynamic Buffers
 
@@ -77,8 +102,7 @@ encrypted payloads, or file chunks MUST be serialized as MessagePack **Binary**
 types.
 
 -   **Why**: Without this, Serde serializes `Vec<u8>` as a MessagePack Array of
-    individual integers, adding significant overhead (1-2 bytes per byte of
-    data).
+    individual integers, adding significant overhead.
 -   **Automatic Handling**: The `#[derive(ToxProto)]` macro automatically
     detects `Vec<u8>` and `&[u8]` fields and applies the `serde_bytes`
     optimization. Manually adding `#[serde(with = "serde_bytes")]` is not
@@ -113,20 +137,22 @@ struct AdminNode {
 
 ## 6. Message Padding (Anti-Traffic Analysis)
 
-To mitigate side-channel leaks where an observer can guess the message content
-based on its exact length (e.g., distinguishing between "Yes" and "No"),
-Merkle-Tox implements **Power-of-2 Padding**.
+To mitigate side-channel leaks where an observer guesses message content based
+on exact length, Merkle-Tox implements **Power-of-2 Padding**.
 
 ### Padding Rule
 
 Before encryption and serialization into a `WireNode`, the sensitive metadata
 and content fields are logically combined into a single buffer.
 
-1.  **Bundle Structure**: Because Header Encryption separates routing info,
-    padding is applied to the `payload_data` block: `[network_timestamp (8B),
-    content (MsgPack), metadata (MsgPack)]`.
+1.  **Bundle Structure**: Padding is applied to the `payload_data` block only:
+    `[network_timestamp (8B), content (MsgPack), metadata (MsgPack)]`. The
+    `sender_hint` (field 3) and `encrypted_routing` (field 4) are **not**
+    included in the padded bundle; they have fixed and bounded sizes
+    respectively and do not benefit from padding.
 2.  **Target Sizes**: The reassembled payload MUST be padded to the next power
-    of 2: 128, 256, 512, 1024, 2048, or 4096 bytes.
+    of 2 (128, 256, 512, ..., up to `MAX_MESSAGE_SIZE`). The minimum padded size
+    is 128 bytes; the maximum is bounded by `MAX_MESSAGE_SIZE` (1MB).
 3.  **Scheme**: Merkle-Tox uses **ISO/IEC 7816-4** padding:
     -   A single `0x80` byte is appended to the data.
     -   `0x00` bytes are appended until the target power-of-2 boundary is
@@ -134,16 +160,19 @@ and content fields are logically combined into a single buffer.
 4.  **Removal**: Upon decryption, the recipient finds the last `0x80` byte and
     truncates the buffer at that point to recover the original content.
 
-**IMPORTANT**: Padding is a property of the **Wire Format** only. It is **not**
-included in the serialization used to calculate a node's `hash()`. This ensures
-that hash verification is consistent regardless of the transport-level padding
-or compression used.
+**IMPORTANT**: Padding is applied to the plaintext **before** encryption. The
+resulting `payload_data` ciphertext (which embeds the padding) is what appears
+in the `WireNode` and is covered by both the authenticator and the
+content-addressable hash. Because ChaCha20 encryption MUST use a random 12-byte
+nonce per message (see `merkle-tox-deniability.md`), the final ciphertext and
+resulting `WireNode` hash will be randomized every time a message is encrypted,
+even if the underlying padded plaintext is identical.
 
 ### Implementation
 
 Padding is applied in the `merkle-tox-core` library within the `pack_wire`
-function and removed in `unpack_wire`. This ensures that all content stored in
-the CAS and sent over the wire is uniform in size.
+function and removed in `unpack_wire`, ensuring content stored in the CAS and
+sent over the wire is uniform in size.
 
 ## 7. Schema Evolution & Versioning
 

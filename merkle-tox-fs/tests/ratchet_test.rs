@@ -1,5 +1,6 @@
 use merkle_tox_core::dag::{
-    ChainKey, ConversationId, LogicalIdentityPk, MerkleNode, NodeAuth, NodeMac, PhysicalDevicePk,
+    ChainKey, ConversationId, Ed25519Signature, LogicalIdentityPk, MerkleNode, NodeAuth,
+    PhysicalDevicePk,
 };
 use merkle_tox_core::sync::NodeStore;
 use merkle_tox_core::vfs::StdFileSystem;
@@ -25,7 +26,8 @@ fn test_ratchet_checkpoints_persistence() {
         network_timestamp: 100,
         content: merkle_tox_core::dag::Content::Text("Trigger".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
     let hash = node.hash();
     store.put_node(&conv_id, node, true).unwrap();

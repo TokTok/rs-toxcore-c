@@ -17,7 +17,7 @@ pub struct IndexRecord {
     pub payload_length: u32,
     pub node_type: u8,
     pub status: u8,
-    pub flags: u8,
+    pub admin_distance: u16,
 }
 
 impl IndexRecord {
@@ -29,8 +29,7 @@ impl IndexRecord {
         buf[48..52].copy_from_slice(&self.payload_length.to_le_bytes());
         buf[52] = self.node_type;
         buf[53] = self.status;
-        buf[54] = self.flags;
-        buf[55] = 0; // Reserved
+        buf[54..56].copy_from_slice(&self.admin_distance.to_le_bytes());
     }
 
     pub fn from_bytes(buf: &[u8]) -> Self {
@@ -42,7 +41,7 @@ impl IndexRecord {
         let payload_length = u32::from_le_bytes(buf[48..52].try_into().unwrap());
         let node_type = buf[52];
         let status = buf[53];
-        let flags = buf[54];
+        let admin_distance = u16::from_le_bytes(buf[54..56].try_into().unwrap());
         Self {
             hash: NodeHash::from(hash),
             offset,
@@ -50,7 +49,7 @@ impl IndexRecord {
             payload_length,
             node_type,
             status,
-            flags,
+            admin_distance,
         }
     }
 }

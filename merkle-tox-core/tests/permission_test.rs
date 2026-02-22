@@ -46,9 +46,18 @@ fn test_permission_denied_message() {
         Permissions::ADMIN,
         2000000000000,
     );
+    let ctx = merkle_tox_core::identity::CausalContext::global();
     engine
         .identity_manager
-        .authorize_device(sync_key, alice_master_pk, &cert, 1000, 0)
+        .authorize_device(
+            &ctx,
+            sync_key,
+            alice_master_pk,
+            &cert,
+            1000,
+            0,
+            merkle_tox_core::dag::NodeHash::from([0u8; 32]),
+        )
         .unwrap();
 
     // Try to send a message (Unauthorized sender_pk)
@@ -108,9 +117,18 @@ fn test_permission_granted_message() {
         Permissions::MESSAGE,
         2000000000000,
     );
+    let ctx = merkle_tox_core::identity::CausalContext::global();
     engine
         .identity_manager
-        .authorize_device(sync_key, alice_master_pk, &cert, 1000, 0)
+        .authorize_device(
+            &ctx,
+            sync_key,
+            alice_master_pk,
+            &cert,
+            1000,
+            0,
+            merkle_tox_core::dag::NodeHash::from([0u8; 32]),
+        )
         .unwrap();
 
     // Try to send a message
@@ -159,12 +177,22 @@ fn test_revocation_enforcement() {
         Permissions::MESSAGE | Permissions::ADMIN,
         2000000000000,
     );
+    let ctx = merkle_tox_core::identity::CausalContext::global();
     engine
         .identity_manager
-        .authorize_device(sync_key, alice_master_pk, &cert, 1000, 0)
+        .authorize_device(
+            &ctx,
+            sync_key,
+            alice_master_pk,
+            &cert,
+            1000,
+            0,
+            merkle_tox_core::dag::NodeHash::from([0u8; 32]),
+        )
         .unwrap();
 
     assert!(engine.identity_manager.is_authorized(
+        &ctx,
         sync_key,
         &alice_device_pk,
         &alice_master_pk,
@@ -194,6 +222,7 @@ fn test_revocation_enforcement() {
 
     // 3. Verify Alice's device is no longer authorized
     assert!(!engine.identity_manager.is_authorized(
+        &ctx,
         sync_key,
         &alice_device_pk,
         &alice_master_pk,
@@ -242,10 +271,13 @@ fn test_self_authorization() {
 
     // This should work because handle_node has a special case for AuthorizeDevice
     let effects = engine
-        .handle_node(sync_key, auth_node, &store, None)
+        .handle_node(sync_key, auth_node.clone(), &store, None)
         .unwrap();
     assert!(merkle_tox_core::testing::is_verified_in_effects(&effects));
+    let mut ctx = merkle_tox_core::identity::CausalContext::global();
+    ctx.admin_ancestor_hashes.insert(auth_node.hash());
     assert!(engine.identity_manager.is_authorized(
+        &ctx,
         sync_key,
         &alice_device_pk,
         &alice_master_pk,
@@ -372,9 +404,18 @@ fn test_unauthorized_leave_bug() {
         Permissions::ADMIN | Permissions::MESSAGE,
         2000000000000,
     );
+    let ctx = merkle_tox_core::identity::CausalContext::global();
     engine
         .identity_manager
-        .authorize_device(sync_key, alice_master_pk, &alice_cert, 1000, 0)
+        .authorize_device(
+            &ctx,
+            sync_key,
+            alice_master_pk,
+            &alice_cert,
+            1000,
+            0,
+            merkle_tox_core::dag::NodeHash::from([0u8; 32]),
+        )
         .unwrap();
 
     // Authorize Bob's device (Member only, NO ADMIN)
@@ -384,9 +425,18 @@ fn test_unauthorized_leave_bug() {
         Permissions::MESSAGE,
         2000000000000,
     );
+    let ctx = merkle_tox_core::identity::CausalContext::global();
     engine
         .identity_manager
-        .authorize_device(sync_key, bob_master_pk, &bob_cert, 1000, 0)
+        .authorize_device(
+            &ctx,
+            sync_key,
+            bob_master_pk,
+            &bob_cert,
+            1000,
+            0,
+            merkle_tox_core::dag::NodeHash::from([0u8; 32]),
+        )
         .unwrap();
 
     // 2. Bob tries to kick Alice using Leave(Alice_PK)
@@ -440,9 +490,18 @@ fn test_authorized_self_leave() {
         Permissions::MESSAGE, // No ADMIN
         2000000000000,
     );
+    let ctx = merkle_tox_core::identity::CausalContext::global();
     engine
         .identity_manager
-        .authorize_device(sync_key, alice_master_pk, &alice_cert, 1000, 0)
+        .authorize_device(
+            &ctx,
+            sync_key,
+            alice_master_pk,
+            &alice_cert,
+            1000,
+            0,
+            merkle_tox_core::dag::NodeHash::from([0u8; 32]),
+        )
         .unwrap();
 
     // Alice leaves the room

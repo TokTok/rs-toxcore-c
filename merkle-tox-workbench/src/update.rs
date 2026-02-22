@@ -347,6 +347,7 @@ fn tick(model: &mut Model, dt: Duration) -> Vec<Cmd> {
                         bao_root: None, // No Bao for simple sim
                         status: BlobStatus::Available,
                         received_mask: None,
+                        decryption_key: None,
                     };
                     let _ = seeder.node.store.put_blob_info(info);
                     for i in 0..(data.len() as u64 / CHUNK_SIZE) {

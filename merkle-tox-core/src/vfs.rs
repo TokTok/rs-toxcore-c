@@ -206,7 +206,6 @@ impl FileSystem for MemFileSystem {
     }
     fn remove_dir(&self, path: &Path) -> io::Result<()> {
         let mut inner = self.inner.write().unwrap();
-        // Only remove if empty
         let is_empty = !inner.files.keys().any(|p| p.starts_with(path))
             && !inner.dirs.keys().any(|p| p.starts_with(path) && p != path);
         if is_empty {

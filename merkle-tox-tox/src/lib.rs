@@ -6,6 +6,7 @@ use merkle_tox_core::{ProtocolMessage, Transport, TransportError};
 use parking_lot::ReentrantMutex;
 use std::sync::Arc;
 use std::time::Instant;
+use tox_proto::PhysicalDeviceSk;
 use toxcore::tox::Tox;
 use toxcore::tox::events::Event;
 use toxcore::types::PublicKey as ToxPublicKey;
@@ -47,13 +48,21 @@ pub struct ToxMerkleBridge<S: NodeStore + BlobStore> {
 
 impl<S: NodeStore + BlobStore> ToxMerkleBridge<S> {
     pub fn new(tox: Tox, store: S) -> Self {
-        let self_pk = PhysicalDevicePk::from(tox.public_key().0);
+        let tox_sk = tox.secret_key();
+        // Derive an Ed25519 identity from the Tox X25519 secret key.
+        // MerkleTox uses Ed25519 for protocol identity (signing), while Tox
+        // uses X25519 for transport. The transport address (Tox PK) and the
+        // protocol identity (Ed25519 PK) are independent.
+        let self_pk = PhysicalDevicePk::from(
+            merkle_tox_core::crypto::ed25519_public_key_from_seed(&tox_sk),
+        );
         let transport = ToxTransport {
             tox: Arc::new(ReentrantMutex::new(tox)),
         };
-        let engine = merkle_tox_core::engine::MerkleToxEngine::new(
+        let engine = merkle_tox_core::engine::MerkleToxEngine::with_sk(
             self_pk,
             self_pk.to_logical(),
+            PhysicalDeviceSk::from(tox_sk),
             rand::SeedableRng::from_entropy(),
             Arc::new(merkle_tox_core::clock::SystemTimeProvider),
         );

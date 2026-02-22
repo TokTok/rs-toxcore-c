@@ -63,3 +63,26 @@ pub const MAX_VERIFIED_NODES_PER_DEVICE: u64 = 1000;
 
 /// The minimum size of the padding bin for encrypted payloads to prevent traffic analysis.
 pub const MIN_PADDING_BIN: usize = 128;
+
+/// Maximum number of devices a single logical identity may have authorized
+/// in a single conversation. Prevents resource exhaustion via delegation spam.
+pub const MAX_DEVICES_PER_IDENTITY: usize = 32;
+
+/// Maximum byte size of a single MerkleNode's serialized content + metadata.
+/// 1 MiB provides ample room for text and blob references while capping
+/// memory consumption for in-flight nodes.
+pub const MAX_MESSAGE_SIZE: usize = 1_048_576;
+
+/// Maximum byte budget for the Opaque Wire Node store (per-conversation).
+/// Nodes that cannot be decrypted yet are held in this store; once the quota
+/// is exceeded the oldest entries are evicted.
+pub const OPAQUE_STORE_QUOTA: usize = 100 * 1024 * 1024;
+
+/// Maximum number of X3DH handshakes (KeyWrap decryptions consuming our
+/// ephemeral keys) before the device must publish a fresh Announcement.
+pub const MAX_HANDSHAKES_PER_ANNOUNCEMENT: u32 = 100;
+
+/// Trust-restored devices (healed by AnchorSnapshot) must receive a fresh
+/// KeyWrap within this window, otherwise they are downgraded to permanent
+/// observer mode.
+pub const TRUST_RESTORED_EXPIRY_MS: i64 = 30 * 24 * 60 * 60 * 1000; // 2,592,000,000

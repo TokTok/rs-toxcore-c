@@ -1,7 +1,6 @@
 # Merkle-Tox File-Based Storage Specification (v1)
 
-This document defines a production-quality, filesystem-based storage format for
-Merkle-Tox.
+This document defines a filesystem-based storage format for Merkle-Tox.
 
 ## Design Principles
 
@@ -73,16 +72,16 @@ the file:
     crash-safe atomicity on modern flash storage.
 2.  **Journal Updates**: Updates to `journal.bin` **MUST** use `lseek(EOF)` +
     `write()`.
-3.  **Durability Barrier**: `fsync()` calls MAY be deferred and coalesced (see
-    Section 9). However, a full durability barrier **MUST** be completed before
-    `state.bin` is updated.
+3.  **Durability Barrier**: `fsync()` calls MAY be deferred and coalesced
+    (§8.1). A full durability barrier MUST complete before `state.bin` is
+    updated.
 
 --------------------------------------------------------------------------------
 
 ## 3. Concurrency & Locking
 
-To prevent "lost updates" and data corruption when multiple threads or processes
-access the same storage root, the following locking strategy is mandated:
+To prevent lost updates when multiple threads or processes access the storage
+root, the following locking strategy is mandated:
 
 ### 3.1. Thread-Level Concurrency (Same Process)
 
@@ -96,7 +95,7 @@ Implementations **MUST** use **advisory file locking** (`flock` on Linux/POSIX,
 
 1.  **Global Lock (`/storage/.lock`):** Acquired in **Shared Mode** (`LOCK_SH`)
     for general operations and **Exclusive Mode** (`LOCK_EX`) for global
-    maintenance (like pruning orphans).
+    maintenance.
 2.  **Conversation Lock (`/conversations/[conv_id]/.lock`):**
     *   **Shared Mode (`LOCK_SH`):** Required for reading `state.bin`,
         `ratchet.bin`, or the `index.idx`.
@@ -119,24 +118,21 @@ When updating metadata (like adding a new head to `state.bin`):
 
 ### 4.1. The Journal (Hot Tier)
 
-To avoid the overhead of small files and multiple locking bottlenecks, all "Hot"
-conversation events are multiplexed into the single `journal.bin`.
+All "Hot" conversation events are multiplexed into the single `journal.bin`.
 
 *   **Format:** `[JournalHeader] [Array<FramedRecord>] [OptionalFooter]`
 *   **JournalHeader (16 bytes):** `[u64 generation_id] [u64 reserved]`
 *   **FramedRecord:** `[u32 length] [u8[32] hash] [u8 type] [Payload]`
     *   **Type 0x01 (Node):** Hash is `blake3(Payload)`. Payload is `MsgPack([u8
         status, MerkleNode])`.
-    *   **Type 0x02 (Vouch):** Hash is `blake3(Payload)`. Payload is
-        `MsgPack([PhysicalDevicePk])`.
-    *   **Type 0x03 (Blacklist):** Hash is `blake3(Payload)`. Payload is
+    *   **Type 0x02 (Blacklist):** Hash is `blake3(Payload)`. Payload is
         `MsgPack([Pk target, String reason])`.
-    *   **Type 0x04 (Promotion):** Hash is `blake3(Payload)`. Payload is
+    *   **Type 0x03 (Promotion):** Hash is `blake3(Payload)`. Payload is
         `MsgPack([NodeHash target])`.
-    *   **Type 0x05 (Ratchet Advance):** Hash is `blake3(Payload)`. Payload is
+    *   **Type 0x04 (Ratchet Advance):** Hash is `blake3(Payload)`. Payload is
         `MsgPack([NodeHash trigger, u64 sequence_number])`.
         *   Note: To preserve Forward Secrecy, `journal.bin` MUST NEVER store
-            raw `chain_key`s. The `trigger` node hash is used to look up the
+            raw `chain_key`s. The `trigger` node hash identifies the
             `sender_pk`. Upon startup, the engine rebuilds the key cache in RAM
             by stepping the ratchet forward from the last compacted checkpoint
             up to this `sequence_number`.
@@ -144,22 +140,27 @@ conversation events are multiplexed into the single `journal.bin`.
     record_count] [u8[32] journal_checksum] [IndexTable]`
     *   **Write Path**: The footer **SHOULD NOT** be written for every append.
         It is appended only during a **Clean Shutdown** or a **Coalesced
-        Durability Barrier** (Section 9.1).
+        Durability Barrier** (Section 8.1).
     *   **IndexTable:** An array of `[u8 type] [u8[32] hash] [u32 offset] [u8
         final_status]` for each record.
 *   **Startup (The Fast Path):**
-    1.  Read `state.bin` to get the `active_journal_id`.
-    2.  Open `journal.bin` and read the `generation_id`. If they mismatch,
-        truncate the journal immediately (Idempotency).
-    3.  Seek to the end and check for a valid `Tail-Commit Footer` (`0x454E4421`
-        -   "END!").
-    4.  Verify the `journal_checksum` (Blake3 hash of all records).
-    5.  If valid, **immediately populate** the in-memory Node Index (using
-        `final_status`), Vouch Registry, and Local Blacklist using the
-        `IndexTable`.
-    6.  **Cleanup**: Before appending new records to the journal, the
-        implementation **MUST** `ftruncate()` the file to remove the footer and
-        restore the append-only record stream.
+    1.  Read `state.bin` to get `active_journal_id`.
+    2.  **Staged Journal Recovery**: Check for `journal.bin.new`:
+        *   If `generation_id` matches `active_journal_id`, a previous
+            compaction committed `state.bin` but crashed before replacing the
+            journal. **Rename** `journal.bin.new` → `journal.bin`.
+        *   If `generation_id` mismatches, a compaction crashed before
+            committing. **Delete** `journal.bin.new`.
+    3.  Open `journal.bin`. If its `generation_id` mismatches
+        `active_journal_id`, fall back to **Deterministic Walking** and salvage
+        uncompacted records.
+    4.  Seek to the end and check for a valid `Tail-Commit Footer`
+        (`0x454E4421`).
+    5.  Verify `journal_checksum` (Blake3 hash of all records).
+    6.  If valid, populate the in-memory Node Index and Local Blacklist using
+        the `IndexTable`.
+    7.  **Cleanup**: Before appending new records, `ftruncate()` the file to
+        remove the footer.
 *   **Recovery (Deterministic Walking):**
     1.  If the footer is missing or invalid (e.g., after a crash), fall back to
         **Deterministic Walking** (starting at offset 16).
@@ -167,8 +168,8 @@ conversation events are multiplexed into the single `journal.bin`.
     3.  Verify `blake3(Payload) == hash`.
     4.  If valid:
         *   For Type 0x01: Add node to index with its initial status.
-        *   For Type 0x04: Update existing node status to Verified.
-        *   For Type 0x05: Update volatile ratchet state.
+        *   For Type 0x03: Update existing node status to Verified.
+        *   For Type 0x04: Update volatile ratchet state.
         *   Move to the next record.
     5.  If invalid (hash mismatch or EOF), **stop and truncate** the journal at
         this boundary. No searching or scavenging is performed.* **Note on Data
@@ -176,12 +177,10 @@ conversation events are multiplexed into the single `journal.bin`.
         the corruption are discarded locally. The Merkle-Tox protocol will
         automatically re-sync these missing nodes from peers.
 *   **Compaction**: When the journal is merged into the Cold Tier, only **Node**
-    records are packed. Valid vouches and blacklists are carried forward into
-    the new journal generation.
+    records are packed. Blacklist records are carried forward into
+    `journal.bin.new` (see Section 6.1 for the staged commit protocol).
 
 --------------------------------------------------------------------------------
-
-## 5. Compaction (Incremental)
 
 ### 4.2. The Packed Tier (Cold Tier)
 
@@ -236,36 +235,45 @@ To find an object by `hash`:
 
 ### 4.3. The Opaque Tier (Undecryptable)
 
-Nodes that cannot yet be decrypted are stored in the `opaque/` directory as raw
-`WireNode` MessagePack objects.
+Nodes that cannot be decrypted are stored in `opaque/` as raw `WireNode`
+MessagePack objects.
 
 *   **Segments:** Nodes are appended to the current segment file (e.g.,
     `0001.bin`). When a segment reaches 10MB, a new one is created.
 *   **Opaque Index (`index.bin`)**: To prevent duplicate processing, the
     implementation maintains a sorted binary index of all nodes in the opaque
     tier.
-    *   **Format**: Sorted Array of `[u8[32] hash, u32 segment_id, u32 offset]`
-        records.
+    *   **Format**: Sorted Array of `[u8[32] hash, u32 segment_id, u32 offset,
+        u8[32] voucher_pk]` records (72 bytes each).
+    *   **`voucher_pk`**: The Ed25519 public key of the peer who first vouched
+        for this node. Recorded at write time. Used on startup to distinguish
+        legitimately vouched nodes from potential junk before peers reconnect.
     *   **Lookup**: Binary search ($O(\log N)$).
-*   **Eviction (Root Carry-Forward):** If the total size of the `opaque/`
-    directory exceeds 100MB, the implementation prepares to delete the oldest
-    segment.
+*   **Eviction (Bounded Root Carry-Forward):** If the total size of the
+    `opaque/` directory exceeds 100MB, the implementation prepares to delete the
+    oldest segment.
     1.  **Check Locks**: Skip any segment that has an active **Promotion Lock**
         (e.g., `0001.bin.lock`).
     2.  **Scan**: Perform a single linear scan of the segment about to be
         deleted.
-    3.  **Promote**: Any **Admin** or **KeyWrap** nodes (the "Anchors") found in
-        the segment **MUST** be re-appended to the newest segment.
-    4.  **Delete**: Once the anchors are preserved, delete the old segment.
+    3.  **Check Anchor Quota**: Calculate the total byte size of all currently
+        unverified Admin/KeyWrap nodes in the entire Opaque Store.
+    4.  **Promote (Bounded)**: If the total size is *below* the **Global Anchor
+        Quota** (`MAX_UNVERIFIED_ADMIN_BYTES = 20971520` or 20MB), any **Admin**
+        or **KeyWrap** nodes (the "Anchors") found in the segment **MUST** be
+        re-appended to the newest segment. If the quota is full, the
+        Carry-Forward rule is suspended and the anchors are allowed to drop,
+        preventing an attacker from permanently wedging the buffer with fake
+        anchors while safely absorbing legitimate large `AnchorSnapshot` nodes.
+    5.  **Delete**: Once the anchors are either preserved or dropped, delete the
+        old segment.
 *   **Promotion Lock**: Before the engine begins a "Promotion Flow" (decrypting
     an opaque segment), it **MUST** create an advisory lock file
-    (segment_id.lock) in the `opaque/` directory. This file SHOULD contain the
-    current PID.
+    (segment_id.lock) in the `opaque/` directory containing the current PID.
 *   **Stale Lock Recovery**: On startup, any lock files referencing dead PIDs
     MUST be deleted.
-*   **Deadlock Prevention:** This ensures that both the root of trust (keys) and
-    nodes currently being processed are never evicted, while still effectively
-    purging large volumes of unreadable history.
+*   **Deadlock Prevention:** This ensures root trust keys and nodes currently
+    being processed are never evicted.
 *   **Promotion (to Hot Tier):** Upon successful decryption, a node is read from
     its opaque segment, promoted to a `MerkleNode`, and written to the **Journal
     (Hot Tier)**.
@@ -288,17 +296,9 @@ cross-conversation deduplication.
 
 --------------------------------------------------------------------------------
 
-## 5. Compaction & Maintenance
+## 5. Storage Files
 
-Compaction moves data from the Journal to the Cold Tier. Unlike a full re-pack,
-this process is **incremental** and does not require reading historical data.
-See Section 7 for details.
-
---------------------------------------------------------------------------------
-
-## 6. Storage Files
-
-### 6.1. Conversation State (`state.bin`)
+### 5.1. Conversation State (`state.bin`)
 
 Serialized as a single **MessagePack Positional Array**:
 
@@ -309,46 +309,77 @@ Serialized as a single **MessagePack Positional Array**:
 5.  `active_packs`: `Array<u64>` (List of pack IDs)
 6.  `active_journal_id`: `u64` (Must match journal.bin header)
 
-### 6.2. Ratchet Checkpoints (`ratchet.bin`)
+### 5.2. Ratchet Checkpoints (`ratchet.bin`)
 
 To provide a stable surface for long-term forensic security and fast startup,
 the **final** ratchet state of each sender is checkpointed to a fixed-size table
 during compaction.
 
-*   **Format:** A fixed-width header followed by $N$ slots. Each slot stores the
-    `PhysicalDevicePk`, `ChainKey`, and `last_sequence_number`.
+*   **Format:** A fixed-width header followed by two sections:
+    1.  **Chain Table**: $N$ fixed-width slots. Each slot stores the
+        `PhysicalDevicePk` (32B), `ChainKey` (32B), and `last_sequence_number`
+        (u64).
+    2.  **Skipped Key Cache**: A variable-length array of skipped message key
+        entries, each containing: `PhysicalDevicePk` (32B), `sequence_number`
+        (u64), `K_msg_i` (32B), `cached_at_ms` (i64). Entries whose age exceeds
+        `RATCHET_CACHE_TTL_MS` (86400000) MUST be omitted during writes. The
+        array is prefixed with a `u32` entry count.
 *   **Update Frequency**: Updated during every **Coalesced Durability Barrier**
     (defined by `DURABILITY_SYNC_MS = 2000` or `DURABILITY_SYNC_MESSAGES = 20`,
-    see Section 9.1) using the standard "Write-to-Temp + Fsync + Rename"
+    see Section 8.1) using the standard "Write-to-Temp + Fsync + Rename"
     pattern. Waiting until Compaction would defeat Forward Secrecy by leaving
     old keys on disk.
-*   **Source of Truth**: On startup, the implementation loads the checkpoint
-    from `ratchet.bin` and then **rebuilds** the hot state by stepping the
-    ratchet forward for each sender based on the `Ratchet Advance` (Type 0x05)
-    sequence numbers recorded in `journal.bin`. This preserves Forward Secrecy
-    on disk while providing $O(1)$ lookups in memory.
+*   **Source of Truth**: On startup, the implementation loads both the Chain
+    Table and the Skipped Key Cache from `ratchet.bin`, then **rebuilds** the
+    hot state by stepping the ratchet forward for each sender based on the
+    `Ratchet Advance` (Type 0x04) sequence numbers recorded in `journal.bin`.
+    Skipped keys from the cache are loaded into the in-memory cache with their
+    original `cached_at_ms` timestamps (expired entries are discarded), ensuring
+    that delayed out-of-order messages arriving after a restart can still be
+    decrypted using their cached $K_{msg, i}$.
+*   **Size Bound**: The Skipped Key Cache is bounded by `MAX_RATCHET_SKIPS`
+    (2000) entries per sender. At 80 bytes per entry, the worst-case overhead
+    for a 100-sender conversation is ~15.6MB (acceptable for the 24-hour TTL
+    window).
 
-### 6.3. Permissions Cache (`permissions.bin`)
+### 5.3. Permissions Cache (`permissions.bin`)
 
 Serialized as a **MessagePack Positional Array** of entries:
 
-*   **Format**: `Array<[PhysicalDevicePk, [u32 perms, i64 expiry, u64 rank]]>`
-*   **Incremental Advancement**: The cache is tagged with the
-    `latest_admin_rank`. When new Admin nodes are synced, the implementation
-    incrementally updates this cache. It **MUST NOT** perform a full re-scan of
-    history unless the cache is corrupted.
+*   **Format**: Maps an **Admin Frontier** to an `Array<[PhysicalDevicePk, [u32
+    perms, i64 expiry, u64 rank]]>` representing the exact Effective Permissions
+    state at that topological point.
+*   **Incremental Advancement**: The cache key is the **Admin Frontier**
+    (represented as a lexicographically sorted array of the concurrent Admin
+    node hashes). A single scalar like `latest_admin_rank` MUST NOT be used
+    because it cannot uniquely represent the causal state of a branching DAG.
+    -   **$O(1)$ Hot-Path**: Content nodes simply look up their computed
+        Frontier in this cache.
+    -   **State Merge**: If the computed Frontier is missing from the cache
+        (e.g., a new merge of concurrent branches), the engine dynamically
+        computes the merged state using the **Admin Seniority** rules from
+        `merkle-tox-identity.md`, caches the resulting array under the new
+        Frontier key, and proceeds. It **MUST NOT** perform a full re-scan of
+        history unless the cache is corrupted.
 *   **Snapshot Optimization:** If an **Anchor Snapshot** is received, the
-    implementation MAY use the snapshot's member list to reset the cache,
-    skipping all preceding history and immediately advancing the
-    `latest_admin_rank` to the snapshot rank.
+    implementation MAY use the snapshot's member list to instantly instantiate a
+    new cached Frontier containing only the Snapshot's hash, skipping all
+    preceding history and immediately advancing the baseline.
 
-### 6.4. Vouch Registry
+### 5.4. Vouch Registry
 
-The Vouch Registry is no longer a separate file. It is a **Volatile Index**
-rebuilt by scanning the **Journal** (Section 4.1). This eliminates a global
-locking bottleneck and improves write performance.
+The Vouch Registry has two layers:
 
-### 6.5. Blacklist Registries
+1.  **Persistence Layer (Opaque Index)**: Each opaque node's index record
+    includes the `voucher_pk` of the peer who first vouched for it (§4.3),
+    surviving app restarts and allowing the eviction policy to distinguish
+    legitimately vouched nodes from junk.
+2.  **Runtime Layer (In-Memory)**: The bounded voucher set per hash
+    (`MAX_VOUCHERS_PER_HASH = 3`) used for multi-peer request routing is
+    maintained purely in memory and rebuilt from `SYNC_HEADS` exchanges upon
+    reconnection. The data is ephemeral and not persisted.
+
+### 5.5. Blacklist Registries
 
 1.  **Global Blacklist (`/storage/blacklist.bin`):** Stores system-wide bans
     (e.g., globally malicious devices). Updated via the **Global Lock**.
@@ -357,12 +388,12 @@ locking bottleneck and improves write performance.
         **Journal** (Type 0x03).
     *   **Cold Path**: During compaction, these bans are moved into the **Index
         Record Flags** (Section 4.2.2) of all nodes authored by the banned
-        device. This enables $O(1)$ rejection during history lookups without
-        extra files.
+        device, enabling $O(1)$ rejection during history lookups without extra
+        files.
     *   **Note**: Local bans authored via the protocol (e.g., by a group admin)
         MUST be validated against the DAG before being applied to the journal.
 
-### 6.6. Conversation Keys (`/keys/`)
+### 5.6. Conversation Keys (`/keys/`)
 
 To support historical decryption after group key rotations, implementations
 **MUST** persist the conversation keys ($K_{conv}$) for each generation.
@@ -370,9 +401,9 @@ To support historical decryption after group key rotations, implementations
 *   **Format**: `[generation_hex].key` containing exactly 32 bytes of raw key
     data.
 *   **Security**: These keys **MUST** be treated with the same forensic care as
-    Ratchet Keys (Section 8).
+    Ratchet Keys (Section 7).
 
-### 6.7. Reconciliation Sketches (`/sketches/`)
+### 5.7. Reconciliation Sketches (`/sketches/`)
 
 To optimize synchronization, serialized sketches (like IBLTs) MAY be cached.
 
@@ -381,36 +412,45 @@ To optimize synchronization, serialized sketches (like IBLTs) MAY be cached.
 *   **Volatility**: Sketches are considered cache data and MAY be deleted safely
     at any time to reclaim space.
 
-## 7. Compaction & Maintenance
+## 6. Compaction & Maintenance
 
 To ensure UI responsiveness, implementations **MUST** minimize the duration of
 the Exclusive Lock. Maintenance follows the **Shadow Write Pattern**:
 
-### 7.1. Incremental Compaction (Journal to Cold Tier)
+### 6.1. Incremental Compaction (Journal to Cold Tier)
 
 1.  **Shadow Write**: Read all records from `journal.bin` (using `LOCK_SH`).
     *   Promote **Node** records to `packs/[id].pack`.
-    *   **Vouch Pruning**: Discard any `Vouch` records for nodes that are now
-        `VERIFIED`.
     *   **Ratchet Checkpoint**: Capture the **final** `ChainKey` and
         `last_sequence_number` for each sender found in the journal.
-    *   **Carry Forward**: Retain only `Vouch` and `Blacklist` records for
-        currently active speculative nodes.
+    *   **Carry Forward**: Retain only `Blacklist` records that are still
+        active.
     *   Write the new pack and index files to disk and `fsync()`.
-2.  **Commit (Brief LOCK_EX)**:
+2.  **Commit (Staged, Brief LOCK_EX)**:
     *   Acquire `LOCK_EX`.
-    *   Atomic Switch: Update `state.bin` with the new pack ID and a new
-        `active_journal_id`.
-    *   Reclaim: Truncate `journal.bin` to 16 bytes (the header) and write the
-        new generation ID.
+    *   **Re-scan**: Walk the journal from the shadow-read end-offset to the
+        current EOF. If new records were appended between the `LOCK_SH` read and
+        the `LOCK_EX` acquisition, append them to the pack and `fsync()`.
+    *   **Stage**: Write `journal.bin.new` with the new `generation_id` (N+1)
+        and carry-forward records only. `fsync()` the file.
+    *   **Commit Point**: Atomically update `state.bin` with the new pack ID and
+        `active_journal_id = N+1` (write-temp + fsync + rename), representing
+        the single point of no return.
+    *   **Finalize**: Rename `journal.bin.new` → `journal.bin`, replacing the
+        old journal whose records are now fully in the cold tier.
     *   Release `LOCK_EX`.
+    *   **Crash Safety**: If a crash occurs before the Commit Point, `state.bin`
+        is unchanged and `journal.bin.new` is an orphan (cleaned up on next
+        startup). If a crash occurs between the Commit Point and Finalize,
+        startup detects `journal.bin.new` with the matching generation and
+        completes the rename (Section 4.1, Startup step 2).
 
-### 7.2. Housekeeping (Pack Merging)
+### 6.2. Housekeeping (Pack Merging)
 
 When merging multiple large packs to optimize lookups:
 
 1.  **Shadow Write**: Read existing packs and write a new merged
-    `packs/[new_id].pack` and index. This may take seconds and is done
+    `packs/[new_id].pack` and index. The operation may take seconds and is done
     **without** an exclusive lock.
 2.  **Commit (Brief LOCK_EX)**:
     *   Acquire `LOCK_EX`.
@@ -423,13 +463,13 @@ update (~1ms), regardless of history size.
 
 --------------------------------------------------------------------------------
 
-## 8. Security Considerations
+## 7. Security Considerations
 
-### 8.1. Forensic Erasure of Ratchet Keys
+### 7.1. Forensic Erasure of Ratchet Keys
 
-Standard file deletion or overwriting (shredding) is often ineffective on modern
-SSDs due to Wear Leveling and the Flash Translation Layer (FTL). To ensure that
-old `ChainKeys` cannot be recovered forensically:
+Standard file deletion or overwriting is often ineffective on modern SSDs due to
+Wear Leveling and the Flash Translation Layer (FTL). To ensure old `ChainKeys`
+cannot be recovered:
 
 1.  **System-Level Encryption**: It is strongly RECOMMENDED to store the
     Merkle-Tox storage root on a filesystem with Full Disk Encryption (FDE) or
@@ -444,12 +484,12 @@ old `ChainKeys` cannot be recovered forensically:
 
 --------------------------------------------------------------------------------
 
-## 9. Performance & Flash Endurance
+## 8. Performance & Flash Endurance
 
-To minimize I/O bottlenecks and extend flash lifespan on mobile devices,
-implementations SHOULD employ the following optimizations:
+To minimize I/O bottlenecks and extend flash lifespan, implementations SHOULD
+employ the following optimizations:
 
-### 9.1. Transactional Coalescing (Amortized Syncing)
+### 8.1. Transactional Coalescing (Amortized Syncing)
 
 Implementations SHOULD NOT call `fsync()` for every individual message in
 high-throughput scenarios. Instead, they should coalesce multiple logical
@@ -460,16 +500,15 @@ updates into a single I/O barrier to protect battery life and flash endurance:
     calls.
 2.  **Idle-Sync Pattern**: Trigger the durability barrier (fsync + state update)
     only when the network event loop goes **idle**, or when a threshold is met
-    (`DURABILITY_SYNC_MESSAGES = 50` or `DURABILITY_SYNC_MS = 2000`).
-3.  **Battery Optimization**: By batching, implementations reduce the number of
-    times the storage hardware must be powered up to full-write mode,
-    significantly extending battery life on mobile devices.
+    (`DURABILITY_SYNC_MESSAGES = 20` or `DURABILITY_SYNC_MS = 2000`).
+3.  **Battery Optimization**: Batching reduces the number of times the storage
+    hardware must be powered up to full-write mode.
 4.  **Single Barrier**: Call `fdatasync()` on both file descriptors (or the
     directory) once at the end of the batch.
 5.  **Atomic State Update**: Finally, update `state.bin` to commit the new heads
     and pack/journal IDs.
 
-### 9.2. Security vs. Endurance Trade-off
+### 8.2. Security vs. Endurance Trade-off
 
 *   **Maximum Security**: Sync every message. Provides immediate forward
     secrecy.
@@ -477,7 +516,7 @@ updates into a single I/O barrier to protect battery life and flash endurance:
     Reduces flash wear by 95% while keeping the "vulnerability window" for
     forensic recovery small.
 
-### 9.3. Memory-Efficient Index Management
+### 8.3. Memory-Efficient Index Management
 
 To prevent memory pressure when managing hundreds of conversations:
 
@@ -492,13 +531,11 @@ To prevent memory pressure when managing hundreds of conversations:
     footprint, ensuring that even under heavy multi-conversation load, the total
     metadata remains well within the limits of mobile hardware.
 
-### 9.4. Desync Recovery
+### 8.4. Desync Recovery
 
 If a crash occurs during a batched update and the latest `ChainKey` is lost, the
 implementation **MUST** be able to resume by requesting the missing nodes again
 from the last parent `ChainKey` successfully persisted in `ratchet.bin`.
-
-The C implementation remains simple and high-performance:
 
 1.  **Hot Lookup:** Build a small hash map from `journal.bin` on startup ($O(N)$
     where $N \le 500$).
@@ -507,13 +544,11 @@ The C implementation remains simple and high-performance:
 
 --------------------------------------------------------------------------------
 
-## 11. Rejected Designs & Trade-offs (Architectural Decisions)
+## 9. Rejected Designs & Trade-offs (Architectural Decisions)
 
-During the design phase, several complex optimizations were rejected in favor of
-the **Simplicity First** principle. This section archives the reasoning for
-these "push backs."
+Optimizations rejected in favor of the **Simplicity First** principle:
 
-### 11.1. Full Write-Ahead Log (WAL)
+### 9.1. Full Write-Ahead Log (WAL)
 
 *   **Suggestion:** Implement a unified WAL for all state changes (nodes, heads,
     keys).
@@ -522,17 +557,22 @@ these "push backs."
     ratchets). These provide identical durability guarantees with significantly
     less code.
 
-### 11.2. Materialized Registry Files
+### 9.2. Materialized Registry Files
 
 *   **Suggestion:** Keep separate `vouchers.bin` and `blacklist.bin` files for
     all hot state.
-*   **Push Back:** Every extra file creates a new filesystem contention point
-    and overhead (write amplification).
-*   **Decision:** Unified all "Hot" conversation events into the **Multiplexed
-    Journal**. This ensures $O(1)$ appends and zero-overhead recovery for all
-    registries.
+*   **Push Back:** Vouches are ephemeral coordination state ("peer X advertised
+    hash Y") that become stale after restart. Persisting them in a global
+    registry or the journal creates stale data and carry-forward complexity
+    during compaction.
+*   **Decision:** Vouches are stored **per-node** in the Opaque Index
+    (`voucher_pk` field, Section 4.3) and naturally discarded on promotion or
+    eviction. The runtime voucher set for multi-peer routing is purely
+    in-memory, rebuilt from `SYNC_HEADS` on reconnection. Blacklists are
+    persisted in the journal (hot path) and migrated to Index Record flags (cold
+    path) during compaction.
 
-### 11.3. Linear Scavenging (Resynchronization)
+### 9.3. Linear Scavenging (Resynchronization)
 
 *   **Suggestion:** Use Magic Markers (SYNC) to skip corrupted journal records
     and recover subsequent valid data.
@@ -542,7 +582,7 @@ these "push backs."
     corrupt, the walk stops. Merkle-Tox's self-healing DAG naturally recovers
     the "lost" nodes from peers during the next sync session.
 
-### 11.4. Global De-duplication on Startup
+### 9.4. Global De-duplication on Startup
 
 *   **Suggestion:** Handle partial compaction commits by checking every journal
     node against historical pack indices on startup.
@@ -552,7 +592,7 @@ these "push backs."
     journal and `state.bin`, stale data is identified and discarded in $O(1)$
     time.
 
-### 11.5. Software-Level "Shredding"
+### 9.5. Software-Level "Shredding"
 
 *   **Suggestion:** Use multi-pass overwriting to erase old `ChainKeys`.
 *   **Push Back:** FTL wear-leveling on SSDs renders software overwrites
@@ -561,16 +601,16 @@ these "push backs."
     stable surface for future **Crypto-Shredding** (encrypting the table with a
     volatile RAM key).
 
-### 11.6. Multi-Level B-Tree Indices
+### 9.6. Multi-Level B-Tree Indices
 
 *   **Suggestion:** Use a B-Tree for pack indices to handle millions of nodes.
 *   **Push Back:** Implementing a disk-backed B-Tree in C is a significant
     undertaking.
-*   **Decision:** Used a **Bloom Filter + Scalable Fanout Table**. This provides
-    the same $O(1)$ performance for lookups while keeping the file format flat,
+*   **Decision:** Used a **Bloom Filter + Scalable Fanout Table**, providing the
+    same $O(1)$ performance for lookups while keeping the file format flat,
     auditable, and `mmap`-friendly.
 
-### 11.7. Replacing Bloom Filters with Large Fanout
+### 9.7. Replacing Bloom Filters with Large Fanout
 
 *   **Suggestion:** Increase Fanout bits ($B$) to 24+ to achieve "Not Found"
     rejection without a Bloom Filter.
@@ -581,7 +621,7 @@ these "push backs."
     while **Bloom Filters** (typically 2KB) provide space-efficient rejection
     for "Not Found" lookups across multiple packs.
 
-### 11.9. Topological Opaque Eviction
+### 9.8. Topological Opaque Eviction
 
 *   **Suggestion:** Evict opaque nodes based on Topological Rank (highest rank
     first) to prevent deleting "anchors" near the LLWM.
@@ -589,12 +629,14 @@ these "push backs."
     vulnerable to Rank-Padding attacks, where an attacker stuffs the buffer with
     low-rank junk. It also requires maintaining a complex index for
     undecryptable data.
-*   **Decision:** Used **Oldest-Arrival First** with **Root Carry-Forward**.
-    Legitimate nodes are promoted quickly; stagnant data is purged. Protocol
-    deadlocks are prevented by explicitly preserving `Admin` and `KeyWrap`
-    anchors during eviction.
+*   **Decision:** Used **Oldest-Arrival First** with **Bounded Root
+    Carry-Forward**. Legitimate nodes are promoted quickly; stagnant data is
+    purged. Protocol deadlocks are prevented by explicitly preserving `Admin`
+    and `KeyWrap` anchors during eviction, but strictly bounded by a 20MB quota
+    to prevent attackers from permanently wedging the Opaque Store with fake
+    anchors.
 
-### 11.10. Atomic Rename for High-Frequency Files
+### 9.9. Atomic Rename for High-Frequency Files
 
 *   **Suggestion:** Avoid the "Write-to-Temp + Rename" pattern for `ratchet.bin`
     and `journal.bin` to save inode allocation overhead, especially since
@@ -610,7 +652,7 @@ these "push backs."
     I/O overhead, it guarantees crash-safety without sacrificing the strict
     deletion required for Forward Secrecy.
 
-### 11.11. MessagePack for Structural Headers/Footers
+### 9.10. MessagePack for Structural Headers/Footers
 
 *   **Suggestion:** Use MessagePack for `JournalHeader`, `index.idx` prefix, and
     `Tail-Commit Footer`.
@@ -624,7 +666,7 @@ these "push backs."
 *   **Decision:** Used **Fixed-Width Binary** for file-structure metadata and
     **MessagePack** for flexible logical metadata.
 
-### 11.12. Manual Framing vs. MessagePack Stream for Journal
+### 9.11. Manual Framing vs. MessagePack Stream for Journal
 
 *   **Suggestion:** Use a raw stream of MessagePack objects for the journal
     instead of manual `[length][hash]` framing.
@@ -632,5 +674,5 @@ these "push backs."
     between records and must parse every byte to find the end. A single
     corrupted byte would make the remainder of the journal unreadable.
 *   **Decision:** Used a **Binary Envelope** (Length + Hash) around
-    **MessagePack Payloads**. This enables **Deterministic Walking** and
+    **MessagePack Payloads**, enabling **Deterministic Walking** and
     cryptographic integrity checks before the parser is even invoked.

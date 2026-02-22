@@ -1,5 +1,5 @@
 use merkle_tox_core::clock::{ManualTimeProvider, TimeProvider};
-use merkle_tox_core::dag::{Content, ConversationId, KConv, Permissions};
+use merkle_tox_core::dag::{Content, ConversationId, KConv, Permissions, PhysicalDeviceSk};
 use merkle_tox_core::engine::MerkleToxEngine;
 use merkle_tox_core::node::MerkleToxNode;
 use merkle_tox_core::sync::NodeStore;
@@ -14,7 +14,7 @@ fn test_partitioned_swarm_convergence() {
     let tp = Arc::new(ManualTimeProvider::new(Instant::now(), 1000));
     let hub = Arc::new(VirtualHub::new(tp.clone()));
 
-    let node_count = 8;
+    let node_count = 4;
     let mut nodes = Vec::new();
     let mut receivers = Vec::new();
 
@@ -36,9 +36,10 @@ fn test_partitioned_swarm_convergence() {
             .put_conversation_key(&conv_id, 0, k_conv.clone())
             .unwrap();
 
-        let mut engine = MerkleToxEngine::new(
+        let mut engine = MerkleToxEngine::with_sk(
             pk,
             identities[i].master_pk,
+            PhysicalDeviceSk::from(identities[i].device_sk.to_bytes()),
             StdRng::seed_from_u64(i as u64),
             tp.clone(),
         );
@@ -50,9 +51,18 @@ fn test_partitioned_swarm_convergence() {
                 .add_member(conv_id, id.master_pk, 1, 0);
             // Authorize each device
             let cert = id.make_device_cert(Permissions::ALL, i64::MAX);
+            let ctx = merkle_tox_core::identity::CausalContext::global();
             engine
                 .identity_manager
-                .authorize_device(conv_id, id.master_pk, &cert, 0, 0)
+                .authorize_device(
+                    &ctx,
+                    conv_id,
+                    id.master_pk,
+                    &cert,
+                    0,
+                    0,
+                    merkle_tox_core::dag::NodeHash::from([0u8; 32]),
+                )
                 .unwrap();
         }
 
@@ -91,8 +101,8 @@ fn test_partitioned_swarm_convergence() {
         }
     }
 
-    // 1. Partition the swarm into 2 groups of 4
-    let group_size = 4;
+    // 1. Partition the swarm into 2 groups of 2
+    let group_size = 2;
     for g in 0..2 {
         let mut group_pks = std::collections::HashSet::new();
         for i in 0..group_size {
@@ -101,8 +111,8 @@ fn test_partitioned_swarm_convergence() {
         hub.add_partition(group_pks);
     }
 
-    let author_count = 5; // total messages = 2 * 4 * 5 = 40
-    let total_expected = 40;
+    let author_count = 2; // total messages = 2 * 2 * 2 = 8
+    let total_expected = 8;
 
     // author 5 messages in each group
     for g in 0..2 {

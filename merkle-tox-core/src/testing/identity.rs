@@ -1,6 +1,6 @@
 use crate::dag::{
     Content, ControlAction, ConversationId, DelegationCertificate, Ed25519Signature, KConv,
-    LogicalIdentityPk, MerkleNode, NodeAuth, NodeHash, NodeMac, Permissions, PhysicalDevicePk,
+    LogicalIdentityPk, MerkleNode, NodeAuth, NodeHash, Permissions, PhysicalDevicePk,
 };
 use crate::identity::sign_delegation;
 use ed25519_dalek::{Signer, SigningKey};
@@ -48,14 +48,20 @@ impl TestIdentity {
         expires: i64,
     ) {
         let cert = self.make_device_cert(perms, expires);
+        let ctx = crate::identity::CausalContext {
+            evaluating_node_hash: crate::dag::NodeHash::from([0u8; 32]),
+            admin_ancestor_hashes: std::collections::HashSet::new(),
+        };
         engine
             .identity_manager
             .authorize_device(
+                &ctx,
                 conversation_id,
                 self.master_pk,
                 &cert,
                 engine.clock.network_time_ms(),
                 0,
+                crate::dag::NodeHash::from([0u8; 32]),
             )
             .unwrap();
     }
@@ -129,10 +135,36 @@ impl TestRoom {
             engine
                 .identity_manager
                 .add_member(self.conv_id, id.master_pk, 1, 0);
-            id.authorize_in_engine(engine, self.conv_id, Permissions::ALL, i64::MAX);
+
+            let cert = id.make_device_cert(Permissions::ALL, i64::MAX);
+            let auth_node = crate::testing::create_admin_node(
+                &self.conv_id,
+                id.master_pk,
+                &id.master_sk,
+                if let Some(genesis) = &self.genesis_node {
+                    vec![genesis.hash()]
+                } else {
+                    vec![]
+                },
+                crate::dag::ControlAction::AuthorizeDevice { cert },
+                1,
+                1,
+                0,
+            );
+
+            let effects = engine
+                .handle_node(self.conv_id, auth_node, store, None)
+                .unwrap();
+            crate::testing::apply_effects(effects, store);
         }
 
         engine.load_conversation_state(self.conv_id, store).unwrap();
+
+        // Register deterministic test ephemeral signing keys for all identities
+        // so the engine can verify content nodes created by test helpers.
+        for id in &self.identities {
+            register_test_ephemeral_key(engine, &self.keys, &id.device_pk);
+        }
     }
 }
 
@@ -147,30 +179,79 @@ pub fn make_cert(
 }
 
 /// Signs an administrative node using the provided signing key.
-pub fn sign_admin_node(node: &mut MerkleNode, conversation_id: &ConversationId, sk: &SigningKey) {
+pub fn sign_admin_node(node: &mut MerkleNode, _conversation_id: &ConversationId, sk: &SigningKey) {
     node.sender_pk = PhysicalDevicePk::from(sk.verifying_key().to_bytes());
-    let sig = sk
-        .sign(&node.serialize_for_auth(conversation_id))
-        .to_bytes();
+    let sig = sk.sign(&node.serialize_for_auth()).to_bytes();
     node.authentication = NodeAuth::Signature(Ed25519Signature::from(sig));
 }
 
-/// Calculates and sets the MAC for a content node using the provided conversation keys.
+/// Signs a content node with an ephemeral Ed25519 key.
+///
+/// In production, each epoch has its own ephemeral signing key distributed via
+/// SenderKeyDistribution. In tests, callers provide a signing key (or use
+/// `sign_content_node_random` which generates one).
+pub fn sign_content_node_with_key(
+    node: &mut MerkleNode,
+    _conversation_id: &ConversationId,
+    eph_sk: &SigningKey,
+) {
+    let auth_data = node.serialize_for_auth();
+    let sig = eph_sk.sign(&auth_data).to_bytes();
+    node.authentication = NodeAuth::EphemeralSignature(Ed25519Signature::from(sig));
+}
+
+/// Signs a content node with a deterministic ephemeral key derived from the
+/// conversation keys and sender. Useful for tests that don't need to control
+/// the ephemeral key directly.
 pub fn sign_content_node(
     node: &mut MerkleNode,
     conversation_id: &ConversationId,
     keys: &crate::crypto::ConversationKeys,
 ) {
-    let mut chain_key = crate::crypto::ratchet_init_sender(&keys.k_conv, &node.sender_pk);
-    for _ in 1..node.sequence_number {
-        chain_key = crate::crypto::ratchet_step(&chain_key);
-    }
-    let k_msg = crate::crypto::ratchet_message_key(&chain_key);
-    let msg_keys = crate::crypto::ConversationKeys::derive(&KConv::from(*k_msg.as_bytes()));
+    // Derive a deterministic ephemeral key from k_conv + sender_pk so that
+    // the verifying key can be reconstructed by the test.
+    let seed = blake3::derive_key(
+        "merkle-tox v1 test-ephemeral",
+        &[
+            keys.k_conv.as_bytes().as_slice(),
+            node.sender_pk.as_bytes().as_slice(),
+        ]
+        .concat(),
+    );
+    let eph_sk = SigningKey::from_bytes(&seed);
+    sign_content_node_with_key(node, conversation_id, &eph_sk);
+}
 
-    let auth_data = node.serialize_for_auth(conversation_id);
-    let mac = msg_keys.calculate_mac(&auth_data);
-    node.authentication = NodeAuth::Mac(mac);
+/// Returns the deterministic ephemeral signing key for a given sender in test contexts.
+/// Matches the key used by `sign_content_node`.
+pub fn test_ephemeral_signing_key(
+    keys: &crate::crypto::ConversationKeys,
+    sender_pk: &PhysicalDevicePk,
+) -> SigningKey {
+    let seed = blake3::derive_key(
+        "merkle-tox v1 test-ephemeral",
+        &[
+            keys.k_conv.as_bytes().as_slice(),
+            sender_pk.as_bytes().as_slice(),
+        ]
+        .concat(),
+    );
+    SigningKey::from_bytes(&seed)
+}
+
+/// Registers the deterministic test ephemeral signing key for a sender on the engine.
+/// This must be called on the *receiving* engine so it can verify content nodes
+/// created by `create_msg()` / `create_signed_content_node()` / `sign_content_node()`.
+pub fn register_test_ephemeral_key(
+    engine: &mut crate::engine::MerkleToxEngine,
+    keys: &crate::crypto::ConversationKeys,
+    sender_pk: &PhysicalDevicePk,
+) {
+    let eph_sk = test_ephemeral_signing_key(keys, sender_pk);
+    let eph_vk = crate::dag::EphemeralSigningPk::from(eph_sk.verifying_key().to_bytes());
+    engine
+        .peer_ephemeral_signing_keys
+        .insert((*sender_pk, 0), eph_vk);
 }
 
 /// Helper to create and sign a content node with full control over authorship.
@@ -253,6 +334,78 @@ pub fn random_signing_key() -> SigningKey {
     SigningKey::from_bytes(&bytes)
 }
 
+/// Creates PackKeys::Content for a test content node.
+/// Derives k_msg from the ratchet init for the sender, using the sequence counter.
+/// Uses deterministic nonces derived from node data for reproducibility.
+pub fn test_pack_content_keys(
+    keys: &crate::crypto::ConversationKeys,
+    sender_pk: &PhysicalDevicePk,
+    sequence_number: u64,
+) -> crate::crypto::PackContentKeys {
+    let chain_key = crate::crypto::ratchet_init_sender(&keys.k_conv, sender_pk);
+    let sender_key = crate::dag::SenderKey::from(*chain_key.as_bytes());
+    let counter = sequence_number & 0xFFFFFFFF;
+
+    // Step the ratchet forward to the right position
+    let mut ck = chain_key;
+    for _ in 1..counter {
+        ck = crate::crypto::ratchet_step(&ck);
+    }
+
+    let k_msg = crate::crypto::ratchet_message_key(&ck);
+    let _k_next = crate::crypto::ratchet_step(&ck);
+    let k_header = crate::crypto::derive_k_header_epoch(&keys.k_conv, &sender_key);
+
+    // Deterministic nonces for test reproducibility
+    let routing_nonce_full = blake3::derive_key(
+        "merkle-tox v1 test-routing-nonce",
+        &[
+            keys.k_conv.as_bytes().as_slice(),
+            sender_pk.as_bytes().as_slice(),
+            &sequence_number.to_be_bytes(),
+        ]
+        .concat(),
+    );
+    let payload_nonce_full = blake3::derive_key(
+        "merkle-tox v1 test-payload-nonce",
+        &[
+            keys.k_conv.as_bytes().as_slice(),
+            sender_pk.as_bytes().as_slice(),
+            &sequence_number.to_be_bytes(),
+        ]
+        .concat(),
+    );
+
+    let mut routing_nonce = [0u8; 12];
+    routing_nonce.copy_from_slice(&routing_nonce_full[..12]);
+    let mut payload_nonce = [0u8; 12];
+    payload_nonce.copy_from_slice(&payload_nonce_full[..12]);
+
+    crate::crypto::PackContentKeys {
+        k_msg,
+        k_header,
+        routing_nonce,
+        payload_nonce,
+    }
+}
+
+/// Transfers ephemeral signing keys from one engine to another.
+/// Copies all of `from_engine`'s self-ephemeral signing keys into `to_engine`'s
+/// peer_ephemeral_signing_keys, keyed by `from_engine.self_pk`.
+/// Used in tests where `author_node()` generates random ephemeral keys and the
+/// receiving engine needs to verify the signatures without going through SKD.
+pub fn transfer_ephemeral_keys(
+    from_engine: &crate::engine::MerkleToxEngine,
+    to_engine: &mut crate::engine::MerkleToxEngine,
+) {
+    for (epoch, sk) in &from_engine.self_ephemeral_signing_keys {
+        let vk = crate::dag::EphemeralSigningPk::from(sk.verifying_key().to_bytes());
+        to_engine
+            .peer_ephemeral_signing_keys
+            .insert((from_engine.self_pk, *epoch), vk);
+    }
+}
+
 /// Creates a base test node with default values.
 pub fn test_node() -> MerkleNode {
     MerkleNode {
@@ -264,7 +417,8 @@ pub fn test_node() -> MerkleNode {
         network_timestamp: 1000,
         content: Content::Text("dummy".to_string()),
         metadata: Vec::new(),
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(crate::dag::Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     }
 }
 

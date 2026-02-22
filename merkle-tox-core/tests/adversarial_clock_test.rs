@@ -1,7 +1,7 @@
 use merkle_tox_core::clock::{ManualTimeProvider, NetworkClock};
-use merkle_tox_core::dag::PhysicalDevicePk;
+use merkle_tox_core::dag::{LogicalIdentityPk, PhysicalDevicePk};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[test]
 fn test_sybil_nudge_attack_unweighted() {
@@ -18,12 +18,11 @@ fn test_sybil_nudge_attack_unweighted() {
         clock.update_peer_offset(PhysicalDevicePk::from([i as u8; 32]), 3600000);
     }
 
-    let offset = clock.consensus_offset();
-    // 13 samples. Median is index 6.
-    // [0, 0, 0, 3.6m, 3.6m, 3.6m, 3.6m, ...]
-    // Index 6 is 3.6m.
-    // This confirms the unweighted median is vulnerable to a simple majority of attackers.
-    assert_eq!(offset, 3600000);
+    let target = clock.consensus_target_offset();
+    // 13 identities (each device = unique identity via update_peer_offset).
+    // Median of [0, 0, 0, 3.6m, 3.6m, ...] is 3.6m, but ±5min clamp caps it to 300_000.
+    // This confirms the clamp mitigates the attack even when the unweighted median is vulnerable.
+    assert_eq!(target, 300_000);
 }
 
 #[test]
@@ -33,13 +32,15 @@ fn test_sybil_nudge_attack_weighted() {
 
     // 3 Honest peers with accurate time (0 offset), but high weight (e.g. verified friends)
     for i in 0..3 {
-        clock.update_peer_offset_weighted(PhysicalDevicePk::from([i as u8; 32]), 0, 10);
+        let pk = PhysicalDevicePk::from([i as u8; 32]);
+        clock.update_peer_offset_weighted(pk, LogicalIdentityPk::from([i as u8; 32]), 0, 10);
     }
     // Total honest weight = 30
 
     // 10 Malicious peers reporting +1 hour (3,600,000 ms) with low weight
     for i in 10..20 {
-        clock.update_peer_offset_weighted(PhysicalDevicePk::from([i as u8; 32]), 3600000, 1);
+        let pk = PhysicalDevicePk::from([i as u8; 32]);
+        clock.update_peer_offset_weighted(pk, LogicalIdentityPk::from([i as u8; 32]), 3600000, 1);
     }
     // Total malicious weight = 10
 
@@ -82,18 +83,34 @@ fn test_quarantine_stability() {
     );
     let keys = ConversationKeys::derive(&k_conv);
 
-    // 1. Receive a node dated 1 hour in the future from a different sender
+    // 1. Receive a node dated 5 minutes in the future from a different sender.
+    //    (Uses 5 minutes because the consensus offset is clamped to ±5 minutes.)
     let remote = merkle_tox_core::testing::TestIdentity::new();
     engine
         .identity_manager
         .add_member(conv_id, remote.master_pk, 0, 0);
     let cert = remote.make_device_cert(merkle_tox_core::dag::Permissions::ALL, i64::MAX);
+    let ctx = merkle_tox_core::identity::CausalContext::global();
     engine
         .identity_manager
-        .authorize_device(conv_id, remote.master_pk, &cert, 0, 0)
+        .authorize_device(
+            &ctx,
+            conv_id,
+            remote.master_pk,
+            &cert,
+            0,
+            0,
+            merkle_tox_core::dag::NodeHash::from([0u8; 32]),
+        )
         .unwrap();
 
-    let future_ts = engine.clock.network_time_ms() + 3_600_000;
+    merkle_tox_core::testing::register_test_ephemeral_key(&mut engine, &keys, &remote.device_pk);
+
+    // Node is 15 minutes in the future → quarantined (> 10min from now).
+    // After applying 300_000 (5min) clock offset, the effective "now" is
+    // now+5min, and the node is only 10min ahead → just at the boundary.
+    // Use 14 min so it's comfortably within range after the offset.
+    let future_ts = engine.clock.network_time_ms() + 14 * 60 * 1000;
     let future_node = create_signed_content_node(
         &conv_id,
         &keys,
@@ -132,10 +149,9 @@ fn test_quarantine_stability() {
         "New node should NOT use quarantined node as parent"
     );
 
-    // 4. Advance clock by 1 hour
-    engine
-        .clock
-        .update_peer_offset(PhysicalDevicePk::from([2u8; 32]), 3_600_000);
+    // 4. Advance wall clock by 5 minutes so the quarantined node (14min ahead)
+    //    is now only 9 minutes ahead: within the 10min quarantine threshold.
+    tp.advance(Duration::from_millis(5 * 60 * 1000));
 
     // 5. Trigger re-verification
     let effects = engine.reverify_speculative_for_conversation(conv_id, &store);

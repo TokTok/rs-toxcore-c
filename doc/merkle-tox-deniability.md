@@ -2,85 +2,211 @@
 
 ## Overview
 
-Merkle-Tox prioritizes **Plausible Deniability**, a tenet of the Tox ecosystem.
-While traditional Merkle-DAGs use digital signatures (providing
-non-repudiation), Merkle-Tox employs **Deniable Authenticated Range/Exchange
-(DARE)** logic using Message Authentication Codes (MACs) and shared secrets.
+Merkle-Tox provides **Plausible Deniability** alongside **Internal
+Authentication** (group members verify message authors during active epochs).
 
-This ensures that while participants *inside* a conversation can verify the
-authenticity and integrity of messages, a third party *outside* the conversation
-cannot cryptographically prove who authored a specific node.
+Uses **Ephemeral Signatures with Intentional Key Disclosure**: content nodes are
+signed with short-lived Ed25519 keys whose private keys are publicly disclosed
+after epoch rotation, making past signatures forgeable.
 
 ## 1. DARE Authentication Model
 
 ### Shared Conversation Key ($K_{conv}$)
 
-Every conversation (1:1 or Group) establishes a symmetric **Shared Conversation
-Key**.
+Every conversation establishes a symmetric **Shared Conversation Key**.
 
--   In **1:1 chats**, this is distributed securely via an X3DH handshake during
-    the initial connection.
--   In **Group chats**, this is distributed securely via X3DH (`KeyWrap` nodes)
-    to all authorized devices of all participants.
+-   In **1:1 chats**, distributed via Signed ECIES handshake during initial
+    connection.
+-   In **Group chats**, distributed via Signed ECIES (`KeyWrap` nodes) to all
+    authorized devices.
 
-### From Signatures to MACs
+### Ephemeral Signatures (Content Nodes)
 
-Instead of an asymmetric signature, each `MerkleNode` contains an
-**Authenticator**:
+Each content node is authenticated with an **Ephemeral Ed25519 Signature**. The
+full cryptographic construction for a Content Node is:
 
--   `Authenticator = Blake3_MAC(K_mac, Node_Contents)`
--   `Header_Encryption = ChaCha20(K_header, Routing_Info)`
--   `Payload_Encryption = ChaCha20(K_msg_i, Content)`
+```
+# 1. Derive the sender hint from the per-message ratchet key
+#    Because K_msg_i is unique per message, the hint changes every message,
+#    preventing passive traffic analysis by blind relays (no static value to
+#    correlate on). Recipients maintain a lookup table built from their
+#    ratchet state (see "Verification Order" in Section 2).
+sender_hint = Blake3-KDF("merkle-tox v1 hint", K_msg_i)[0..4]
 
-Where `K_mac` and `K_header` are derived from $K_{conv}$ using **Blake3-KDF**,
-ensuring global deniability and preventing metadata leakage to relays. `K_msg_i`
-is derived from the sender's current **Ratchet Chain Key**, ensuring Forward
-Secrecy. See **`merkle-tox.md`** for the full cryptographic suite.
+# 2. Derive per-epoch header key from the sender's current SenderKey
+#    (rotates every 7 days / 5,000 messages), ensuring routing metadata
+#    has the exact same Post-Compromise Security (PCS) as the payload.
+#    New members joining mid-epoch receive this key explicitly via JIT Piggybacking.
+K_header_epoch_n = Blake3-KDF("merkle-tox v1 header-key", K_conv || SenderKey_n)
 
-### Plausible Deniability
+> **Design Rationale (Epoch-Static vs. Per-Message Header Key):**
+>
+> $K_{header}$ MUST NOT be derived from the per-message $K_{chain_i}$.
+>
+> Deriving $K_{header}$ per-message introduces an asymmetric CPU Denial of Service (DoS) vector. On a `sender_hint` cache miss, a recipient must identify the sender via trial decryption. A per-message key requires stepping every known sender's ratchet up to `MAX_RATCHET_SKIPS` (2000) to derive candidate keys. For $N$ members, one unauthenticated packet forces $N \times 2000$ sequential Blake3 hashes prior to rejection.
+>
+> Deriving $K_{header}$ from the epoch-static `SenderKey` sacrifices per-message Forward Secrecy on the `sequence_number` to guarantee:
+> 1.  **$O(N)$ AEAD Fast-Fail**: Trial decryption requires at most $N$ `ChaCha20-Poly1305` tag checks against cached epoch keys. Zero ratchet steps occur until the sender and sequence number are authenticated.
+> 2.  **Asynchronous Recovery**: A recipient processing out-of-order or offline batches can decrypt routing headers to identify sequence numbers, enabling deterministic ratchet advancement to target indices without interactive off-DAG recovery.
+>
+> The `content`, `metadata`, and `network_timestamp` maintain per-message Forward Secrecy via $K_{msg_i}$.
 
-Because every participant in the conversation possesses $K_{conv}$, any of them
-could have theoretically authored any node in the DAG.
+# 3. Encrypt routing metadata (random nonce, prepended to ciphertext)
+#    MUST use an AEAD cipher like ChaCha20-Poly1305. The 16-byte Poly1305 tag
+#    is required to instantly reject garbage during O(N) trial decryption,
+#    preventing asymmetric CPU DoS attacks from outsiders.
+#    (Note: sender_pk is omitted because the key used implicitly identifies the sender).
+#    To prevent replay attacks where a valid routing header is attached
+#    to a garbage payload (bypassing the fast DoS check), the hash of the payload
+#    MUST be included as Additional Authenticated Data (AAD).
+nonce = random_bytes(12)
+ciphertext = ChaCha20-Poly1305(
+    key:   K_header_epoch_n,
+    nonce: nonce,
+    aad:   Blake3(payload_data),
+    plain: [sequence_number (fixed 8-byte u64)]
+)
+encrypted_routing = nonce || ciphertext
 
--   **Internal Trust**: When Peer A receives a node from Peer B, they know it's
-    authentic because it's valid under $K_{conv}$ and follows Peer B's
-    `sequence_number` chain.
--   **External Repudiation**: If the DAG is leaked, Peer B can plausibly claim
-    that Peer A (or any other participant) forged the node to frame them.
+# 4. Encrypt payload with the per-message ratchet key
+#    A random nonce is used because K_msg_i uniqueness depends on ratchet
+#    state being persisted before sending. If the ratchet rewinds (database
+#    restore, crash before persist, VM clone), the same K_msg_i would be
+#    derived again. Reusing a fixed nonce with the same key under ChaCha20
+#    is catastrophic (XOR of ciphertexts reveals XOR of plaintexts). A
+#    random 96-bit nonce makes collision negligible even under state rewind.
+nonce_msg_i = random_bytes(12)
+payload_data = nonce_msg_i || ChaCha20-IETF(K_msg_i, nonce_msg_i, [network_timestamp || content || metadata])
 
-> **Note on KCI**: This design explicitly accepts **Key Compromise Impersonation
-> (KCI)** for content nodes as a trade-off for deniability. If a user's key is
-> compromised, the attacker can impersonate others *to that user*. For a full
-> analysis, see **`merkle-tox-threat-model.md`**.
+# 5. Sign with the sender's current ephemeral signing key (Encrypt-then-Sign)
+Node_Contents = ToxProto::serialize([
+    parents, author_pk, sender_hint, encrypted_routing,
+    payload_data, topological_rank, flags
+])
+Authenticator = Ed25519_Sign(ephemeral_signing_sk, "merkle-tox v1 content-sig" || Node_Contents)
+```
+
+The signature covers the **ciphertext** of `encrypted_routing` and
+`payload_data`, `topological_rank`, and `flags`. Covering `topological_rank`
+prevents silent relay inflation of a node's rank; covering `flags` prevents
+relay-induced decompression failures. See `merkle-tox-dag.md` for the full
+canonical definition and the Admin Node signature variant.
+
+### Internal Authentication
+
+During the active epoch, only the sender holds the ephemeral signing private key
+(`ephemeral_signing_sk`). Recipients verify the signature using the
+`ephemeral_signing_pk` distributed via `SenderKeyDistribution`. Valid signatures
+cryptographically prove authorship to all group members, preventing real-time
+impersonation.
+
+### Plausible Deniability (Key Disclosure)
+
+When a sender rotates their SenderKey (every 7 days or 5,000 messages), the new
+`SenderKeyDistribution` node includes the **previous epoch's
+`ephemeral_signing_sk`** in the `disclosed_keys` field. Once disclosed:
+
+-   Any authorized member now possesses the old private key and could have
+    forged any signature from that epoch.
+-   **External Repudiation**: If the DAG is leaked, the sender can plausibly
+    claim that any member who received the disclosure could have forged the
+    signed content.
+-   **Timing**: The disclosure is delivered over the deniable encrypted channel.
+    There is no non-repudiable certificate linking the ephemeral key to the
+    sender's identity.
+
+> **Note**: During the active epoch (before disclosure), signatures provide
+> non-repudiable internal authentication to group members. The deniability
+> window is bounded by the SenderKey rotation interval (7 days / 5,000
+> messages).
 
 ## 2. Key Agreement & Rotation
 
-### Initial Handshake: X3DH
+### Initial Handshake: Signed ECIES
 
-Merkle-Tox uses a decentralized **Extended Triple Diffie-Hellman (X3DH)**
-handshake to establish the initial conversation key ($K_{conv, 0}$).
+A decentralized **Signed ECIES (Ephemeral-Static Diffie-Hellman)** handshake
+establishes the initial conversation key ($K_{conv, 0}$).
 
 1.  **Announcement Nodes**: Users publish signed ephemeral "Pre-keys" to the
     DAG.
 2.  **Exchange**: To start a chat or join a group, a user fetches the
     recipient's latest pre-key and performs a 4-part DH exchange.
-3.  **Result**: This establishes a shared secret with **Forward Secrecy** from
-    the first message.
+3.  **Result**: Establishes a shared secret with **Forward Secrecy**.
 
-See **`merkle-tox-handshake-x3dh.md`** for the full handshake protocol.
+See **`merkle-tox-handshake-ecies.md`** for the full handshake protocol.
 
-### Per-Message Forward Secrecy: Symmetric Ratchet
+### Bounded Forward Secrecy (Symmetric Ratchet)
 
 Once $K_{conv, 0}$ is established, it seeds a **Symmetric Key Ratchet** (Hash
 Chain).
 
--   Every message is encrypted with a unique, one-way derived key.
--   Keys are deleted immediately after use, ensuring that compromising the
-    current state does not expose past messages.
--   The ratchet handles the non-linear nature of the DAG by merging parent chain
-    keys during branch joins.
+-   Every message is encrypted with a unique, one-way derived key ($K_{msg,i}$).
+-   Keys are deleted immediately after use.
+-   **The ECIES Trade-off**: Without 1-to-1 Double Ratchets, the root
+    `SenderKey` is distributed using ECIES against the recipient's `Signed
+    Pre-Key` (SPK). Forward Secrecy of the *entire chain* is bounded by the SPK
+    rotation interval (30 days). A compromised SPK allows retroactive decryption
+    of `SenderKey` distributions from that epoch.
+-   The ratchet handles the non-linear nature of the DAG by keeping each
+    sender's chain strictly linear and independent of other senders' branches.
 
 See **`merkle-tox-ratchet.md`** for the ratchet implementation details.
+
+### Per-Epoch Key Rotation (Header & Signing)
+
+The header encryption key is tied to the sender's **SenderKey epoch** and
+therefore rotates every 7 days or 5,000 messages, exactly matching the
+Post-Compromise Security cadence of payload encryption:
+
+```
+K_header_epoch_n = Blake3-KDF("merkle-tox v1 header-key", K_conv || SenderKey_n)
+```
+
+The ephemeral signing key pair is generated fresh for each epoch and distributed
+alongside the `SenderKey` via `SenderKeyDistribution`.
+
+`SenderKeyDistribution` nodes (Content ID 2) are themselves signed with the
+**current** epoch's ephemeral signing key. The new `SenderKeyDistribution`
+distributing $SenderKey\_{n+1}$ is signed with the epoch $n$ key (which
+recipients already possess). For the initial distribution ($n = 0$), the node
+uses `NodeAuth::Signature` (a permanent Ed25519 signature from the device key)
+because no ephemeral key has been established yet.
+
+**Forward Secrecy**: Once a SenderKey epoch ends, the corresponding
+$K_{header\_epoch\_n}$ is irrecoverable from the new epoch's keys. The old
+ephemeral signing private key is disclosed (see Section 1), making past
+signatures unforgeable-proof but past routing metadata unrecoverable.
+
+**Deniability**: After epoch rotation, the old `ephemeral_signing_sk` is
+disclosed to all members via the `disclosed_keys` field. Any member can then
+produce valid signatures for past content, preserving the DARE deniability
+property. Before disclosure, the signature provides non-repudiable internal
+authentication.
+
+**Verification Order**: The `sender_hint` is derived from $K_{msg\_i}$ (see
+Section 1). Recipients maintain a `{hint → (sender_pk, ratchet_index)}` lookup
+table built from their ratchet state (next expected key and cached skipped
+keys).
+
+1.  The verifier looks up `sender_hint` in the table for O(1) sender
+    identification.
+2.  On match, the verifier retrieves the sender's current
+    `ephemeral_signing_pk`, verifies the signature, then decrypts
+    `encrypted_routing` and `payload_data`.
+3.  On collision, the verifier tries each candidate sender's
+    `ephemeral_signing_pk` until one succeeds.
+4.  **Fallback (table miss)**: On table miss, the verifier falls back to O(N)
+    **trial decryption** of `encrypted_routing` using each known sender's
+    $K_{header\_epoch\_n}$.
+    -   **DoS Protection (AEAD)**: The routing header MUST be encrypted using an
+        AEAD cipher (**ChaCha20-Poly1305**). If a message is garbage or uses an
+        unknown key, the Poly1305 authentication tag check will fail in a
+        fraction of a microsecond, preventing an asymmetric CPU DoS where an
+        attacker floods the room with random hints to force O(N) stream
+        decryptions and memory comparisons.
+
+Table entries are updated incrementally as the ratchet advances or skipped keys
+expire.
 
 ### Post-Compromise Security (PCS)
 
@@ -89,32 +215,31 @@ performs periodic **Sender Key Rotations**.
 
 1.  **Triggers**: Rotation occurs per-device every **5,000 messages** or **7
     days**.
-2.  **Mechanism**: The device generates a new `SenderKey` (ratchet root) and
-    distributes it via ephemeral-static DH (`SenderKeyDistribution`) to all
-    currently authorized members.
-3.  **Result**: This provides **Post-Compromise Security**, ensuring that an
-    attacker who has stolen a previous device key is eventually rotated out of
-    the message decryption capability. This decentralized $O(N)$ distribution
-    prevents the $O(N^2)$ Admin bottleneck associated with global key rotations.
+2.  **Mechanism**: The device generates a new `SenderKey` (ratchet root) and a
+    fresh ephemeral Ed25519 key pair, distributing both via
+    `SenderKeyDistribution` to all currently authorized members. The old epoch's
+    `ephemeral_signing_sk` is included in `disclosed_keys`.
+3.  **Result**: This provides **Post-Compromise Security**, ensuring an attacker
+    who has stolen a previous device key is eventually rotated out of both
+    message decryption and content forgery capability. The decentralized $O(N)$
+    distribution prevents the Admin bottleneck associated with global key
+    rotations.
 
 ## 3. "Lazy Consensus" Fallback
 
-In scenarios where $K_{conv}$ is not yet known (e.g., syncing history from a
-third-party relay before meeting the author):
+In scenarios where $K_{conv}$ is not yet known (e.g., syncing from a blind
+relay):
 
 1.  **Speculative Sync**: The client downloads nodes and validates their `hash`
-    (integrity) but marks them as `Unverified`.
-2.  **Attestation (Vouching)**: If Peer C (whom you trust) has included a node
-    from Peer B as a parent in their own authenticated nodes, your confidence in
-    that node increases.
-3.  **Finalization**: Once you perform a DARE handshake with Peer B (or any
-    participant who has the key), the historical DAG is validated.
+    but marks them as `Unverified`.
+2.  **Attestation (Vouching)**: If a trusted peer includes a node as a parent,
+    confidence in that node increases.
+3.  **Finalization**: Once the client establishes $K_{conv}$ with an authorized
+    peer, the historical DAG is validated.
 
 ## 4. Identity vs. Content (Two-Stage Onboarding)
 
-To maintain the security of the **Identity Model** (`merkle-tox-identity.md`)
-while keeping messages deniable, Merkle-Tox uses a **Two-Stage Onboarding**
-process.
+Merkle-Tox uses a **Two-Stage Onboarding** process.
 
 ### Stage 1: Non-Repudiable Authorization (Hard Identity)
 
@@ -123,27 +248,30 @@ transparent.
 
 -   **Admin/Control Nodes**: Authorize/revoke devices, change room title, or
     invite members.
--   **Security**: These nodes use **Ed25519 signatures**. This provides
+-   **Security**: These nodes use **Ed25519 signatures**, providing
     non-repudiable proof that an Admin performed a specific management action.
 -   **Privacy**: These nodes do **not** contain private user content. They only
     establish *who* is allowed to participate.
 
 ### Stage 2: Deniable Communication (DARE)
 
-Once authorized, all actual conversation content is protected by the symmetric
-DARE model.
+Once authorized, all actual conversation content is protected by the DARE model
+using ephemeral signatures.
 
--   **Content Nodes**: All messages, files, and reactions **MUST** use the DARE
-    MAC approach.
--   **Deniability**: Because the content uses symmetric MACs derived from the
-    $K_{conv}$, any authorized member could have forged a message. An outsider
-    cannot prove who authored a specific `Content::Text` node.
--   **Strict Encryption**: Clients MUST use "Encrypt-then-MAC" for the `content`
-    and `metadata` fields. In Content nodes, the `sender_pk` and
-    `sequence_number` MUST be encrypted into an `encrypted_routing` header using
-    $K_{header}$ (derived from $K_{conv}$) to prevent metadata leakage to blind
-    relays.
-    -   **EXCEPTION (KeyWrap)**: `KeyWrap` nodes (Content ID 7) are sent in
+-   **Content Nodes**: All messages, files, and reactions **MUST** use
+    `NodeAuth::EphemeralSignature`.
+-   **Internal Authentication**: During the active epoch, the ephemeral signing
+    key is held exclusively by the sender. A valid signature proves authorship
+    to all group members, preventing real-time impersonation.
+-   **Deniability**: After epoch rotation, the sender discloses the old
+    `ephemeral_signing_sk`. Any authorized member could then have forged the
+    signatures from that epoch. An outsider cannot prove who authored a specific
+    `Content::Text` node.
+-   **Strict Encryption**: The `content` and `metadata` use Encrypt-then-Sign.
+    In Content nodes, the `sequence_number` MUST be encrypted into an
+    `encrypted_routing` header using $K_{header\_epoch\_n}$. See Section 1 for
+    the full derivation.
+    -   **EXCEPTION (KeyWrap)**: `KeyWrap` nodes (Content ID 1) are sent in
         **cleartext** (and signed with an Ed25519 Signature) to allow new
         members to receive the conversation keys. For these nodes, the
         `sender_pk` and `recipient_pk` lists are technically visible to relays.
@@ -154,33 +282,49 @@ DARE model.
 
 ### Transitive Rationale
 
-By separating the **Authority to Speak** (Signed) from the **Act of Speaking**
-(MAC'd), we ensure that a user's digital signature on a room-management task
-never "anchors" the hash of a private message into a non-repudiable record. Even
-if your presence in a room is proven, your specific messages remain plausibly
-deniable.
+Separating the **Authority to Speak** (permanently Signed) from the **Act of
+Speaking** (ephemerally Signed with disclosed keys) ensures a user's permanent
+digital signature on a room-management task never "anchors" the hash of a
+private message into a non-repudiable record. Even if presence in a room is
+proven, specific messages remain plausibly deniable after epoch rotation.
 
 ## 5. Control Chain Isolation
 
 To prevent "Transitive Non-Repudiation," Merkle-Tox enforces a strict separation
 between Admin and Content nodes:
 
--   **Admin nodes** (which are signed) can only reference other Admin nodes as
-    parents.
--   **Content nodes** (which are MAC'd) can reference both Admin and Content
-    nodes.
-
-This ensures that a user's digital signature on a room-management task (like
-changing a topic) never "anchors" the hash of a private message into a
-non-repudiable record. Even if a user's signed presence in a room is proven,
-their specific messages remain plausibly deniable.
+-   **Admin nodes** (which are permanently signed) can only reference other
+    Admin nodes as parents.
+-   **Content nodes** (which use ephemeral signatures) can reference both Admin
+    and Content nodes.
 
 ## 6. Summary of Security Properties
 
--   **Integrity**: Guaranteed by the Merkle-DAG (Blake3 hashes).
--   **Authenticity**: Guaranteed to participants who hold the shared key.
--   **Deniability**: Provided by the symmetric nature of the MAC (DARE).
--   **Forward Secrecy**: Provided by the symmetric ratchet (per-message) and
-    X3DH (per-handshake).
--   **Post-Compromise Security**: Provided by periodic per-device `SenderKey`
-    rotations.
+-   **Integrity**: Guaranteed by the Merkle-DAG (Blake3 hashes) and the
+    Encrypt-then-Sign construction covering all wire-visible fields including
+    `topological_rank` and `flags`.
+-   **Internal Authentication**: During the active epoch, the ephemeral signing
+    key is held exclusively by the sender. A valid signature proves authorship
+    to all group members. No other member can forge content as another member in
+    real time.
+-   **Deniability**: After epoch rotation, the old `ephemeral_signing_sk` is
+    disclosed to all members. Any authorized member could then forge signatures
+    from that epoch. No asymmetric signature permanently binds a message to a
+    specific sender.
+-   **Forward Secrecy**: Bounded by the 30-day SPK rotation epoch. Provided by
+    the symmetric ratchet (per-message deletion) but constrained by the ECIES
+    distribution of the root `SenderKey` and ECIES (per-handshake).
+-   **Post-Compromise Security (Payload)**: Provided by periodic per-device
+    `SenderKey` rotations (every 7 days / 5,000 messages).
+-   **Post-Compromise Security (Routing Metadata)**: The `sender_hint` is
+    derived from the per-message ratchet key ($K_{msg\_i}$), giving it the same
+    bounded Forward Secrecy and PCS inherited from the ratchet chain. The
+    `encrypted_routing` header is encrypted with $K_{header\_epoch\_n}$, which
+    rotates with the SenderKey (7-day / 5,000-message cadence). Together, no
+    cleartext or encrypted routing field is static across messages, and all
+    routing metadata gains PCS from the SenderKey rotation schedule.
+-   **Post-Compromise Security (Authentication)**: Provided by per-epoch
+    ephemeral signing key rotation. An attacker who compromises a device's
+    current ephemeral signing key is rotated out of forgery capability within 7
+    days. The disclosed old key only enables forging past-epoch content (which
+    is already deniable).

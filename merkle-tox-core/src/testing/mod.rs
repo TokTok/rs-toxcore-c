@@ -9,10 +9,51 @@ pub use gateway::MerkleToxGateway;
 pub use hub::{SimulatedTransport, VirtualHub};
 pub use identity::{
     TestIdentity, TestRoom, create_admin_node, create_dummy_node, create_msg,
-    create_signed_content_node, make_cert, random_signing_key, sign_admin_node, sign_content_node,
-    test_node,
+    create_signed_content_node, make_cert, random_signing_key, register_test_ephemeral_key,
+    sign_admin_node, sign_content_node, sign_content_node_with_key, test_ephemeral_signing_key,
+    test_node, test_pack_content_keys, transfer_ephemeral_keys,
 };
 pub use store::{InMemoryStore, ManagedStore, delegate_store};
+
+/// Create a Genesis node with valid proof-of-work for testing.
+pub fn create_genesis_pow(
+    conv_id: &crate::dag::ConversationId,
+    alice: &TestIdentity,
+    title: &str,
+) -> crate::dag::MerkleNode {
+    let mut node = crate::dag::MerkleNode {
+        parents: vec![],
+        author_pk: alice.master_pk,
+        sender_pk: alice.device_sk.verifying_key().to_bytes().into(),
+        sequence_number: 1,
+        topological_rank: 0,
+        network_timestamp: 1000,
+        content: crate::dag::Content::Control(crate::dag::ControlAction::Genesis {
+            title: title.to_string(),
+            creator_pk: alice.master_pk,
+            permissions: crate::dag::Permissions::all(),
+            flags: 0,
+            created_at: 1000,
+        }),
+        metadata: vec![],
+        authentication: crate::dag::NodeAuth::Signature(crate::dag::Ed25519Signature::from(
+            [0u8; 64],
+        )),
+        pow_nonce: 0,
+    };
+    sign_admin_node(&mut node, conv_id, &alice.device_sk);
+    let node_hash = node.hash();
+    let creator_pk = alice.master_pk;
+    let mut nonce = 0u64;
+    loop {
+        if crate::dag::validate_pow(creator_pk.as_bytes(), &node_hash, nonce) {
+            break;
+        }
+        nonce += 1;
+    }
+    node.pow_nonce = nonce;
+    node
+}
 
 pub fn get_node_from_effects(effects: Vec<crate::engine::Effect>) -> crate::dag::MerkleNode {
     effects
@@ -27,6 +68,22 @@ pub fn get_node_from_effects(effects: Vec<crate::engine::Effect>) -> crate::dag:
         .expect("No node found in effects")
 }
 
+/// Returns all nodes from effects in order.
+pub fn get_all_nodes_from_effects(
+    effects: &[crate::engine::Effect],
+) -> Vec<crate::dag::MerkleNode> {
+    effects
+        .iter()
+        .filter_map(|e| {
+            if let crate::engine::Effect::WriteStore(_, node, _) = e {
+                Some(node.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 pub fn is_verified_in_effects(effects: &[crate::engine::Effect]) -> bool {
     effects.iter().any(|e| {
         if let crate::engine::Effect::WriteStore(_, _, verified) = e {
@@ -39,6 +96,17 @@ pub fn is_verified_in_effects(effects: &[crate::engine::Effect]) -> bool {
 
 pub fn has_verified_in_effects(effects: &[crate::engine::Effect]) -> bool {
     is_verified_in_effects(effects)
+}
+
+/// Transfers wire nodes from authoring effects into a receiving store.
+/// Call this before `handle_node` so encrypt-then-sign verification can
+/// look up the wire node's auth data (ciphertext) to verify the signature.
+pub fn transfer_wire_nodes(effects: &[crate::engine::Effect], store: &dyn crate::sync::NodeStore) {
+    for effect in effects {
+        if let crate::engine::Effect::WriteWireNode(cid, hash, node) = effect {
+            let _ = store.put_wire_node(cid, hash, node.clone());
+        }
+    }
 }
 
 pub fn apply_effects(effects: Vec<crate::engine::Effect>, store: &dyn crate::sync::NodeStore) {

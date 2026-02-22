@@ -1,6 +1,6 @@
 use merkle_tox_core::dag::{
     Content, ControlAction, ConversationId, Ed25519Signature, LogicalIdentityPk, MerkleNode,
-    NodeAuth, NodeHash, NodeMac, PhysicalDevicePk,
+    NodeAuth, NodeHash, PhysicalDevicePk,
 };
 use merkle_tox_core::engine::session::{Handshake, SyncSession};
 use merkle_tox_core::sync::{BlobStore, NodeStore, SyncHeads};
@@ -31,7 +31,8 @@ fn test_blob_discovery() {
             metadata: vec![],
         },
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
 
     session.on_node_received(&node, &store, Some(&store));
@@ -93,13 +94,16 @@ fn test_shallow_sync_snapshot_stop() {
         sequence_number: 100,
         topological_rank: 100,
         network_timestamp: 1000,
-        content: Content::Control(ControlAction::Snapshot {
-            basis_hash: NodeHash::from([0xBBu8; 32]),
-            members: vec![],
-            last_seq_numbers: vec![],
-        }),
+        content: Content::Control(ControlAction::Snapshot(
+            merkle_tox_core::dag::SnapshotData {
+                basis_hash: NodeHash::from([0xBBu8; 32]),
+                members: vec![],
+                last_seq_numbers: vec![],
+            },
+        )),
         metadata: vec![],
         authentication: NodeAuth::Signature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
 
     session.on_node_received(&snapshot, &store, None);
@@ -141,7 +145,8 @@ fn test_shallow_sync_limits() {
         network_timestamp: 1100,
         content: Content::Text("hello".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
 
     session.on_node_received(&node_rank_11, &store, None);
@@ -158,7 +163,8 @@ fn test_shallow_sync_limits() {
         network_timestamp: 1000,
         content: Content::Text("hello".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
 
     session.on_node_received(&node_rank_10, &store, None);
@@ -183,7 +189,8 @@ fn test_shallow_sync_limits() {
         network_timestamp: 400,
         content: Content::Text("hello".to_string()),
         metadata: vec![],
-        authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+        authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+        pow_nonce: 0,
     };
 
     session_time.on_node_received(&node_time_400, &store, None);
@@ -207,7 +214,6 @@ fn test_sync_session_iblt() {
     let node2_hash = NodeHash::from([0x22u8; 32]);
 
     let range = SyncRange {
-        epoch: 0,
         min_rank: 0,
         max_rank: 100,
     };

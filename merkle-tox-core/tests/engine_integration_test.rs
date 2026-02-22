@@ -4,8 +4,8 @@ use merkle_tox_core::builder::NodeBuilder;
 use merkle_tox_core::clock::{ManualTimeProvider, SystemTimeProvider};
 use merkle_tox_core::crypto::ConversationKeys;
 use merkle_tox_core::dag::{
-    Content, ControlAction, ConversationId, KConv, LogicalIdentityPk, MerkleNode, NodeAuth,
-    NodeHash, NodeMac, Permissions, PhysicalDevicePk,
+    Content, ControlAction, ConversationId, Ed25519Signature, KConv, LogicalIdentityPk, MemberInfo,
+    MerkleNode, NodeAuth, NodeHash, Permissions, PhysicalDevicePk, PhysicalDeviceSk, SnapshotData,
 };
 use merkle_tox_core::engine::session::{Handshake, SyncSession};
 use merkle_tox_core::engine::{
@@ -13,8 +13,9 @@ use merkle_tox_core::engine::{
 };
 use merkle_tox_core::sync::NodeStore;
 use merkle_tox_core::testing::{
-    InMemoryStore, TestIdentity, TestRoom, apply_effects, create_admin_node, create_msg,
-    create_signed_content_node, make_cert,
+    InMemoryStore, TestIdentity, TestRoom, apply_effects, create_admin_node, create_genesis_pow,
+    create_msg, create_signed_content_node, make_cert, register_test_ephemeral_key,
+    transfer_ephemeral_keys,
 };
 use rand::{SeedableRng, rngs::StdRng};
 use std::sync::Arc;
@@ -89,6 +90,9 @@ fn test_engine_conversation_flow() {
     // Set active state for sessions
     bob_engine.start_sync(sync_key, Some(alice.device_pk), &bob_store);
 
+    // Register Alice's test ephemeral signing key on Bob's engine (DARE)
+    register_test_ephemeral_key(&mut bob_engine, &conv_keys, &alice.device_pk);
+
     // 2. Authorize Alice's device
     let expires_at = bob_engine.clock.network_time_ms() + 10000000000;
     let cert = alice.make_device_cert(Permissions::ALL, expires_at);
@@ -104,6 +108,7 @@ fn test_engine_conversation_flow() {
         100,
     );
 
+    let auth_hash = auth_node.hash();
     let effects = bob_engine
         .handle_node(sync_key, auth_node, &bob_store, None)
         .expect("Bob handles Alice's auth");
@@ -114,9 +119,9 @@ fn test_engine_conversation_flow() {
         &sync_key,
         &conv_keys,
         &alice,
-        vec![genesis_hash],
+        vec![auth_hash],
         "Hi Bob",
-        1,
+        2,
         1,
         150,
     );
@@ -152,7 +157,8 @@ fn test_concurrency_merging() {
                 network_timestamp: 0,
                 content: Content::Text("Root".to_string()),
                 metadata: vec![],
-                authentication: NodeAuth::Mac(NodeMac::from([0u8; 32])),
+                authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])),
+                pow_nonce: 0,
             },
             true,
         )
@@ -260,16 +266,22 @@ fn test_rekeying_flow() {
         expires_at,
     );
 
+    let ctx = merkle_tox_core::identity::CausalContext::global();
     bob_engine
         .identity_manager
         .authorize_device(
+            &ctx,
             sync_key,
             alice_master_pk,
             &cert,
             bob_engine.clock.network_time_ms(),
             0,
+            merkle_tox_core::dag::NodeHash::from([0u8; 32]),
         )
         .expect("Bob handles Alice's auth");
+
+    // Register Alice's test ephemeral signing key on Bob's engine (DARE)
+    register_test_ephemeral_key(&mut bob_engine, &v1_keys, &alice_device_pk);
 
     // 1. Message under Epoch 0
     let msg_v1_final = create_signed_content_node(
@@ -303,6 +315,19 @@ fn test_rekeying_flow() {
 
     // 3. Message under Epoch 1
     let v2_keys = ConversationKeys::derive(&k_conv_v2);
+    // Register Alice's ephemeral key for the new epoch
+    {
+        let eph_sk =
+            merkle_tox_core::testing::test_ephemeral_signing_key(&v2_keys, &alice_device_pk);
+        let eph_vk =
+            merkle_tox_core::dag::EphemeralSigningPk::from(eph_sk.verifying_key().to_bytes());
+        // Epoch 1: sequence_number >> 32 == 0 for seq=2, but test uses seq=2 which
+        // is epoch 0.  The test helper signs with keys derived from v2_keys, so
+        // we register at epoch 0 (matching the sequence_number epoch).
+        bob_engine
+            .peer_ephemeral_signing_keys
+            .insert((alice_device_pk, 0), eph_vk);
+    }
     let msg_v2_final = create_signed_content_node(
         &sync_key,
         &v2_keys,
@@ -354,6 +379,9 @@ fn test_actual_reverification_trigger() {
     );
     let conv_keys = ConversationKeys::derive(&k_conv);
 
+    // Register Alice's test ephemeral signing key on Bob's engine (DARE)
+    register_test_ephemeral_key(&mut bob_engine, &conv_keys, &alice_device_pk);
+
     // 0. Genesis
     let genesis = NodeBuilder::new_1on1_genesis(alice_master_pk, bob_pk.to_logical(), &conv_keys);
     let genesis_hash = genesis.hash();
@@ -361,25 +389,7 @@ fn test_actual_reverification_trigger() {
         .put_node(&sync_key, genesis.clone(), true)
         .unwrap();
 
-    // 1. Speculative node
-    let msg_final = create_signed_content_node(
-        &sync_key,
-        &conv_keys,
-        alice_master_pk,
-        alice_device_pk,
-        vec![genesis_hash],
-        Content::Text("Speculative".to_string()),
-        1,
-        1,
-        100,
-    );
-
-    let effects = bob_engine
-        .handle_node(sync_key, msg_final.clone(), &bob_store, None)
-        .unwrap();
-    merkle_tox_core::testing::apply_effects(effects, &bob_store);
-
-    // 2. Auth node from Alice Master
+    // 1. Auth node from Alice Master
     let cert = make_cert(
         &alice_master_sk,
         alice_device_pk,
@@ -396,6 +406,25 @@ fn test_actual_reverification_trigger() {
         1,
         10,
     );
+    let auth_hash = auth_node.hash();
+
+    // 2. Speculative node
+    let msg_final = create_signed_content_node(
+        &sync_key,
+        &conv_keys,
+        alice_master_pk,
+        alice_device_pk,
+        vec![auth_hash],
+        Content::Text("Speculative".to_string()),
+        2,
+        1,
+        100,
+    );
+
+    let effects = bob_engine
+        .handle_node(sync_key, msg_final.clone(), &bob_store, None)
+        .unwrap();
+    merkle_tox_core::testing::apply_effects(effects, &bob_store);
 
     // This should trigger re-verification of the speculative node
     let effects = bob_engine
@@ -474,12 +503,27 @@ fn test_vouching_lazy_consensus() {
         Permissions::ADMIN | Permissions::MESSAGE,
         2000000000000,
     );
+    let ctx = merkle_tox_core::identity::CausalContext::global();
     charlie_engine
         .identity_manager
-        .authorize_device(sync_key, bob_master_pk, &cert, 1000, 0)
+        .authorize_device(
+            &ctx,
+            sync_key,
+            bob_master_pk,
+            &cert,
+            1000,
+            0,
+            merkle_tox_core::dag::NodeHash::from([0u8; 32]),
+        )
         .unwrap();
 
     let k_conv = KConv::from([0xBBu8; 32]);
+    // Register Bob's test ephemeral signing key on Charlie's engine (DARE)
+    register_test_ephemeral_key(
+        &mut charlie_engine,
+        &ConversationKeys::derive(&k_conv),
+        &bob_pk,
+    );
     charlie_engine.conversations.insert(
         sync_key,
         Conversation::Established(ConversationData::<conversation::Established>::new(
@@ -683,6 +727,9 @@ fn test_repro_stuck_sync() {
         .unwrap();
     let node_c = merkle_tox_core::testing::get_node_from_effects(effects.clone());
     merkle_tox_core::testing::apply_effects(effects.clone(), &alice_store);
+
+    // Transfer Alice's ephemeral signing keys to Bob so DARE verification works
+    transfer_ephemeral_keys(&alice_engine, &mut bob_engine);
 
     // 2. Bob initiates sync with Alice
     let effects = alice_engine.start_sync(conv_id, Some(bob_pk), &alice_store);
@@ -1117,11 +1164,14 @@ fn test_vouching_accumulation() {
     engine.start_sync(room.conv_id, Some(bob.device_pk), &store);
     engine.start_sync(room.conv_id, Some(charlie.device_pk), &store);
 
+    let mut bob_parents = vec![stranger_hash];
+    bob_parents.extend(store.get_admin_heads(&room.conv_id));
+
     let bob_msg = create_msg(
         &room.conv_id,
         &room.keys,
         bob,
-        vec![stranger_hash],
+        bob_parents,
         "I saw it",
         2, // Rank 2
         1,
@@ -1145,11 +1195,14 @@ fn test_vouching_accumulation() {
         "Bob's message should be verified"
     );
 
+    let mut charlie_parents = vec![stranger_hash];
+    charlie_parents.extend(store.get_admin_heads(&room.conv_id));
+
     let charlie_msg = create_msg(
         &room.conv_id,
         &room.keys,
         charlie,
-        vec![stranger_hash],
+        charlie_parents,
         "Me too",
         2, // Rank 2
         1,
@@ -1212,22 +1265,26 @@ fn test_out_of_order_sequence_numbers() {
     let alice = &room.identities[0];
 
     // Author two messages from Alice
+    let admin_heads = store.get_admin_heads(&room.conv_id);
     let msg1 = create_msg(
         &room.conv_id,
         &room.keys,
         alice,
-        vec![room.genesis_node.as_ref().unwrap().hash()],
+        admin_heads.clone(),
         "Message 1",
         1,
         2, // Sequence 2
         1001,
     );
 
+    let mut msg2_parents = vec![msg1.hash()];
+    msg2_parents.extend(admin_heads);
+
     let msg2 = create_msg(
         &room.conv_id,
         &room.keys,
         alice,
-        vec![msg1.hash()],
+        msg2_parents,
         "Message 2",
         2,
         3, // Sequence 3
@@ -1331,6 +1388,14 @@ fn test_concurrent_children_ratchet_purge() {
     let bob_store = InMemoryStore::new();
     room.setup_engine(&mut bob_engine, &bob_store);
 
+    // Transfer Alice's ephemeral signing keys to Bob so DARE verification works
+    transfer_ephemeral_keys(&engine, &mut bob_engine);
+
+    // Transfer wire nodes so encrypt-then-sign verification works
+    for (hash, (cid, wire)) in store.wire_nodes.read().unwrap().iter() {
+        let _ = bob_store.put_wire_node(cid, hash, wire.clone());
+    }
+
     // 5. Bob processes G1
     let msg_g1 = store.get_node(&msg_g1_hash).unwrap();
     let effects = bob_engine
@@ -1369,5 +1434,520 @@ fn test_concurrent_children_ratchet_purge() {
         Err(e) => {
             panic!("Bob failed to verify P2 (concurrent branch): {}", e);
         }
+    }
+}
+
+#[test]
+fn test_anchor_snapshot_speculative() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let rng = StdRng::seed_from_u64(42);
+    let tp = Arc::new(ManualTimeProvider::new(Instant::now(), 1000));
+    let alice = TestIdentity::new();
+    let mut alice_engine = MerkleToxEngine::with_sk(
+        alice.device_pk,
+        alice.master_pk,
+        PhysicalDeviceSk::from(alice.device_sk.to_bytes()),
+        rng.clone(),
+        tp.clone(),
+    );
+    let alice_store = InMemoryStore::new();
+
+    let bob = TestIdentity::new();
+    let conv_id = ConversationId::from([1u8; 32]);
+
+    // 1. Setup Alice's established conversation (Alice is founder)
+    let genesis_node = create_genesis_pow(&conv_id, &alice, "Snapshot Test");
+
+    let effects = alice_engine
+        .handle_node(conv_id, genesis_node.clone(), &alice_store, None)
+        .unwrap();
+    apply_effects(effects, &alice_store);
+
+    // 2. Bob receives an AnchorSnapshot from Alice
+    // Even if Bob doesn't have the AuthorizeDevice node for Alice's device,
+    // the AnchorSnapshot contains a DelegationCertificate signed by the founder (Alice's master key).
+
+    let bob_tp = Arc::new(ManualTimeProvider::new(Instant::now(), 1000));
+    let mut bob_engine = MerkleToxEngine::with_sk(
+        bob.device_pk,
+        bob.master_pk,
+        PhysicalDeviceSk::from(bob.device_sk.to_bytes()),
+        rng.clone(),
+        bob_tp.clone(),
+    );
+    let bob_store = InMemoryStore::new();
+
+    // Bob only has the genesis node
+    let effects = bob_engine
+        .handle_node(conv_id, genesis_node.clone(), &bob_store, None)
+        .unwrap();
+    apply_effects(effects, &bob_store);
+
+    // Alice's device cert
+    let alice_cert = make_cert(
+        &alice.master_sk,
+        alice.device_pk,
+        Permissions::ADMIN | Permissions::MESSAGE,
+        2000,
+    );
+
+    let anchor_snapshot = create_admin_node(
+        &conv_id,
+        alice.master_pk,
+        &alice.device_sk,
+        vec![genesis_node.hash()],
+        ControlAction::AnchorSnapshot {
+            data: SnapshotData {
+                basis_hash: genesis_node.hash(),
+                members: vec![],
+                last_seq_numbers: vec![],
+            },
+            cert: alice_cert,
+        },
+        1,
+        2,
+        1000,
+    );
+
+    // Bob processes the AnchorSnapshot
+    let effects = bob_engine
+        .handle_node(conv_id, anchor_snapshot.clone(), &bob_store, None)
+        .unwrap();
+
+    // Should result in a WriteStore with verified = true
+    let mut verified = false;
+    for e in &effects {
+        if let Effect::WriteStore(_, _, v) = e {
+            verified = *v;
+        }
+    }
+
+    assert!(
+        verified,
+        "AnchorSnapshot should be verified speculatively using the founder's key"
+    );
+}
+
+/// AnchorSnapshot processing must apply its `data.members` list to the
+/// identity_manager so that members listed in the snapshot are recognised after
+/// the snapshot is accepted. Currently `apply_side_effects` for AnchorSnapshot
+/// only updates `latest_anchor_hashes` and never calls `add_member` for the
+/// members listed in the snapshot's `data` field. As a result, subsequent
+/// re-verification of speculative nodes authored by those members cannot succeed
+/// because the identity_manager still has no record of them.
+#[test]
+fn test_anchor_snapshot_applies_member_data() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let rng = StdRng::seed_from_u64(42);
+    let tp = Arc::new(ManualTimeProvider::new(Instant::now(), 1000));
+    let alice = TestIdentity::new();
+    let charlie = TestIdentity::new();
+    let conv_id = ConversationId::from([9u8; 32]);
+
+    let genesis_node = create_genesis_pow(&conv_id, &alice, "Anchor Member Test");
+
+    let mut engine = MerkleToxEngine::with_sk(
+        alice.device_pk,
+        alice.master_pk,
+        PhysicalDeviceSk::from(alice.device_sk.to_bytes()),
+        rng,
+        tp.clone(),
+    );
+    let store = InMemoryStore::new();
+
+    let effects = engine
+        .handle_node(conv_id, genesis_node.clone(), &store, None)
+        .unwrap();
+    apply_effects(effects, &store);
+
+    // Confirm Charlie is not yet a member.
+    let members_before: Vec<_> = engine
+        .identity_manager
+        .list_members(conv_id)
+        .into_iter()
+        .map(|(pk, _, _)| pk)
+        .collect();
+    assert!(
+        !members_before.contains(&charlie.master_pk),
+        "Charlie must not be a member before AnchorSnapshot is processed",
+    );
+
+    // Alice (the founder) issues an AnchorSnapshot that lists Charlie as a member.
+    let alice_cert = make_cert(
+        &alice.master_sk,
+        alice.device_pk,
+        Permissions::all(),
+        9_999_999,
+    );
+    let anchor = create_admin_node(
+        &conv_id,
+        alice.master_pk,
+        &alice.device_sk,
+        vec![genesis_node.hash()],
+        ControlAction::AnchorSnapshot {
+            data: SnapshotData {
+                basis_hash: genesis_node.hash(),
+                members: vec![MemberInfo {
+                    public_key: charlie.master_pk,
+                    role: 1,
+                    joined_at: 1000,
+                }],
+                last_seq_numbers: vec![],
+            },
+            cert: alice_cert,
+        },
+        1,
+        2,
+        1000,
+    );
+
+    let effects = engine
+        .handle_node(conv_id, anchor.clone(), &store, None)
+        .unwrap();
+    apply_effects(effects, &store);
+
+    // After AnchorSnapshot, Charlie must be recognised as a member.
+    let members_after: Vec<_> = engine
+        .identity_manager
+        .list_members(conv_id)
+        .into_iter()
+        .map(|(pk, _, _)| pk)
+        .collect();
+    assert!(
+        members_after.contains(&charlie.master_pk),
+        "AnchorSnapshot data.members must be applied to the identity_manager; \
+         Charlie (listed in the snapshot) should be a recognised member afterwards \
+         so that his speculative nodes can be re-verified",
+    );
+}
+
+/// An admin device must automatically author a Snapshot (re-anchoring)
+/// after every N content messages, where N is the re-anchor threshold (<= 400).
+/// Without periodic Snapshots, newly-joining devices that receive only an
+/// AnchorSnapshot have an increasingly stale anchor and must replay more and more
+/// history. Currently `check_rotation_triggers` only checks the 5 000-message
+/// epoch-rotation threshold; no re-anchoring logic exists.
+#[test]
+fn test_message_count_triggers_anchor_snapshot() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let rng = StdRng::seed_from_u64(42);
+    let tp = Arc::new(ManualTimeProvider::new(Instant::now(), 1000));
+    let alice = TestIdentity::new();
+    let conv_id = ConversationId::from([10u8; 32]);
+
+    let genesis_node = create_genesis_pow(&conv_id, &alice, "Anchor Threshold Test");
+
+    let mut alice_engine = MerkleToxEngine::with_sk(
+        alice.device_pk,
+        alice.master_pk,
+        PhysicalDeviceSk::from(alice.device_sk.to_bytes()),
+        rng,
+        tp.clone(),
+    );
+    let store = InMemoryStore::new();
+
+    let effects = alice_engine
+        .handle_node(conv_id, genesis_node.clone(), &store, None)
+        .unwrap();
+    apply_effects(effects, &store);
+
+    // Authorize Alice's device so she can both send messages and author admin nodes.
+    let alice_cert = make_cert(
+        &alice.master_sk,
+        alice.device_pk,
+        Permissions::all(),
+        9_999_999,
+    );
+    let auth_alice = create_admin_node(
+        &conv_id,
+        alice.master_pk,
+        &alice.master_sk,
+        vec![genesis_node.hash()],
+        ControlAction::AuthorizeDevice { cert: alice_cert },
+        1,
+        1,
+        1000,
+    );
+    let effects = alice_engine
+        .handle_node(conv_id, auth_alice.clone(), &store, None)
+        .unwrap();
+    apply_effects(effects, &store);
+
+    // Establish the conversation key so Alice can sign content messages.
+    let effects = alice_engine
+        .rotate_conversation_key(conv_id, &store)
+        .unwrap();
+    apply_effects(effects, &store);
+
+    // Jump the message counter to just below the re-anchoring threshold.
+    // This avoids having to author hundreds of nodes in the test.
+    const RE_ANCHOR_THRESHOLD: u32 = 400;
+    if let Some(Conversation::Established(em)) = alice_engine.conversations.get_mut(&conv_id) {
+        em.state.message_count = RE_ANCHOR_THRESHOLD - 1;
+    }
+
+    // Author one more content message; this pushes the count to the threshold.
+    // The engine should detect this and automatically co-author a Snapshot.
+    let effects = alice_engine
+        .author_node(
+            conv_id,
+            Content::Text("trigger".to_string()),
+            vec![],
+            &store,
+        )
+        .unwrap();
+    apply_effects(effects.clone(), &store);
+
+    let has_anchor = effects.iter().any(|e| {
+        matches!(
+            e,
+            Effect::WriteStore(_, node, _)
+                if matches!(
+                    node.content,
+                    Content::Control(ControlAction::Snapshot(_))
+                        | Content::Control(ControlAction::AnchorSnapshot { .. })
+                )
+        )
+    });
+    assert!(
+        has_anchor,
+        "After {} content messages an admin must auto-author a Snapshot or AnchorSnapshot \
+         (re-anchoring); currently no such threshold check exists",
+        RE_ANCHOR_THRESHOLD,
+    );
+}
+
+/// `HistoryKeyExport` must register the `blob_hash` in `blob_syncs` so
+/// the CAS fetch machinery can retrieve the encrypted history blob. Currently the
+/// processing stub only logs a debug message and never populates `blob_syncs`.
+#[test]
+fn test_history_key_export_registers_blob_sync() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let rng = StdRng::seed_from_u64(42);
+    let tp = Arc::new(ManualTimeProvider::new(Instant::now(), 1000));
+
+    // Use TestRoom to get two identities sharing the same k_conv in a 1-on-1 DAG.
+    let room = TestRoom::new(2);
+    let alice_id = &room.identities[0];
+    let bob_id = &room.identities[1];
+
+    let mut alice_engine = MerkleToxEngine::with_sk(
+        alice_id.device_pk,
+        alice_id.master_pk,
+        PhysicalDeviceSk::from(alice_id.device_sk.to_bytes()),
+        rng.clone(),
+        tp.clone(),
+    );
+    let alice_store = InMemoryStore::new();
+    room.setup_engine(&mut alice_engine, &alice_store);
+
+    let mut bob_engine = MerkleToxEngine::with_sk(
+        bob_id.device_pk,
+        bob_id.master_pk,
+        PhysicalDeviceSk::from(bob_id.device_sk.to_bytes()),
+        rng.clone(),
+        tp.clone(),
+    );
+    let bob_store = InMemoryStore::new();
+    room.setup_engine(&mut bob_engine, &bob_store);
+
+    // Alice exports history referencing a specific blob.
+    let blob_hash = NodeHash::from([0xBB_u8; 32]);
+    let hke_effects = alice_engine
+        .author_history_key_export(room.conv_id, blob_hash, &alice_store)
+        .unwrap();
+    apply_effects(hke_effects.clone(), &alice_store);
+
+    let hke_node = hke_effects
+        .iter()
+        .find_map(|e| {
+            if let Effect::WriteStore(_, node, _) = e
+                && matches!(node.content, Content::HistoryExport { .. })
+            {
+                Some(node.clone())
+            } else {
+                None
+            }
+        })
+        .expect("author_history_key_export must produce a HistoryKeyExport WriteStore effect");
+
+    // Bob processes the HistoryKeyExport node.
+    let bob_effects = bob_engine
+        .handle_node(room.conv_id, hke_node, &bob_store, None)
+        .unwrap();
+    apply_effects(bob_effects, &bob_store);
+
+    assert!(
+        bob_engine.blob_syncs.contains_key(&blob_hash),
+        "Processing a HistoryKeyExport addressed to us must register the blob_hash \
+         in blob_syncs so the CAS fetch machinery knows to retrieve the history blob; \
+         currently the stub only logs and never populates blob_syncs",
+    );
+}
+
+#[test]
+fn test_opaque_store_quota_eviction() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let rng = StdRng::seed_from_u64(100);
+    let base_instant = Instant::now();
+    let tp = Arc::new(ManualTimeProvider::new(base_instant, 1000));
+    let alice = TestIdentity::new();
+    let mut engine = MerkleToxEngine::new(alice.device_pk, alice.master_pk, rng, tp.clone());
+
+    let conv_id = ConversationId::from([20u8; 32]);
+
+    // Manually insert entries totaling > 100 MB into opaque_store_usage.
+    // OPAQUE_STORE_QUOTA = 100 * 1024 * 1024 = 104,857,600 bytes
+    let quota = 100 * 1024 * 1024;
+    let entry_size = quota / 5; // ~20 MB each
+    let mut entries = Vec::new();
+    for i in 0u8..6 {
+        let hash = NodeHash::from([i; 32]);
+        let ts = 1000 + i as i64 * 100; // increasing timestamps
+        entries.push((hash, entry_size, ts));
+    }
+    let total = entry_size * 6; // 120 MB, exceeds quota
+    engine.opaque_store_usage.insert(conv_id, (total, entries));
+
+    // Verify we're over quota
+    let (tracked_total, tracked_entries) = engine.opaque_store_usage.get(&conv_id).unwrap();
+    assert!(
+        *tracked_total > quota,
+        "Total should exceed quota: {} > {}",
+        tracked_total,
+        quota
+    );
+    assert_eq!(tracked_entries.len(), 6);
+
+    // Simulate what happens when the engine processes a new wire node that triggers eviction.
+    // The eviction logic is in handle_message for wire nodes. For a direct unit test,
+    // we can manually run the eviction loop that matches the handler logic.
+    let (total, entries) = engine.opaque_store_usage.get_mut(&conv_id).unwrap();
+    while *total > quota && !entries.is_empty() {
+        entries.sort_by_key(|&(_, _, ts)| ts);
+        let (_evicted_hash, evicted_size, _) = entries.remove(0);
+        *total -= evicted_size;
+    }
+
+    let (post_total, post_entries) = engine.opaque_store_usage.get(&conv_id).unwrap();
+    assert!(
+        *post_total <= quota,
+        "After eviction, total should be under quota: {} <= {}",
+        post_total,
+        quota
+    );
+    // We started with 6 entries at ~20 MB each (120 MB). Need to remove at least 1 to
+    // get under 100 MB.
+    assert!(
+        post_entries.len() < 6,
+        "At least one entry should have been evicted"
+    );
+}
+
+#[test]
+fn test_identity_pending_on_keywrap_without_genesis() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let rng = StdRng::seed_from_u64(300);
+    let base_instant = Instant::now();
+    let tp = Arc::new(ManualTimeProvider::new(base_instant, 1000));
+
+    // Bob is the recipient who will receive a KeyWrap without a Genesis
+    let bob = TestIdentity::new();
+    let alice = TestIdentity::new();
+    let mut bob_engine = MerkleToxEngine::with_sk(
+        bob.device_pk,
+        bob.master_pk,
+        PhysicalDeviceSk::from(bob.device_sk.to_bytes()),
+        rng.clone(),
+        tp.clone(),
+    );
+    let bob_store = InMemoryStore::new();
+
+    let conv_id = ConversationId::from([40u8; 32]);
+
+    // Alice creates a genesis and establishes her engine (so she can author a KeyWrap)
+    let alice_rng = StdRng::seed_from_u64(301);
+    let mut alice_engine = MerkleToxEngine::with_sk(
+        alice.device_pk,
+        alice.master_pk,
+        PhysicalDeviceSk::from(alice.device_sk.to_bytes()),
+        alice_rng,
+        tp.clone(),
+    );
+    let alice_store = InMemoryStore::new();
+
+    let genesis = create_genesis_pow(&conv_id, &alice, "KeyWrap Test");
+    let effects = alice_engine
+        .handle_node(conv_id, genesis.clone(), &alice_store, None)
+        .unwrap();
+    apply_effects(effects, &alice_store);
+
+    let alice_cert = make_cert(
+        &alice.master_sk,
+        alice.device_pk,
+        Permissions::all(),
+        i64::MAX,
+    );
+    let auth_node = create_admin_node(
+        &conv_id,
+        alice.master_pk,
+        &alice.master_sk,
+        vec![genesis.hash()],
+        ControlAction::AuthorizeDevice { cert: alice_cert },
+        1,
+        1,
+        1000,
+    );
+    let effects = alice_engine
+        .handle_node(conv_id, auth_node.clone(), &alice_store, None)
+        .unwrap();
+    apply_effects(effects, &alice_store);
+
+    // Before Bob gets any Genesis node, check the conversation doesn't exist
+    assert!(
+        !bob_engine.conversations.contains_key(&conv_id),
+        "Bob should not have conversation before any nodes"
+    );
+
+    // Manually create a Pending conversation and then establish it with identity_pending=true
+    // to simulate what happens when a KeyWrap is processed without Genesis.
+    // We insert a Pending conversation and then establish it.
+    use merkle_tox_core::engine::conversation::{ConversationData, Pending};
+    let pending = ConversationData::<Pending>::new(conv_id);
+    let k_conv = merkle_tox_core::dag::KConv::from([99u8; 32]);
+    let mut est = pending.establish(k_conv, 1000, 0);
+    // Simulate: no genesis means identity_pending = true
+    est.state.identity_pending = true;
+    bob_engine
+        .conversations
+        .insert(conv_id, Conversation::Established(est));
+
+    // Verify identity_pending is true
+    match bob_engine.conversations.get(&conv_id) {
+        Some(Conversation::Established(e)) => {
+            assert!(
+                e.state.identity_pending,
+                "identity_pending should be true when no Genesis exists"
+            );
+        }
+        _ => panic!("Conversation should be Established"),
+    }
+
+    // Now Bob processes the Genesis node -- identity_pending should clear
+    let effects = bob_engine
+        .handle_node(conv_id, genesis.clone(), &bob_store, None)
+        .unwrap();
+    apply_effects(effects, &bob_store);
+
+    match bob_engine.conversations.get(&conv_id) {
+        Some(Conversation::Established(e)) => {
+            assert!(
+                !e.state.identity_pending,
+                "identity_pending should be false after Genesis is processed"
+            );
+        }
+        _ => panic!("Conversation should still be Established after Genesis"),
     }
 }

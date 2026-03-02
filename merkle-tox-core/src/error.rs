@@ -39,6 +39,8 @@ pub enum MerkleToxError {
     Quarantined(NodeHash),
     #[error("Storage error: {0}")]
     Storage(String),
+    #[error("Not authorized")]
+    NotAuthorized,
     #[error("Other error: {0}")]
     Other(String),
 }

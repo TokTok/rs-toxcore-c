@@ -78,6 +78,13 @@ pub struct MerkleToxEngine {
     /// OPK IDs consumed by received KeyWraps.
     /// Maps opk_id to (keywrap_hash, sender_pk, topological_rank) for collision detection.
     pub consumed_opk_ids: HashMap<NodeHash, (NodeHash, PhysicalDevicePk, u64)>,
+    /// Anti-Branching: tracks accepted SoftAnchor (device_pk, basis_hash) pairs
+    /// per conversation. Spec: Relays MUST accept only one SoftAnchor per
+    /// device_pk per basis_hash.
+    pub soft_anchor_dedup: HashMap<ConversationId, HashSet<(PhysicalDevicePk, NodeHash)>>,
+    /// Our DelegationCertificate per conversation, captured from our
+    /// AuthorizeDevice node. Needed for SoftAnchor authoring.
+    pub self_certs: HashMap<ConversationId, crate::dag::DelegationCertificate>,
 }
 
 /// State for pending KeyWrap awaiting KEYWRAP_ACK.
@@ -182,6 +189,8 @@ impl MerkleToxEngine {
             trust_restored_devices: HashMap::new(),
             keywrap_pending: HashMap::new(),
             consumed_opk_ids: HashMap::new(),
+            soft_anchor_dedup: HashMap::new(),
+            self_certs: HashMap::new(),
         }
     }
 
@@ -884,6 +893,23 @@ impl<'a> crate::dag::NodeLookup for EngineStore<'a> {
     }
     fn has_children(&self, hash: &NodeHash) -> bool {
         self.store.has_children(hash)
+    }
+    fn get_soft_anchor_chain_length(&self, hash: &NodeHash) -> Option<u64> {
+        // Check pending cache first
+        let cached_node = self.cache.lock().nodes.get(hash).cloned();
+        if let Some(node) = cached_node {
+            if let crate::dag::Content::Control(crate::dag::ControlAction::SoftAnchor {
+                basis_hash,
+                ..
+            }) = &node.content
+            {
+                let parent_count = self.get_soft_anchor_chain_length(basis_hash).unwrap_or(0);
+                return Some(1 + parent_count);
+            } else {
+                return Some(0);
+            }
+        }
+        self.store.get_soft_anchor_chain_length(hash)
     }
 }
 

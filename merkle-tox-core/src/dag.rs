@@ -269,9 +269,13 @@ pub trait NodeLookup {
     fn get_admin_distance(&self, hash: &NodeHash) -> Option<u64>;
     fn contains_node(&self, hash: &NodeHash) -> bool;
     fn has_children(&self, hash: &NodeHash) -> bool;
+    /// Returns number of consecutive SoftAnchor ancestors ending at `hash`.
+    /// 0 for non-SoftAnchor admin nodes, None if hash doesn't exist.
+    fn get_soft_anchor_chain_length(&self, hash: &NodeHash) -> Option<u64>;
 }
 
 pub const POW_DIFFICULTY: u32 = 20; // Spec: BASELINE_POW_DIFFICULTY = 20 bits
+pub const MAX_SOFT_ANCHOR_CHAIN: u64 = 3;
 
 pub const MAX_PARENTS: usize = 16;
 pub const MAX_ANCESTRY_HOPS: u64 = 500;
@@ -321,6 +325,10 @@ pub enum ValidationError {
     MacMismatch,
     #[error("Message too large: {actual} bytes (max {max})")]
     MaxMessageSizeExceeded { actual: usize, max: usize },
+    #[error("SoftAnchor must have exactly one parent (the basis_hash)")]
+    SoftAnchorInvalidParent,
+    #[error("SoftAnchor chaining cap exceeded: {actual} (max {max})")]
+    SoftAnchorChainingCapExceeded { actual: u64, max: u64 },
 }
 
 /// Wire-format fields 1 to 6 of WireNode, used as signature input.
@@ -610,6 +618,24 @@ impl MerkleNode {
                     None => {
                         return Err(ValidationError::MissingParents(vec![*parent_hash]));
                     }
+                }
+            }
+        }
+
+        // 4b. SoftAnchor-specific constraints
+        if let Content::Control(ControlAction::SoftAnchor { basis_hash, .. }) = &self.content {
+            // Single-parent: MUST have exactly basis_hash as sole parent
+            if self.parents.len() != 1 || self.parents[0] != *basis_hash {
+                return Err(ValidationError::SoftAnchorInvalidParent);
+            }
+            // Chaining cap: max 3 consecutive SoftAnchors
+            if let Some(chain_len) = lookup.get_soft_anchor_chain_length(basis_hash) {
+                let new_chain_len = chain_len + 1;
+                if new_chain_len > MAX_SOFT_ANCHOR_CHAIN {
+                    return Err(ValidationError::SoftAnchorChainingCapExceeded {
+                        actual: new_chain_len,
+                        max: MAX_SOFT_ANCHOR_CHAIN,
+                    });
                 }
             }
         }

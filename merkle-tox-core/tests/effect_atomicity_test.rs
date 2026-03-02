@@ -62,6 +62,9 @@ impl merkle_tox_core::dag::NodeLookup for FailingStore {
     fn has_children(&self, hash: &NodeHash) -> bool {
         self.inner.has_children(hash)
     }
+    fn get_soft_anchor_chain_length(&self, hash: &NodeHash) -> Option<u64> {
+        self.inner.get_soft_anchor_chain_length(hash)
+    }
 }
 
 impl NodeStore for FailingStore {

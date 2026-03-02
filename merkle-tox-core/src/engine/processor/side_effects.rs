@@ -86,6 +86,10 @@ impl MerkleToxEngine {
                     node_ref.topological_rank,
                     node.hash(),
                 )?;
+                // Store our cert for SoftAnchor authoring
+                if cert.device_pk == self.self_pk {
+                    self.self_certs.insert(conversation_id, cert.clone());
+                }
             }
             Content::Control(ControlAction::RevokeDevice {
                 target_device_pk, ..

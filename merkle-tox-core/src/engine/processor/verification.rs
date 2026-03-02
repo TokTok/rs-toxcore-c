@@ -700,6 +700,23 @@ impl MerkleToxEngine {
                 }
             }
 
+            // Anti-branching post-check: applies to all SoftAnchors. Speculative
+            // path performs this check, but authorized SoftAnchors bypass it via
+            // generic path, requiring this post-check.
+            if verified
+                && let Content::Control(ControlAction::SoftAnchor { basis_hash, .. }) =
+                    &node.content
+            {
+                let dedup_key = (node.sender_pk, *basis_hash);
+                let dedup_set = self.soft_anchor_dedup.entry(conversation_id).or_default();
+                if !dedup_set.insert(dedup_key) {
+                    tracing::debug!(
+                        "SoftAnchor rejected (authorized path): duplicate (device_pk, basis_hash)"
+                    );
+                    verified = false;
+                }
+            }
+
             if verified {
                 overlay.put_node(&conversation_id, node.clone(), true)?;
             } else {

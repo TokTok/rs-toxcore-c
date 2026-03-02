@@ -17,6 +17,10 @@ const MESSAGES_PER_EPOCH: u32 = 5000;
 const EPOCH_DURATION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// Re-anchor every N content messages so joining devices have fresh anchor.
 const MESSAGES_PER_ANCHOR: u32 = 400;
+/// SoftAnchor auto-trigger: minimum admin-distance hops before considering.
+const SOFT_ANCHOR_MIN_HOPS: u64 = 400;
+/// SoftAnchor auto-trigger: upper bound for randomized threshold.
+const SOFT_ANCHOR_MAX_HOPS: u64 = 450;
 
 impl MerkleToxEngine {
     /// Authors KeyWrap node using X3DH for initial key exchange with peer.
@@ -276,6 +280,37 @@ impl MerkleToxEngine {
             {
                 all_effects.extend(snap_effects);
             }
+
+            // Non-admin SoftAnchor trigger: Level 2 devices author SoftAnchor
+            // at 400-450 hops to reset trust cap.
+            if !should_anchor {
+                let is_admin = self
+                    .self_certs
+                    .get(&conversation_id)
+                    .is_some_and(|c| c.permissions.contains(crate::dag::Permissions::ADMIN));
+                if !is_admin && self.self_certs.contains_key(&conversation_id) {
+                    let heads = store.get_heads(&conversation_id);
+                    let parent_admin_dist = heads
+                        .iter()
+                        .filter_map(|h| store.get_admin_distance(h))
+                        .min()
+                        .unwrap_or(0);
+                    let hops = parent_admin_dist + 1;
+                    if hops >= SOFT_ANCHOR_MIN_HOPS {
+                        let threshold = {
+                            let mut rng = self.rng.lock();
+                            use rand::Rng;
+                            rng.gen_range(SOFT_ANCHOR_MIN_HOPS..=SOFT_ANCHOR_MAX_HOPS)
+                        };
+                        if hops >= threshold
+                            && let Ok(anchor_effects) =
+                                self.author_soft_anchor(conversation_id, store)
+                        {
+                            all_effects.extend(anchor_effects);
+                        }
+                    }
+                }
+            }
         }
 
         Ok(all_effects)
@@ -322,19 +357,22 @@ impl MerkleToxEngine {
             );
 
             // Find or create a session to get the heads.
-            let mut parents = if node_type == NodeType::Admin {
-                overlay.get_admin_heads(&conversation_id)
-            } else {
-                // Content nodes (and bootstrap nodes) must merge both tracks
-                // to causally depend on recent AuthorizeDevice/RevokeDevice nodes.
-                let mut p = overlay.get_heads(&conversation_id);
-                for h in overlay.get_admin_heads(&conversation_id) {
-                    if !p.contains(&h) {
-                        p.push(h);
+            let mut parents =
+                if let Content::Control(ControlAction::SoftAnchor { basis_hash, .. }) = &content {
+                    vec![*basis_hash]
+                } else if node_type == NodeType::Admin {
+                    overlay.get_admin_heads(&conversation_id)
+                } else {
+                    // Content nodes (and bootstrap nodes) must merge both tracks
+                    // to causally depend on recent AuthorizeDevice/RevokeDevice nodes.
+                    let mut p = overlay.get_heads(&conversation_id);
+                    for h in overlay.get_admin_heads(&conversation_id) {
+                        if !p.contains(&h) {
+                            p.push(h);
+                        }
                     }
-                }
-                p
-            };
+                    p
+                };
 
             // RULE: Use only verified heads as parents for new nodes.
             // Prevents using quarantined/speculative nodes as parents.
@@ -1334,6 +1372,30 @@ impl MerkleToxEngine {
             last_seq_numbers,
         }));
 
+        self.author_node(conversation_id, content, Vec::new(), store)
+    }
+
+    /// Authors SoftAnchor node for conversation.
+    /// Allows Level 2 (non-admin) participants to reset 500-hop ancestry
+    /// trust cap when admins are offline.
+    pub fn author_soft_anchor(
+        &mut self,
+        conversation_id: ConversationId,
+        store: &dyn NodeStore,
+    ) -> MerkleToxResult<Vec<Effect>> {
+        let admin_heads = store.get_admin_heads(&conversation_id);
+        if admin_heads.is_empty() {
+            return Err(MerkleToxError::Validation(ValidationError::EmptyDag));
+        }
+        let basis_hash = admin_heads[0];
+
+        let cert = self
+            .self_certs
+            .get(&conversation_id)
+            .ok_or(MerkleToxError::NotAuthorized)?
+            .clone();
+
+        let content = Content::Control(ControlAction::SoftAnchor { basis_hash, cert });
         self.author_node(conversation_id, content, Vec::new(), store)
     }
 }

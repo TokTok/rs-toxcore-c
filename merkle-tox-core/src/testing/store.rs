@@ -90,6 +90,24 @@ impl crate::dag::NodeLookup for InMemoryStore {
             .get(hash)
             .is_some_and(|c| !c.is_empty())
     }
+    fn get_soft_anchor_chain_length(&self, hash: &NodeHash) -> Option<u64> {
+        let node = self
+            .nodes
+            .read()
+            .unwrap()
+            .get(hash)
+            .map(|(n, _)| n.clone())?;
+        if let crate::dag::Content::Control(crate::dag::ControlAction::SoftAnchor {
+            basis_hash,
+            ..
+        }) = &node.content
+        {
+            let parent_count = self.get_soft_anchor_chain_length(basis_hash).unwrap_or(0);
+            Some(1 + parent_count)
+        } else {
+            Some(0)
+        }
+    }
 }
 
 impl crate::sync::NodeStore for InMemoryStore {
@@ -530,6 +548,9 @@ macro_rules! __delegate_store {
             }
             fn has_children(&self, hash: &$crate::dag::NodeHash) -> bool {
                 self.$field.has_children(hash)
+            }
+            fn get_soft_anchor_chain_length(&self, hash: &$crate::dag::NodeHash) -> Option<u64> {
+                self.$field.get_soft_anchor_chain_length(hash)
             }
         }
 

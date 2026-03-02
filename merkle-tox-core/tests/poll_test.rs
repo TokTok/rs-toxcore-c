@@ -266,6 +266,9 @@ fn test_engine_poll_failure_no_loop() {
         fn has_children(&self, _: &NodeHash) -> bool {
             false
         }
+        fn get_soft_anchor_chain_length(&self, _: &NodeHash) -> Option<u64> {
+            Some(0)
+        }
     }
     impl merkle_tox_core::sync::BlobStore for FailingStore {
         fn has_blob(&self, _: &NodeHash) -> bool {

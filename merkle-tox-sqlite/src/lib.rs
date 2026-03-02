@@ -213,6 +213,18 @@ impl NodeLookup for Storage {
             .unwrap();
         stmt.exists(params![hash.as_bytes()]).unwrap_or(false)
     }
+    fn get_soft_anchor_chain_length(&self, hash: &NodeHash) -> Option<u64> {
+        let node = self.get_node(hash)?;
+        if let merkle_tox_core::dag::Content::Control(
+            merkle_tox_core::dag::ControlAction::SoftAnchor { basis_hash, .. },
+        ) = &node.content
+        {
+            let parent_count = self.get_soft_anchor_chain_length(basis_hash).unwrap_or(0);
+            Some(1 + parent_count)
+        } else {
+            Some(0)
+        }
+    }
 }
 
 impl NodeStore for Storage {

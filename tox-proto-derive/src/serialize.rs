@@ -187,6 +187,37 @@ pub fn derive_tox_serialize_impl(input: DeriveInput) -> TokenStream {
 
                     let v_ident = &v.ident;
 
+                    // Detect #[tox(catch_all)]
+                    let mut is_catch_all = false;
+                    for attr in &v.attrs {
+                        if attr.path().is_ident("tox") {
+                            let _ = attr.parse_nested_meta(|meta| {
+                                if meta.path.is_ident("catch_all") {
+                                    is_catch_all = true;
+                                }
+                                Ok(())
+                            });
+                        }
+                    }
+
+                    if is_catch_all {
+                        // Serialize with stored discriminant, not compile-time idx
+                        return quote! {
+                            #name::#v_ident { discriminant, data } => {
+                                if data.is_empty() {
+                                    (*discriminant as u8).serialize(writer, ctx)?;
+                                } else {
+                                    ::tox_proto::rmp::encode::write_array_len(writer, 2)
+                                        .map_err(|e| ::tox_proto::Error::Serialize(e.to_string()))?;
+                                    (*discriminant as u8).serialize(writer, ctx)?;
+                                    writer.write_all(data)?;
+                                }
+                            }
+                        };
+                    }
+
+                    let _ = idx; // suppress unused warning for catch_all path
+
                     match &v.fields {
                         Fields::Unit => quote! {
                             #name::#v_ident => {

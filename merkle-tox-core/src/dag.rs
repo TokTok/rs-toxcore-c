@@ -209,6 +209,7 @@ pub enum Content {
     },
     // 12: Unknown — forward compatibility catch-all for unrecognized content types.
     // Passes validation but triggers no side effects.
+    #[tox(catch_all)]
     Unknown {
         discriminant: u32,
         data: Vec<u8>,

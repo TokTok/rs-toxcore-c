@@ -580,6 +580,30 @@ pub fn skip_value<R: Read>(reader: &mut R) -> Result<()> {
     Ok(())
 }
 
+/// Reads a single msgpack value from the reader and returns its raw bytes.
+///
+/// This is used by the `#[tox(catch_all)]` derive macro to capture unknown
+/// enum variant payloads for transparent forwarding.
+pub fn capture_value<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
+    struct CaptureReader<'a, R> {
+        inner: &'a mut R,
+        buf: &'a mut Vec<u8>,
+    }
+    impl<R: Read> Read for CaptureReader<'_, R> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(out)?;
+            self.buf.extend_from_slice(&out[..n]);
+            Ok(n)
+        }
+    }
+    let mut buf = Vec::new();
+    skip_value(&mut CaptureReader {
+        inner: reader,
+        buf: &mut buf,
+    })?;
+    Ok(buf)
+}
+
 /// Helper to read an enum header, supporting both naked discriminators and array-wrapped variants.
 pub fn read_enum_header<R: Read>(reader: &mut R, ctx: &ToxContext) -> Result<(u8, u32)> {
     use rmp::Marker;
@@ -588,23 +612,29 @@ pub fn read_enum_header<R: Read>(reader: &mut R, ctx: &ToxContext) -> Result<(u8
     match marker {
         Marker::FixPos(idx) => Ok((idx, 1)),
         Marker::U8 => {
-            let idx =
-                rmp::decode::read_u8(reader).map_err(|e| Error::Deserialize(e.to_string()))?;
-            Ok((idx, 1))
+            // Read raw data byte — marker was already consumed by read_marker.
+            // rmp::decode::read_u8 would re-read the marker (reads marker+data).
+            let mut buf = [0u8; 1];
+            reader.read_exact(&mut buf)?;
+            Ok((buf[0], 1))
         }
         Marker::FixArray(len) => {
             let idx = u8::deserialize(reader, ctx)?;
             Ok((idx, len as u32))
         }
         Marker::Array16 => {
-            let len =
-                rmp::decode::read_u16(reader).map_err(|e| Error::Deserialize(e.to_string()))?;
+            // Read raw 2-byte big-endian length — marker already consumed.
+            let mut buf = [0u8; 2];
+            reader.read_exact(&mut buf)?;
+            let len = u16::from_be_bytes(buf);
             let idx = u8::deserialize(reader, ctx)?;
             Ok((idx, len as u32))
         }
         Marker::Array32 => {
-            let len =
-                rmp::decode::read_u32(reader).map_err(|e| Error::Deserialize(e.to_string()))?;
+            // Read raw 4-byte big-endian length — marker already consumed.
+            let mut buf = [0u8; 4];
+            reader.read_exact(&mut buf)?;
+            let len = u32::from_be_bytes(buf);
             let idx = u8::deserialize(reader, ctx)?;
             Ok((idx, len))
         }

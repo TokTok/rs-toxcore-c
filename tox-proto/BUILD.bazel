@@ -103,6 +103,17 @@ rust_test(
     ],
 )
 
+rust_test(
+    name = "forward-compat-test",
+    srcs = ["tests/forward_compat_test.rs"],
+    edition = "2024",
+    rustc_flags = ["-Clink-arg=-fuse-ld=bfd"],
+    deps = [
+        ":tox-proto",
+        "//rs-toxcore-c/merkle-tox-core",
+    ],
+)
+
 rust_binary(
     name = "proto_bench",
     srcs = ["benches/proto_bench.rs"],
@@ -127,6 +138,7 @@ rust_clippy(
         ":array-regression-test",
         ":flat-test",
         ":bitflags-test",
+        ":forward-compat-test",
         ":proto_bench",
     ],
 )

@@ -299,3 +299,41 @@ fn test_ext_type_skipping() {
     let decoded3: OnlyOne = deserialize(&data3).expect("Failed to skip Ext16");
     assert_eq!(decoded3.a, 789);
 }
+
+#[test]
+fn test_enum_forward_compatibility() {
+    #[derive(Debug, PartialEq, ToxProto)]
+    enum OldEnum {
+        A,
+        B(u32),
+        #[tox(catch_all)]
+        Unknown {
+            discriminant: u32,
+            data: Vec<u8>,
+        },
+    }
+
+    #[derive(Debug, PartialEq, ToxProto)]
+    enum NewEnum {
+        A,
+        B(u32),
+        C(String),
+    }
+
+    // New variant → Old captures it
+    let new_val = NewEnum::C("future data".to_string());
+    let encoded = serialize(&new_val).unwrap();
+    let old_val: OldEnum = deserialize(&encoded).expect("Old should capture new variant");
+    assert!(matches!(
+        old_val,
+        OldEnum::Unknown {
+            discriminant: 2,
+            ..
+        }
+    ));
+
+    // Re-serialize → recover as New
+    let re_encoded = serialize(&old_val).unwrap();
+    let recovered: NewEnum = deserialize(&re_encoded).expect("Should recover new variant");
+    assert_eq!(recovered, new_val, "Transparent round-trip failed");
+}

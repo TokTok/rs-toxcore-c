@@ -198,25 +198,42 @@ pub fn derive_tox_deserialize_impl(input: DeriveInput) -> TokenStream {
         }
         Data::Enum(e) => {
             let mut next_idx = 0u8;
-            let arms: Vec<_> = e.variants.iter().map(|v| {
-                let idx = if let Some((_, expr)) = &v.discriminant {
+            let mut catch_all_ident: Option<syn::Ident> = None;
+            let arms: Vec<_> = e.variants.iter().filter_map(|v| {
+                // Track discriminant even for catch_all variants
+                if let Some((_, expr)) = &v.discriminant {
                     let lit = match expr {
                         syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(lit), .. }) => lit,
                         _ => panic!("Only integer discriminants are supported"),
                     };
                     let val = lit.base10_parse::<u8>().expect("Discriminant must be u8");
                     next_idx = val + 1;
-                    val
                 } else {
-                    let val = next_idx;
                     next_idx += 1;
-                    val
-                };
+                }
 
+                // Detect #[tox(catch_all)] — skip generating a match arm
+                let mut is_catch_all = false;
+                for attr in &v.attrs {
+                    if attr.path().is_ident("tox") {
+                        let _ = attr.parse_nested_meta(|meta| {
+                            if meta.path.is_ident("catch_all") {
+                                is_catch_all = true;
+                            }
+                            Ok(())
+                        });
+                    }
+                }
+                if is_catch_all {
+                    catch_all_ident = Some(v.ident.clone());
+                    return None;
+                }
+
+                let idx = next_idx - 1;
                 let v_ident = &v.ident;
                 let expected_fields = v.fields.len() as u32;
 
-                match &v.fields {
+                Some(match &v.fields {
                     Fields::Unit => quote!(#idx => {
                         if len != 1 {
                             return Err(::tox_proto::Error::Deserialize(format!("Enum unit variant {} must have len 1, got {}", stringify!(#v_ident), len)));
@@ -296,14 +313,30 @@ pub fn derive_tox_deserialize_impl(input: DeriveInput) -> TokenStream {
                             }
                         }
                     }
-                }
+                })
             }).collect();
+
+            let fallthrough = if let Some(catch_all) = &catch_all_ident {
+                quote! {
+                    unknown_idx => {
+                        let mut data = Vec::new();
+                        for _ in 1..len {
+                            data.extend(::tox_proto::capture_value(reader)?);
+                        }
+                        Ok(#name::#catch_all { discriminant: unknown_idx as u32, data })
+                    }
+                }
+            } else {
+                quote! {
+                    _ => Err(::tox_proto::Error::Deserialize(format!("Unknown variant: {}", idx)))
+                }
+            };
 
             let deserialize = quote! {
                 let (idx, len) = ::tox_proto::read_enum_header(reader, ctx)?;
                 match idx {
                     #(#arms)*
-                    _ => Err(::tox_proto::Error::Deserialize(format!("Unknown variant: {}", idx))),
+                    #fallthrough
                 }
             };
             let deserialize_flat = quote! {

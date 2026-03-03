@@ -1,7 +1,7 @@
 use merkle_tox_core::clock::ManualTimeProvider;
 use merkle_tox_core::dag::{
-    Content, ControlAction, ConversationId, EmojiSource, LogicalIdentityPk, NodeHash, NodeLookup,
-    Permissions, PhysicalDevicePk,
+    Content, ControlAction, ConversationId, EmojiSource, LogicalIdentityPk, MerkleNode, NodeHash,
+    NodeLookup, Permissions, PhysicalDevicePk,
 };
 use merkle_tox_core::engine::MerkleToxEngine;
 use merkle_tox_core::sync::NodeStore;
@@ -664,5 +664,61 @@ fn test_legacy_bridge_dedup_validation() {
         format!("{}", err).contains("dedup_id does not match"),
         "Expected InvalidLegacyBridgeDedup, got: {}",
         err
+    );
+}
+
+// ── Forward Compatibility: Unknown Content Types ─────────────────────────
+
+#[test]
+fn test_unknown_content_node_passthrough() {
+    // Simulate a content node from a newer protocol version with discriminant 99.
+    // Build a MerkleNode with known Content, serialize it, then patch the
+    // content discriminant to 99 (unknown) and verify it round-trips.
+
+    let (room, _engine, store) = setup_room();
+    let alice = &room.identities[0];
+    let heads = get_all_heads(&store, &room.conv_id);
+    let parent_rank = get_max_rank(&store, &room.conv_id);
+
+    // 1. Create a Content::Unknown directly — now supported by #[tox(catch_all)]
+    let payload = tox_proto::serialize(&42u32).expect("serialize payload");
+    let unknown_content = Content::Unknown {
+        discriminant: 99,
+        data: payload.clone(),
+    };
+
+    // 2. Verify Content round-trips through serialize/deserialize
+    let content_bytes = tox_proto::serialize(&unknown_content).expect("serialize unknown content");
+    let recovered: Content =
+        tox_proto::deserialize(&content_bytes).expect("deserialize unknown content");
+    assert_eq!(
+        recovered, unknown_content,
+        "Content::Unknown should round-trip"
+    );
+
+    // 3. Verify MerkleNode with Unknown content round-trips
+    let node = create_signed_content_node(
+        &room.conv_id,
+        &room.keys,
+        alice.master_pk,
+        alice.device_pk,
+        heads,
+        unknown_content.clone(),
+        parent_rank + 1,
+        2,
+        2000,
+    );
+    let node_bytes = tox_proto::serialize(&node).expect("serialize node");
+    let recovered_node: MerkleNode = tox_proto::deserialize(&node_bytes).expect("deserialize node");
+    assert_eq!(
+        recovered_node.content, unknown_content,
+        "MerkleNode with Unknown content should round-trip"
+    );
+
+    // 4. Verify the hash is stable across round-trips
+    assert_eq!(
+        node.hash(),
+        recovered_node.hash(),
+        "Hash should be stable across serialization round-trips"
     );
 }

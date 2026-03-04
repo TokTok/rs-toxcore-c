@@ -36,6 +36,23 @@ impl MerkleToxEngine {
     ) -> MerkleToxResult<Vec<Effect>> {
         self.clear_pending();
 
+        // Enforce handshake retry cap: max 3 retries per 10-min window
+        let now = self.clock.network_time_ms();
+        let retry_state = self
+            .handshake_retry_state
+            .entry((conversation_id, peer_pk))
+            .or_default();
+        if retry_state.attempts >= super::HANDSHAKE_RETRY_CAP {
+            if now < retry_state.window_start_ms + super::HANDSHAKE_RETRY_WINDOW_MS {
+                return Ok(Vec::new()); // Rate limited, skip handshake
+            }
+            // Window expired, reset
+            retry_state.attempts = 0;
+            retry_state.window_start_ms = now;
+        } else if retry_state.window_start_ms == 0 {
+            retry_state.window_start_ms = now;
+        }
+
         // Enforce X3DH Last Resort key blocking rule
         if let Some(ControlAction::Announcement {
             last_resort_key, ..
@@ -202,15 +219,20 @@ impl MerkleToxEngine {
             }
         }
 
-        // Block authoring if self is in expired trust-restored state
-        if let Some(&heal_ts) = self
+        // Block authoring if self is in trust-restored observer mode.
+        // Only Announcement and HandshakePulse are allowed (needed for healing protocol).
+        if let Some(&_heal_ts) = self
             .trust_restored_devices
             .get(&(conversation_id, self.self_pk))
         {
-            let now_ms = self.clock.network_time_ms();
-            if now_ms - heal_ts > tox_proto::constants::TRUST_RESTORED_EXPIRY_MS {
+            let allowed = matches!(
+                &content,
+                Content::Control(ControlAction::Announcement { .. })
+                    | Content::Control(ControlAction::HandshakePulse)
+            );
+            if !allowed {
                 return Err(crate::error::MerkleToxError::Other(
-                    "Cannot author: trust-restored state has expired (30-day limit)".to_string(),
+                    "Cannot author: device is in trust-restored observer mode".to_string(),
                 ));
             }
         }
@@ -219,6 +241,13 @@ impl MerkleToxEngine {
         let mut all_effects = Vec::new();
         if self.check_rotation_triggers(conversation_id) {
             let effects = self.rotate_conversation_key(conversation_id, store)?;
+            all_effects.extend(effects);
+        }
+
+        // Per-device Sender Rekey (any device, not just admin).
+        // Only when K_conv rotation is NOT also due (avoids double rotation).
+        if all_effects.is_empty() && self.check_sender_rekey_triggers(conversation_id) {
+            let effects = self.sender_rekey(conversation_id, store)?;
             all_effects.extend(effects);
         }
 
@@ -345,10 +374,7 @@ impl MerkleToxEngine {
                 cache: &self.pending_cache,
             };
 
-            let node_type = match &content {
-                Content::Control(_) => NodeType::Admin,
-                _ => NodeType::Content,
-            };
+            let node_type = content.node_type();
 
             let _is_bootstrap = matches!(
                 content,
@@ -400,20 +426,26 @@ impl MerkleToxEngine {
                 0
             };
 
-            let last_seq = if let Some(Conversation::Established(em)) =
-                self.conversations.get(&conversation_id)
-            {
-                em.get_sender_last_seq(&self.self_pk)
-            } else {
-                let cache = self.pending_cache.lock();
-                let last_verified = cache
+            let last_seq = {
+                // Get sequence from ratchet state (tracks content node ratchet advancement).
+                let from_ratchet = if let Some(Conversation::Established(em)) =
+                    self.conversations.get(&conversation_id)
+                {
+                    em.get_sender_last_seq(&self.self_pk)
+                } else {
+                    0
+                };
+                // Also check last_verified_sequences which tracks ALL nodes including
+                // exception nodes (Admin, Control, SKD) that skip ratchet advancement.
+                let from_cache = self
+                    .pending_cache
+                    .lock()
                     .last_verified_sequences
                     .get(&(conversation_id, self.self_pk))
-                    .cloned();
-                drop(cache);
-                last_verified.unwrap_or_else(|| {
-                    store.get_last_sequence_number(&conversation_id, &self.self_pk)
-                })
+                    .copied()
+                    .unwrap_or(0);
+                let from_store = store.get_last_sequence_number(&conversation_id, &self.self_pk);
+                from_ratchet.max(from_cache).max(from_store)
             };
 
             let use_epoch_id = use_epoch.unwrap_or(current_epoch);
@@ -439,11 +471,12 @@ impl MerkleToxEngine {
                 pow_nonce: 0,
             };
 
-            // KeyWrap must be Ed25519-signed (not ephemeral-signed).
+            // Admin nodes (including KeyWrap) are Ed25519-signed.
             // SKD uses device Signature if no prior epoch ephemeral key
             // (first-ever SKD), otherwise uses EphemeralSignature from
             // previous epoch key (DARE §2).
-            let is_key_wrap = matches!(node.content, Content::KeyWrap { .. });
+            // Announcement/HandshakePulse are Content but device-signed
+            // (pre-establishment exception nodes).
             let is_skd_needs_device_sig =
                 matches!(&node.content, Content::SenderKeyDistribution { .. }) && {
                     let eph_epoch = use_epoch.unwrap_or(0);
@@ -454,6 +487,9 @@ impl MerkleToxEngine {
                             .self_ephemeral_signing_keys
                             .contains_key(&(eph_epoch.saturating_sub(1)))
                 };
+            // All Control actions (Content-type ones) are device-signed.
+            let is_content_control =
+                matches!(&node.content, Content::Control(_)) && node_type == NodeType::Content;
 
             // Pre-packed wire for content nodes (encrypt-then-sign):
             // Content nodes packed BEFORE signing so signature covers
@@ -470,7 +506,7 @@ impl MerkleToxEngine {
             // Content nodes are encrypted, requiring wire (ciphertext) signature.
             let is_exception = node.is_exception_node();
 
-            if node_type == NodeType::Admin || is_key_wrap || is_skd_needs_device_sig {
+            if node_type == NodeType::Admin || is_skd_needs_device_sig || is_content_control {
                 // Path 1: Device signature on exception node.
                 if let Some(sk) = &self.self_sk {
                     let signing_key = SigningKey::from_bytes(sk.as_bytes());
@@ -519,44 +555,31 @@ impl MerkleToxEngine {
                     NodeAuth::EphemeralSignature(crate::dag::Ed25519Signature::from(sig));
             } else {
                 // Path 3: Content nodes (encrypt-then-sign).
-                // 1. Increment message count
-                if let Some(Conversation::Established(em)) =
-                    self.conversations.get_mut(&conversation_id)
+                // 1. Increment message count (skip for HistoryExport: uses export keys, not ratchet)
+                if !matches!(&node.content, Content::HistoryExport { .. })
+                    && let Some(Conversation::Established(em)) =
+                        self.conversations.get_mut(&conversation_id)
                 {
                     em.state.message_count += 1;
+                    em.state.self_message_count += 1;
                 }
 
                 // 2. Pack wire with placeholder auth BEFORE signing
                 if let Some(Conversation::Established(em)) =
                     self.conversations.get_mut(&conversation_id)
                 {
-                    let pack_keys = em
-                        .peek_keys(&node.sender_pk, node.sequence_number, now)
-                        .map(|(k_msg, _k_next)| {
-                            let epoch = node.sequence_number >> 32;
-                            let keys = em
-                                .get_keys(epoch)
-                                .or_else(|| em.get_keys(em.current_epoch()));
-                            let k_conv = keys
-                                .map(|k| &k.k_conv)
-                                .cloned()
-                                .unwrap_or_else(|| KConv::from([0u8; 32]));
-                            let sender_key = em
-                                .state
-                                .sender_keys
-                                .get(&(node.sender_pk, epoch))
-                                .cloned()
-                                .unwrap_or_else(|| {
-                                    SenderKey::from(
-                                        *crate::crypto::ratchet_init_sender(
-                                            &k_conv,
-                                            &node.sender_pk,
-                                        )
-                                        .as_bytes(),
-                                    )
-                                });
-                            let k_header =
-                                crate::crypto::derive_k_header_epoch(&k_conv, &sender_key);
+                    let is_history_export = matches!(&node.content, Content::HistoryExport { .. });
+                    let pack_keys = if is_history_export {
+                        // HistoryExport uses room-wide export keys instead of ratchet keys
+                        let epoch = node.sequence_number >> 32;
+                        let keys = em
+                            .get_keys(epoch)
+                            .or_else(|| em.get_keys(em.current_epoch()));
+                        keys.map(|k| {
+                            let k_msg = crate::dag::MessageKey::from(
+                                *crate::crypto::derive_k_payload_export(&k.k_conv).as_bytes(),
+                            );
+                            let k_header = crate::crypto::derive_k_header_export(&k.k_conv);
                             let mut routing_nonce = [0u8; 12];
                             let mut payload_nonce = [0u8; 12];
                             self.rng.lock().fill_bytes(&mut routing_nonce);
@@ -567,7 +590,46 @@ impl MerkleToxEngine {
                                 routing_nonce,
                                 payload_nonce,
                             })
-                        });
+                        })
+                    } else {
+                        em.peek_keys(&node.sender_pk, node.sequence_number, now)
+                            .map(|(k_msg, _k_next)| {
+                                let epoch = node.sequence_number >> 32;
+                                let keys = em
+                                    .get_keys(epoch)
+                                    .or_else(|| em.get_keys(em.current_epoch()));
+                                let k_conv = keys
+                                    .map(|k| &k.k_conv)
+                                    .cloned()
+                                    .unwrap_or_else(|| KConv::from([0u8; 32]));
+                                let sender_key = em
+                                    .state
+                                    .sender_keys
+                                    .get(&(node.sender_pk, epoch))
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                        SenderKey::from(
+                                            *crate::crypto::ratchet_init_sender(
+                                                &k_conv,
+                                                &node.sender_pk,
+                                            )
+                                            .as_bytes(),
+                                        )
+                                    });
+                                let k_header =
+                                    crate::crypto::derive_k_header_epoch(&k_conv, &sender_key);
+                                let mut routing_nonce = [0u8; 12];
+                                let mut payload_nonce = [0u8; 12];
+                                self.rng.lock().fill_bytes(&mut routing_nonce);
+                                self.rng.lock().fill_bytes(&mut payload_nonce);
+                                crate::crypto::PackKeys::Content(crate::crypto::PackContentKeys {
+                                    k_msg,
+                                    k_header,
+                                    routing_nonce,
+                                    payload_nonce,
+                                })
+                            })
+                    };
                     if let Some(keys) = pack_keys
                         && let Ok(wire) = node.pack_wire(&keys, true)
                     {
@@ -636,6 +698,28 @@ impl MerkleToxEngine {
                 // Exception nodes: pack after signing (wire copies auth from node)
                 let pack_keys = if node.is_exception_node() {
                     Some(crate::crypto::PackKeys::Exception)
+                } else if matches!(&node.content, Content::HistoryExport { .. }) {
+                    // HistoryExport: use room-wide export keys
+                    let epoch = node.sequence_number >> 32;
+                    let keys = em
+                        .get_keys(epoch)
+                        .or_else(|| em.get_keys(em.current_epoch()));
+                    keys.map(|k| {
+                        let k_msg = crate::dag::MessageKey::from(
+                            *crate::crypto::derive_k_payload_export(&k.k_conv).as_bytes(),
+                        );
+                        let k_header = crate::crypto::derive_k_header_export(&k.k_conv);
+                        let mut routing_nonce = [0u8; 12];
+                        let mut payload_nonce = [0u8; 12];
+                        self.rng.lock().fill_bytes(&mut routing_nonce);
+                        self.rng.lock().fill_bytes(&mut payload_nonce);
+                        crate::crypto::PackKeys::Content(crate::crypto::PackContentKeys {
+                            k_msg,
+                            k_header,
+                            routing_nonce,
+                            payload_nonce,
+                        })
+                    })
                 } else {
                     em.peek_keys(&node.sender_pk, node.sequence_number, now)
                         .map(|(k_msg, _k_next)| {
@@ -807,7 +891,12 @@ impl MerkleToxEngine {
             last_resort_key,
         });
 
-        self.author_node(conversation_id, content, Vec::new(), store)
+        let result = self.author_node(conversation_id, content, Vec::new(), store);
+        if result.is_ok() {
+            self.last_announcement_time_ms
+                .insert(conversation_id, self.clock.network_time_ms());
+        }
+        result
     }
 
     /// Checks if a conversation key rotation is triggered by message count or time.
@@ -824,11 +913,195 @@ impl MerkleToxEngine {
         false
     }
 
+    const MESSAGES_PER_SENDER_REKEY: u32 = 5000;
+    const SENDER_REKEY_DURATION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+    /// Checks if this device's per-sender SenderKey rekey is due.
+    pub fn check_sender_rekey_triggers(&mut self, conversation_id: ConversationId) -> bool {
+        let now = self.clock.network_time_ms();
+        if let Some(Conversation::Established(em)) = self.conversations.get(&conversation_id) {
+            em.state.self_message_count >= Self::MESSAGES_PER_SENDER_REKEY
+                || now - em.state.self_last_rekey_time_ms >= Self::SENDER_REKEY_DURATION_MS
+        } else {
+            false
+        }
+    }
+
+    /// Performs a per-device Sender Rekey: generates a fresh SenderKey for the
+    /// current epoch and distributes it via SenderKeyDistribution. Does NOT
+    /// rotate K_conv or change the epoch number.
+    pub fn sender_rekey(
+        &mut self,
+        conversation_id: ConversationId,
+        store: &dyn NodeStore,
+    ) -> MerkleToxResult<Vec<Effect>> {
+        let current_epoch =
+            if let Some(Conversation::Established(em)) = self.conversations.get(&conversation_id) {
+                em.current_epoch()
+            } else {
+                return Ok(Vec::new());
+            };
+
+        // Generate a fresh random SenderKey.
+        let mut sender_key_bytes = [0u8; 32];
+        self.rng.lock().fill_bytes(&mut sender_key_bytes);
+        let sender_key = SenderKey::from(sender_key_bytes);
+
+        // Store at (self_pk, current_epoch) — overwrites old SenderKey.
+        if let Some(Conversation::Established(em)) = self.conversations.get_mut(&conversation_id) {
+            em.state
+                .sender_keys
+                .insert((self.self_pk, current_epoch), sender_key.clone());
+            em.state.self_message_count = 0;
+            em.state.self_last_rekey_time_ms = self.clock.network_time_ms();
+            em.state.shared_keys_sent_to.clear(); // New SenderKey invalidates JIT tracking
+        }
+
+        // Get existing ephemeral signing key for current epoch (NO rotation).
+        let ephemeral_signing_pk =
+            if let Some(sk) = self.self_ephemeral_signing_keys.get(&current_epoch) {
+                EphemeralSigningPk::from(sk.verifying_key().to_bytes())
+            } else {
+                // No ephemeral signing key for this epoch — create one.
+                let mut bytes = [0u8; 32];
+                self.rng.lock().fill_bytes(&mut bytes);
+                let sk = ed25519_dalek::SigningKey::from_bytes(&bytes);
+                let pk = EphemeralSigningPk::from(sk.verifying_key().to_bytes());
+                self.self_ephemeral_signing_keys.insert(current_epoch, sk);
+                pk
+            };
+
+        // Build 72-byte triplet payload.
+        let triplet_payload = {
+            let chain_key = crate::dag::ChainKey::from(*sender_key.as_bytes());
+            let last_seq = self.get_sender_last_seq(conversation_id);
+            let k_header = if let Some(Conversation::Established(em)) =
+                self.conversations.get(&conversation_id)
+            {
+                let keys = em
+                    .get_keys(current_epoch)
+                    .or_else(|| em.get_keys(em.current_epoch()));
+                let k_conv = keys
+                    .map(|k| &k.k_conv)
+                    .cloned()
+                    .unwrap_or_else(|| KConv::from([0u8; 32]));
+                crate::crypto::derive_k_header_epoch(&k_conv, &sender_key)
+            } else {
+                crate::dag::HeaderKey::from([0u8; 32])
+            };
+            let mut payload = Vec::with_capacity(72);
+            payload.extend_from_slice(chain_key.as_bytes());
+            payload.extend_from_slice(&last_seq.to_be_bytes());
+            payload.extend_from_slice(k_header.as_bytes());
+            payload
+        };
+
+        // Wrap the 72-byte triplet for each authorized recipient.
+        let now = self.clock.network_time_ms();
+        let mut skd_e_sk_bytes = [0u8; 32];
+        self.rng.lock().fill_bytes(&mut skd_e_sk_bytes);
+        let skd_e_sk = EphemeralX25519Sk::from(skd_e_sk_bytes);
+        let skd_e_pk = EphemeralX25519Pk::from(
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(skd_e_sk_bytes))
+                .to_bytes(),
+        );
+
+        let dummy_ctx = crate::identity::CausalContext {
+            evaluating_node_hash: crate::dag::NodeHash::from([0u8; 32]),
+            admin_ancestor_hashes: std::collections::HashSet::new(),
+        };
+        let recipients = self.identity_manager.list_active_authorized_devices(
+            &dummy_ctx,
+            conversation_id,
+            now,
+            u64::MAX,
+        );
+
+        let self_dh_sk_bytes = self.self_dh_sk.as_ref().map(|sk| *sk.as_bytes());
+
+        let mut wrapped_keys = Vec::new();
+        for recipient_pk in recipients {
+            if recipient_pk == self.self_pk {
+                continue;
+            }
+            let spk = self.resolve_recipient_spk(&recipient_pk);
+            let (opk, opk_id) = self
+                .consume_recipient_opk(&recipient_pk)
+                .map(|(pk, id)| (Some(pk), id))
+                .unwrap_or((None, NodeHash::from([0u8; 32])));
+            let auth_secret = self_dh_sk_bytes.map(|sk| {
+                let ss = x25519_dalek::StaticSecret::from(sk);
+                let rpk = x25519_dalek::PublicKey::from(*spk.as_bytes());
+                *ss.diffie_hellman(&rpk).as_bytes()
+            });
+            let ciphertext = crate::crypto::ecies_wrap(
+                &skd_e_sk,
+                &spk,
+                opk.as_ref(),
+                auth_secret.as_ref(),
+                &triplet_payload,
+            );
+            wrapped_keys.push(crate::dag::WrappedKey {
+                recipient_pk,
+                ciphertext,
+                opk_id,
+            });
+        }
+
+        // Track which devices received our SenderKey
+        if let Some(Conversation::Established(em)) = self.conversations.get_mut(&conversation_id) {
+            for wrapped in &wrapped_keys {
+                em.state.shared_keys_sent_to.insert(wrapped.recipient_pk);
+            }
+        }
+
+        let content = Content::SenderKeyDistribution {
+            ephemeral_pk: skd_e_pk,
+            wrapped_keys,
+            ephemeral_signing_pk,
+            disclosed_keys: vec![], // No signing key rotation for sender rekey
+        };
+
+        self.author_node_internal(
+            conversation_id,
+            content,
+            Vec::new(),
+            store,
+            Some(current_epoch),
+        )
+    }
+
+    fn get_sender_last_seq(&self, conversation_id: ConversationId) -> u64 {
+        if let Some(Conversation::Established(em)) = self.conversations.get(&conversation_id) {
+            em.get_sender_last_seq(&self.self_pk)
+        } else {
+            0
+        }
+    }
+
     /// Rotates the conversation key, creating Rekey and KeyWrap nodes.
     pub fn rotate_conversation_key(
         &mut self,
         conversation_id: ConversationId,
         store: &dyn NodeStore,
+    ) -> MerkleToxResult<Vec<Effect>> {
+        self.rotate_conversation_key_impl(conversation_id, store, false)
+    }
+
+    /// Post-revocation rotation: includes devices with only last-resort keys.
+    pub fn rotate_conversation_key_post_revocation(
+        &mut self,
+        conversation_id: ConversationId,
+        store: &dyn NodeStore,
+    ) -> MerkleToxResult<Vec<Effect>> {
+        self.rotate_conversation_key_impl(conversation_id, store, true)
+    }
+
+    fn rotate_conversation_key_impl(
+        &mut self,
+        conversation_id: ConversationId,
+        store: &dyn NodeStore,
+        post_revocation: bool,
     ) -> MerkleToxResult<Vec<Effect>> {
         self.clear_pending();
         let now = self.clock.network_time_ms();
@@ -915,7 +1188,7 @@ impl MerkleToxEngine {
                         if pre_keys.is_empty()
                     )
                 });
-            if only_last_resort {
+            if only_last_resort && !post_revocation {
                 tracing::debug!(
                     "Skipping KeyWrap for {:?}: only last-resort key available",
                     recipient_pk
@@ -1028,7 +1301,34 @@ impl MerkleToxEngine {
                 .insert((self.self_pk, new_generation), sender_key.clone());
         }
 
-        // Wrap the SenderKey (not k_conv) for each authorized recipient.
+        // Build 72-byte triplet payload: [chain_key(32) || last_seq(8 BE) || k_header(32)]
+        // chain_key = ratchet_init from SenderKey, last_seq = initial position for epoch,
+        // k_header = derive_k_header_epoch(k_conv, sender_key)
+        let triplet_payload = {
+            let chain_key = crate::dag::ChainKey::from(*sender_key.as_bytes());
+            let last_seq = new_generation << 32; // initial position for this epoch
+            let k_header = if let Some(Conversation::Established(em)) =
+                self.conversations.get(&conversation_id)
+            {
+                let keys = em
+                    .get_keys(new_generation)
+                    .or_else(|| em.get_keys(em.current_epoch()));
+                let k_conv = keys
+                    .map(|k| &k.k_conv)
+                    .cloned()
+                    .unwrap_or_else(|| KConv::from([0u8; 32]));
+                crate::crypto::derive_k_header_epoch(&k_conv, &sender_key)
+            } else {
+                crate::dag::HeaderKey::from([0u8; 32])
+            };
+            let mut payload = Vec::with_capacity(72);
+            payload.extend_from_slice(chain_key.as_bytes());
+            payload.extend_from_slice(&last_seq.to_be_bytes());
+            payload.extend_from_slice(k_header.as_bytes());
+            payload
+        };
+
+        // Wrap the 72-byte triplet for each authorized recipient.
         let now = self.clock.network_time_ms();
         if !matches!(
             self.conversations.get(&conversation_id),
@@ -1074,7 +1374,7 @@ impl MerkleToxEngine {
                 &spk,
                 opk.as_ref(),
                 auth_secret.as_ref(),
-                sender_key.as_bytes(),
+                &triplet_payload,
             );
             wrapped_keys.push(crate::dag::WrappedKey {
                 recipient_pk,

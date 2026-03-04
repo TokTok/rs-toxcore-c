@@ -938,7 +938,7 @@ fn test_concurrent_mad_revocation_respects_seniority_hash() {
     );
 
     // The senior admin (lower auth_hash) must survive; the junior must be revoked.
-    // With the current rank-only comparison both are revoked -- this test should fail.
+    // With the current rank-only comparison both are revoked. This test should fail.
     let alice_is_senior = auth_alice.hash().as_bytes() < auth_bob.hash().as_bytes();
     if alice_is_senior {
         assert!(
@@ -980,7 +980,7 @@ fn test_max_devices_per_identity_enforced() {
     // Register the logical identity as a member so recursive permission lookups work
     id_mgr.add_member(conv_id, master_pk, 0, 1000);
 
-    // Authorize one admin device via Level 1 (master key) -- this always succeeds
+    // Authorize one admin device via Level 1 (master key). This always succeeds.
     let admin_sk = merkle_tox_core::testing::random_signing_key();
     let admin_pk = PhysicalDevicePk::from(admin_sk.verifying_key().to_bytes());
     let admin_cert = make_cert(&master_sk, admin_pk, Permissions::all(), i64::MAX);

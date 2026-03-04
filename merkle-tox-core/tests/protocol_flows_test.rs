@@ -331,6 +331,7 @@ fn test_ratchet_snapshot_recovery() {
     let _key_wrap_node = merkle_tox_core::testing::get_node_from_effects(effects);
 
     // Alice authors 5 messages in Epoch 1
+    let mut last_msg_node = None;
     for i in 0..5 {
         let effects = alice_engine
             .author_node(
@@ -340,8 +341,12 @@ fn test_ratchet_snapshot_recovery() {
                 &alice_store,
             )
             .unwrap();
+        last_msg_node = Some(merkle_tox_core::testing::get_node_from_effects(
+            effects.clone(),
+        ));
         apply_effects(effects, &alice_store);
     }
+    let last_msg_node = last_msg_node.unwrap();
 
     // Alice authors a RatchetSnapshot for Epoch 1
     let effects = alice_engine
@@ -351,7 +356,6 @@ fn test_ratchet_snapshot_recovery() {
             &alice_store,
         )
         .unwrap();
-    let snapshot_node = merkle_tox_core::testing::get_node_from_effects(effects.clone());
     apply_effects(effects, &alice_store);
 
     // Now setup Alice's SECOND device engine
@@ -425,13 +429,15 @@ fn test_ratchet_snapshot_recovery() {
         Conversation::Established(em) => em,
         _ => panic!("A2 conversation should be established"),
     };
+    // HistoryExport skips ratchet advancement (uses export keys, not per-sender
+    // ratchet), so the ratchet head should point to the last content message.
     assert_eq!(
         em.state
             .sender_ratchets
-            .get(&snapshot_node.sender_pk)
+            .get(&last_msg_node.sender_pk)
             .and_then(|(_, _, h, _)| h.as_ref()),
-        Some(&snapshot_node.hash()),
-        "A2 should have committed the ratchet key from the snapshot"
+        Some(&last_msg_node.hash()),
+        "A2 should have committed the ratchet key from the last content message"
     );
 
     // Verify A2 can now verify subsequent messages from A1 because it resumed the ratchet
@@ -510,8 +516,24 @@ fn test_epoch_rotation_ratchet_continuity() {
         .unwrap();
 
     // Initialize
-    let effects = engine.rotate_conversation_key(conv_id, &store).unwrap();
-    apply_effects(effects, &store);
+    let effects_e0 = engine.rotate_conversation_key(conv_id, &store).unwrap();
+    // Capture epoch-0 KeyWrap hash for later admin chain continuity check.
+    let wrap_e0_hash = effects_e0
+        .iter()
+        .filter_map(|e| {
+            if let Effect::WriteStore(_, node, _) = e {
+                if matches!(node.content, Content::KeyWrap { .. }) {
+                    Some(node.hash())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .next()
+        .unwrap();
+    apply_effects(effects_e0, &store);
 
     // Message in Epoch 0
     let effects = engine
@@ -522,7 +544,6 @@ fn test_epoch_rotation_ratchet_continuity() {
             &store,
         )
         .unwrap();
-    let msg_e0 = merkle_tox_core::testing::get_node_from_effects(effects.clone());
     apply_effects(effects, &store);
     assert_eq!(engine.get_current_generation(&conv_id), 0);
 
@@ -547,8 +568,9 @@ fn test_epoch_rotation_ratchet_continuity() {
         .find(|n| matches!(n.content, Content::KeyWrap { .. }))
         .unwrap();
 
-    // Check that KeyWrap node DOES have parents from Epoch 0 (it merges the tracks)
-    assert!(wrap_node.parents.contains(&msg_e0.hash()));
+    // KeyWrap is Admin: it references the epoch-0 KeyWrap (admin chain continuity),
+    // not content messages (chain isolation).
+    assert!(wrap_node.parents.contains(&wrap_e0_hash));
 
     // Rotation also authors a SenderKeyDistribution node (DARE §2)
     let skd_node = nodes

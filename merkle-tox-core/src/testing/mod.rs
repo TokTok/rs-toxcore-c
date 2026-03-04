@@ -16,11 +16,13 @@ pub use identity::{
 pub use store::{InMemoryStore, ManagedStore, delegate_store};
 
 /// Create a Genesis node with valid proof-of-work for testing.
+/// Uses v2 PoW formula (nonce inside genesis action).
 pub fn create_genesis_pow(
     conv_id: &crate::dag::ConversationId,
     alice: &TestIdentity,
     title: &str,
 ) -> crate::dag::MerkleNode {
+    let creator_pk = alice.master_pk;
     let mut node = crate::dag::MerkleNode {
         parents: vec![],
         author_pk: alice.master_pk,
@@ -30,10 +32,11 @@ pub fn create_genesis_pow(
         network_timestamp: 1000,
         content: crate::dag::Content::Control(crate::dag::ControlAction::Genesis {
             title: title.to_string(),
-            creator_pk: alice.master_pk,
+            creator_pk,
             permissions: crate::dag::Permissions::all(),
             flags: 0,
             created_at: 1000,
+            pow_nonce: 0,
         }),
         metadata: vec![],
         authentication: crate::dag::NodeAuth::Signature(crate::dag::Ed25519Signature::from(
@@ -41,17 +44,24 @@ pub fn create_genesis_pow(
         )),
         pow_nonce: 0,
     };
-    sign_admin_node(&mut node, conv_id, &alice.device_sk);
-    let node_hash = node.hash();
-    let creator_pk = alice.master_pk;
+    // Mine v2 PoW: iterate pow_nonce inside genesis action
     let mut nonce = 0u64;
     loop {
-        if crate::dag::validate_pow(creator_pk.as_bytes(), &node_hash, nonce) {
+        if let crate::dag::Content::Control(crate::dag::ControlAction::Genesis {
+            pow_nonce, ..
+        }) = &mut node.content
+        {
+            *pow_nonce = nonce;
+        }
+        if let crate::dag::Content::Control(ref action) = node.content
+            && crate::dag::validate_pow_v2(creator_pk.as_bytes(), action)
+        {
             break;
         }
         nonce += 1;
     }
-    node.pow_nonce = nonce;
+    // Sign after mining (signature covers mined action content)
+    sign_admin_node(&mut node, conv_id, &alice.device_sk);
     node
 }
 

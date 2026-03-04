@@ -230,6 +230,7 @@ fn test_gossip_broadcast() {
             state: merkle_tox_core::engine::conversation::Pending {
                 speculative_nodes: std::collections::HashSet::new(),
                 vouchers: std::collections::HashMap::new(),
+                genesis_flags: 0,
             },
         }),
     );

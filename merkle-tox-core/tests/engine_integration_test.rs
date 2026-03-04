@@ -1938,7 +1938,7 @@ fn test_identity_pending_on_keywrap_without_genesis() {
         _ => panic!("Conversation should be Established"),
     }
 
-    // Now Bob processes the Genesis node -- identity_pending should clear
+    // Now Bob processes the Genesis node. identity_pending should clear.
     let effects = bob_engine
         .handle_node(conv_id, genesis.clone(), &bob_store, None)
         .unwrap();

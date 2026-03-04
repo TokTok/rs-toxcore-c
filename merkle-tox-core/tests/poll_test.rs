@@ -560,7 +560,7 @@ fn test_poll_evicts_stale_skipped_keys() {
             .insert((dummy_sender, stale_seq), (dummy_key, 0i64));
     }
 
-    // Advance both the Instant and the network ms by 25 hours -- the key is stale.
+    // Advance both the Instant and the network ms by 25 hours. The key is stale.
     tp.advance(Duration::from_millis(86_400_001));
 
     // poll() should proactively sweep and evict expired entries.

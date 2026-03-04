@@ -304,6 +304,7 @@ fn test_pow_sensitivity() {
         permissions,
         flags,
         created_at,
+        pow_nonce,
     }) = node.content
     {
         title.push('!');
@@ -314,6 +315,7 @@ fn test_pow_sensitivity() {
                 permissions,
                 flags,
                 created_at,
+                pow_nonce,
             }),
             ..node
         };

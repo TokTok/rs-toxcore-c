@@ -67,14 +67,14 @@ pub struct MemberInfo {
 
 #[derive(Debug, Clone, ToxProto, PartialEq, Eq)]
 pub struct DelegationCertificate {
-    pub device_pk: PhysicalDevicePk,
-    pub permissions: Permissions,
-    pub expires_at: i64,
-    pub signature: Ed25519Signature,
     /// Protocol version at time of signing. Prevents replay across versions.
     pub version: u32,
     /// Conversation this certificate is scoped to. Prevents cross-conversation replay.
     pub conversation_id: ConversationId,
+    pub device_pk: PhysicalDevicePk,
+    pub permissions: Permissions,
+    pub expires_at: i64,
+    pub signature: Ed25519Signature,
 }
 
 #[derive(Debug, Clone, ToxProto, PartialEq, Eq)]
@@ -112,6 +112,9 @@ pub enum ControlAction {
         permissions: Permissions,
         flags: u64,
         created_at: i64,
+        /// PoW nonce for v2 formula (nonce inside action).
+        /// When non-zero, PoW validation uses v2: `blake3(creator_pk || serialize(genesis_action))`.
+        pow_nonce: u64,
     },
     SetTitle(String),
     SetTopic(String),
@@ -207,13 +210,33 @@ pub enum Content {
         message_type: u8,
         dedup_id: NodeHash,
     },
-    // 12: Unknown — forward compatibility catch-all for unrecognized content types.
+    // 12: Unknown. Forward compatibility catch-all for unrecognized content types.
     // Passes validation but triggers no side effects.
     #[tox(catch_all)]
     Unknown {
         discriminant: u32,
         data: Vec<u8>,
     },
+}
+
+impl Content {
+    /// Returns the node type classification for this content.
+    /// Admin = Genesis, AuthorizeDevice, RevokeDevice, Snapshot, AnchorSnapshot, KeyWrap, SoftAnchor.
+    /// Content = everything else.
+    pub fn node_type(&self) -> NodeType {
+        match self {
+            Content::KeyWrap { .. }
+            | Content::Control(
+                ControlAction::Genesis { .. }
+                | ControlAction::AuthorizeDevice { .. }
+                | ControlAction::RevokeDevice { .. }
+                | ControlAction::Snapshot(_)
+                | ControlAction::AnchorSnapshot { .. }
+                | ControlAction::SoftAnchor { .. },
+            ) => NodeType::Admin,
+            _ => NodeType::Content,
+        }
+    }
 }
 
 /// Logical representation of Merkle node.
@@ -379,7 +402,7 @@ fn count_leading_zeros(hash: &[u8; 32]) -> u32 {
     leading_zeros
 }
 
-/// Validates Genesis Proof-of-Work.
+/// Validates Genesis Proof-of-Work (v1 formula).
 ///
 /// PoW input is `creator_pk || node_hash || nonce` where `node_hash` is
 /// Blake3 hash of serialized MerkleNode (excluding `pow_nonce`
@@ -393,17 +416,47 @@ pub fn validate_pow(creator_pk: &[u8; 32], node_hash: &NodeHash, nonce: u64) -> 
     count_leading_zeros(hash.as_bytes()) >= POW_DIFFICULTY
 }
 
+/// Validates Genesis Proof-of-Work (v2 formula).
+///
+/// PoW input is `creator_pk || serialize(genesis_action)` where `genesis_action`
+/// includes the `pow_nonce` field. The nonce is mined by incrementing
+/// `genesis_action.pow_nonce` until the hash has sufficient leading zeros.
+pub fn validate_pow_v2(creator_pk: &[u8; 32], genesis_action: &ControlAction) -> bool {
+    let action_bytes =
+        tox_proto::serialize(genesis_action).expect("Failed to serialize genesis action");
+    let mut input = Vec::with_capacity(32 + action_bytes.len());
+    input.extend_from_slice(creator_pk);
+    input.extend_from_slice(&action_bytes);
+    let hash = blake3::hash(&input);
+    count_leading_zeros(hash.as_bytes()) >= POW_DIFFICULTY
+}
+
 impl MerkleNode {
-    /// Validates Proof-of-Work for Genesis node using external
-    /// `pow_nonce` field.
+    /// Validates Proof-of-Work for Genesis node.
+    ///
+    /// Tries v2 (nonce inside action) first when `genesis.pow_nonce != 0`,
+    /// then falls back to v1 (external `self.pow_nonce`).
     pub fn validate_pow(&self) -> bool {
-        if let Content::Control(ControlAction::Genesis { creator_pk, .. }) = &self.content {
+        if let Content::Control(
+            action @ ControlAction::Genesis {
+                creator_pk,
+                pow_nonce,
+                ..
+            },
+        ) = &self.content
+        {
             // EXCEPTION: 1-on-1 Genesis nodes use EphemeralSignature (MAC-derived pseudo-sig)
             // and don't require PoW.
             if matches!(self.authentication, NodeAuth::EphemeralSignature(_)) {
                 return true;
             }
 
+            // v2: nonce inside genesis action
+            if *pow_nonce != 0 && validate_pow_v2(creator_pk.as_bytes(), action) {
+                return true;
+            }
+
+            // v1 fallback: external nonce
             let node_hash = self.hash();
             validate_pow(creator_pk.as_bytes(), &node_hash, self.pow_nonce)
         } else {
@@ -465,23 +518,28 @@ impl MerkleNode {
     }
 
     pub fn node_type(&self) -> NodeType {
-        match &self.content {
-            Content::Control(_) => NodeType::Admin,
-            _ => NodeType::Content,
-        }
+        self.content.node_type()
     }
 
     /// Returns true if node is "exception" type using cleartext
-    /// wire encoding (no per-message encryption). Admin nodes, KeyWrap,
-    /// HistoryExport, and SenderKeyDistribution are exception nodes.
+    /// wire encoding (no per-message encryption). Admin nodes,
+    /// all Control actions, and SenderKeyDistribution are exception nodes.
+    /// Control actions are device-signed and cleartext regardless of
+    /// node_type() classification (which only affects chain isolation
+    /// and domain separators).
     pub fn is_exception_node(&self) -> bool {
         self.node_type() == NodeType::Admin
             || matches!(
                 self.content,
-                Content::KeyWrap { .. }
-                    | Content::HistoryExport { .. }
-                    | Content::SenderKeyDistribution { .. }
+                Content::Control(_) | Content::SenderKeyDistribution { .. }
             )
+    }
+
+    /// Whether this node skips per-message ratchet advancement.
+    /// Exception nodes skip because they are cleartext. HistoryExport also
+    /// skips because it uses room-wide export keys, not the per-sender ratchet.
+    pub fn skips_ratchet(&self) -> bool {
+        self.is_exception_node() || matches!(self.content, Content::HistoryExport { .. })
     }
 
     /// Verifies the signature of an Admin node.
@@ -548,28 +606,27 @@ impl MerkleNode {
 
         let node_type = self.node_type();
 
-        // KeyWrap always requires Ed25519 Signature.
         // SenderKeyDistribution: epoch 0 uses Signature, epoch n>0 uses EphemeralSignature (DARE §2).
-        let is_key_wrap = matches!(self.content, Content::KeyWrap { .. });
         let is_skd = matches!(self.content, Content::SenderKeyDistribution { .. });
+        // All Control actions use device Signature (they're administrative
+        // actions that need accountability, not deniability).
+        let is_control = matches!(self.content, Content::Control(_));
+        // Combined flag: Content nodes that allow device Signature.
+        let allows_device_sig = is_skd || (is_control && node_type == NodeType::Content);
 
-        // 1. Authentication Rule: Admin nodes and KeyWrap MUST use Signature.
-        //    SKD accepts either Signature (epoch 0) or EphemeralSignature (epoch n>0).
+        // 1. Authentication Rule: Admin nodes (including KeyWrap) MUST use Signature.
+        //    SKD and Announcement/HandshakePulse accept both Signature and EphemeralSignature.
         //    Other content nodes MUST use EphemeralSignature.
-        match (&self.authentication, node_type, is_key_wrap, is_skd) {
-            (NodeAuth::Signature(_), NodeType::Admin, _, _) => {}
-            (NodeAuth::EphemeralSignature(_), NodeType::Content, false, false) => {}
-            (NodeAuth::Signature(_), NodeType::Content, true, _) => {}
-            // SKD allows both Signature and EphemeralSignature
-            (NodeAuth::Signature(_), NodeType::Content, false, true) => {}
-            (NodeAuth::EphemeralSignature(_), NodeType::Content, false, true) => {}
-            (NodeAuth::Signature(_), NodeType::Content, false, false) => {
+        match (&self.authentication, node_type, allows_device_sig) {
+            (NodeAuth::Signature(_), NodeType::Admin, _) => {}
+            (NodeAuth::EphemeralSignature(_), NodeType::Content, false) => {}
+            // SKD and pre-setup nodes allow both Signature and EphemeralSignature
+            (NodeAuth::Signature(_), NodeType::Content, true) => {}
+            (NodeAuth::EphemeralSignature(_), NodeType::Content, true) => {}
+            (NodeAuth::Signature(_), NodeType::Content, false) => {
                 return Err(ValidationError::ContentNodeShouldUseMac);
             }
-            (NodeAuth::EphemeralSignature(_), NodeType::Content, true, _) => {
-                return Err(ValidationError::AdminNodeShouldUseSignature);
-            }
-            (NodeAuth::EphemeralSignature(_), NodeType::Admin, _, _) => {
+            (NodeAuth::EphemeralSignature(_), NodeType::Admin, _) => {
                 // EXCEPTION: 1-on-1 Genesis nodes use EphemeralSignature (MAC-derived pseudo-sig).
                 if let Content::Control(ControlAction::Genesis { .. }) = &self.content {
                     if !self.parents.is_empty() {
@@ -581,11 +638,11 @@ impl MerkleNode {
             }
         }
 
-        // 2. Admin Authenticity: applies to Admin nodes, KeyWrap, and
-        //    Signature-authed SKD (epoch 0). EphemeralSignature SKD (epoch n>0)
-        //    is verified via the ephemeral key path in the engine.
-        let is_signature_skd = is_skd && matches!(self.authentication, NodeAuth::Signature(_));
-        if node_type == NodeType::Admin || is_key_wrap || is_signature_skd {
+        // 2. Admin Authenticity: applies to Admin nodes and any device-signed
+        //    Content exception (SKD epoch 0, Announcement, HandshakePulse).
+        let is_device_signed = matches!(self.authentication, NodeAuth::Signature(_));
+        let is_device_signed_content = allows_device_sig && is_device_signed;
+        if node_type == NodeType::Admin || is_device_signed_content {
             // 0. PoW check for Genesis
             if !self.validate_pow() {
                 return Err(ValidationError::PoWInvalid);
@@ -627,9 +684,14 @@ impl MerkleNode {
             });
         }
 
-        // 4. Chain Isolation: Admin and SoftAnchor nodes MUST ONLY reference other
-        //    Admin or SoftAnchor nodes as parents (merkle-tox-dag.md §3.2).
-        if node_type == NodeType::Admin {
+        // 4. Chain Isolation: Admin nodes MUST ONLY reference other Admin nodes
+        //    as parents (merkle-tox-dag.md §3.2). SoftAnchor is exempt because
+        //    its basis_hash can reference any node type.
+        let is_soft_anchor = matches!(
+            self.content,
+            Content::Control(ControlAction::SoftAnchor { .. })
+        );
+        if node_type == NodeType::Admin && !is_soft_anchor {
             for parent_hash in &self.parents {
                 match lookup.get_node_type(parent_hash) {
                     Some(NodeType::Admin) => {}
@@ -689,7 +751,8 @@ impl MerkleNode {
     /// routing encrypted with K_header AEAD, and 4-byte sender_hint for fast
     /// sender identification.
     ///
-    /// Exception nodes (Admin, KeyWrap, HistoryExport, SKD) use cleartext.
+    /// Exception nodes (Admin, KeyWrap, SKD) use cleartext.
+    /// HistoryExport uses room-wide export keys (k_header_export, k_payload_export).
     pub fn pack_wire(
         &self,
         keys: &crate::crypto::PackKeys,

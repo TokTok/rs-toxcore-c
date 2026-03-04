@@ -1,7 +1,7 @@
 use ed25519_dalek::{Signer, SigningKey};
 use merkle_tox_core::dag::{
-    Content, ControlAction, ConversationId, Ed25519Signature, EphemeralX25519Pk, LogicalIdentityPk,
-    MAX_METADATA_SIZE, MAX_PARENTS, MerkleNode, NodeAuth, NodeHash, PhysicalDevicePk, SignedPreKey,
+    Content, ControlAction, ConversationId, Ed25519Signature, LogicalIdentityPk, MAX_METADATA_SIZE,
+    MAX_PARENTS, MerkleNode, NodeAuth, NodeHash, PhysicalDevicePk,
 };
 use merkle_tox_core::testing::{InMemoryStore, TestIdentity, TestRoom, sign_admin_node, test_node};
 
@@ -124,7 +124,13 @@ fn test_validate_admin_isolation() {
 
     let mut a_node = test_node();
     a_node.topological_rank = 1;
-    a_node.content = Content::Control(ControlAction::SetTitle("Parent Admin".to_string()));
+    a_node.content = Content::Control(ControlAction::Snapshot(
+        merkle_tox_core::dag::SnapshotData {
+            basis_hash: NodeHash::from([0u8; 32]),
+            members: vec![],
+            last_seq_numbers: vec![],
+        },
+    ));
     lookup
         .nodes
         .write()
@@ -132,7 +138,13 @@ fn test_validate_admin_isolation() {
         .insert(admin_parent, (a_node, true));
 
     let mut node = test_node();
-    node.content = Content::Control(ControlAction::SetTitle("Admin".to_string()));
+    node.content = Content::Control(ControlAction::Snapshot(
+        merkle_tox_core::dag::SnapshotData {
+            basis_hash: NodeHash::from([0u8; 32]),
+            members: vec![],
+            last_seq_numbers: vec![],
+        },
+    ));
     sign_admin_node(&mut node, &conv_id, &sk);
     node.topological_rank = 2;
 
@@ -176,7 +188,13 @@ fn test_validate_mixed_parents() {
 
     let mut a_node = test_node();
     a_node.topological_rank = 1;
-    a_node.content = Content::Control(ControlAction::SetTitle("Parent Admin".to_string()));
+    a_node.content = Content::Control(ControlAction::Snapshot(
+        merkle_tox_core::dag::SnapshotData {
+            basis_hash: NodeHash::from([0u8; 32]),
+            members: vec![],
+            last_seq_numbers: vec![],
+        },
+    ));
     lookup
         .nodes
         .write()
@@ -205,7 +223,7 @@ fn test_validate_content_parent_to_admin_v1_rule() {
         .unwrap()
         .insert(content_parent, (c_node, true));
 
-    // Admin node (Announcement)
+    // Admin node (Snapshot, a true Admin type)
     let mut admin_node = MerkleNode {
         parents: vec![content_parent],
         author_pk: LogicalIdentityPk::from(sk.verifying_key().to_bytes()),
@@ -213,14 +231,13 @@ fn test_validate_content_parent_to_admin_v1_rule() {
         sequence_number: 1,
         topological_rank: 2,
         network_timestamp: 1000,
-        content: Content::Control(ControlAction::Announcement {
-            pre_keys: vec![],
-            last_resort_key: SignedPreKey {
-                public_key: EphemeralX25519Pk::from([0u8; 32]),
-                signature: Ed25519Signature::from([0u8; 64]),
-                expires_at: 0,
+        content: Content::Control(ControlAction::Snapshot(
+            merkle_tox_core::dag::SnapshotData {
+                basis_hash: NodeHash::from([0u8; 32]),
+                members: vec![],
+                last_seq_numbers: vec![],
             },
-        }),
+        )),
         metadata: vec![],
         authentication: NodeAuth::Signature(Ed25519Signature::from([0u8; 64])),
         pow_nonce: 0,
@@ -255,7 +272,13 @@ fn test_validate_auth_mismatch() {
 
     // Admin node with MAC -> Fail
     let mut admin_node = test_node();
-    admin_node.content = Content::Control(ControlAction::SetTitle("Admin".to_string()));
+    admin_node.content = Content::Control(ControlAction::Snapshot(
+        merkle_tox_core::dag::SnapshotData {
+            basis_hash: NodeHash::from([0u8; 32]),
+            members: vec![],
+            last_seq_numbers: vec![],
+        },
+    ));
     admin_node.authentication = NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64]));
     let res = admin_node.validate(&conv_id, &lookup);
     assert!(matches!(
@@ -304,7 +327,7 @@ fn test_validate_indirect_cycle() {
 
     // Node1(rank 10) -> Node2(rank 9) -> Node1(rank 10) ... wait.
     // The validator checks topological_rank > parent_rank.
-    // In a DAG, rank must strictly increase.
+    // In a DAG, rank must increase.
 
     let mut n2 = test_node();
     n2.topological_rank = 10;
@@ -428,7 +451,13 @@ fn test_content_sig_domain_separator() {
         sequence_number: 1,
         topological_rank: 0,
         network_timestamp: 1000,
-        content: Content::Control(ControlAction::HandshakePulse),
+        content: Content::Control(ControlAction::Snapshot(
+            merkle_tox_core::dag::SnapshotData {
+                basis_hash: NodeHash::from([0u8; 32]),
+                members: vec![],
+                last_seq_numbers: vec![],
+            },
+        )),
         metadata: vec![],
         authentication: NodeAuth::Signature(Ed25519Signature::from([0u8; 64])),
         pow_nonce: 0,

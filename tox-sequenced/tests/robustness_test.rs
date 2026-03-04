@@ -541,7 +541,7 @@ fn test_out_of_order_acks() {
     });
 
     alice.handle_packet(ack01, current_now + Duration::from_millis(1));
-    // Should be fully acked now
+    // Should be acked now
     assert_eq!(alice.in_flight(), 0);
 }
 

@@ -30,6 +30,7 @@ impl NodeBuilder {
                 permissions: Permissions::ALL,
                 flags: 0,
                 created_at: 0,
+                pow_nonce: 0,
             }),
             metadata: vec![],
             authentication: NodeAuth::EphemeralSignature(Ed25519Signature::from([0u8; 64])), // Placeholder
@@ -68,29 +69,32 @@ impl NodeBuilder {
                 permissions: Permissions::ALL,
                 flags,
                 created_at: timestamp,
+                pow_nonce: 0,
             }),
             metadata: vec![],
             authentication: NodeAuth::Signature(Ed25519Signature::from([0u8; 64])), // Placeholder
             pow_nonce: 0,
         };
 
-        // Sign first: signature is stable because pow_nonce is excluded
-        // from serialization (#[tox(skip)]).
-        let auth_data = node.serialize_for_auth();
-        let sig = signing_key.sign(&auth_data).to_bytes();
-        node.authentication = NodeAuth::Signature(Ed25519Signature::from(sig));
-
-        // Solve PoW: iterate nonces using external formula.
-        // node.hash() is stable because pow_nonce is #[tox(skip)].
-        let node_hash = node.hash();
+        // Solve PoW v2: nonce inside genesis action.
+        // Iterate pow_nonce inside the action; sign after mining.
         let mut nonce = 0u64;
         loop {
-            if crate::dag::validate_pow(creator_pk.as_bytes(), &node_hash, nonce) {
+            if let Content::Control(ControlAction::Genesis { pow_nonce, .. }) = &mut node.content {
+                *pow_nonce = nonce;
+            }
+            if let Content::Control(ref action) = node.content
+                && crate::dag::validate_pow_v2(creator_pk.as_bytes(), action)
+            {
                 break;
             }
             nonce += 1;
         }
-        node.pow_nonce = nonce;
+
+        // Sign after mining: signature covers the mined action
+        let auth_data = node.serialize_for_auth();
+        let sig = signing_key.sign(&auth_data).to_bytes();
+        node.authentication = NodeAuth::Signature(Ed25519Signature::from(sig));
 
         node
     }

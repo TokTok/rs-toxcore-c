@@ -45,7 +45,7 @@ pub const MAX_BATCH_SIZE: usize = MAX_HEADS_SYNC;
 pub const MIN_TRANSPORT_SLOTS: usize = 32;
 
 /// Maximum total memory used for reassembly across all messages (16MB).
-/// Derived to allow 8 peers to fully saturate their 32-slot windows with 64KB blob chunks.
+/// Derived to allow 8 peers to saturate their 32-slot windows with 64KB blob chunks.
 /// Calculation: 8 peers * 32 slots * 64KB = 16MB.
 /// This also protects mobile devices from excessive background memory usage.
 pub const MAX_TOTAL_REASSEMBLY_BUFFER: usize = 8 * 32 * 64 * 1024;
@@ -86,6 +86,10 @@ pub const OPAQUE_STORE_QUOTA: usize = 100 * 1024 * 1024;
 /// ephemeral keys) before the device must publish a fresh Announcement.
 pub const MAX_HANDSHAKES_PER_ANNOUNCEMENT: u32 = 100;
 
+/// Maximum age (ms) of an Announcement before it should be refreshed.
+/// Spec: "Users SHOULD publish a new Announcement every 30 days."
+pub const ANNOUNCEMENT_ROTATION_INTERVAL_MS: i64 = 30 * 24 * 60 * 60 * 1000; // 2,592,000,000
+
 /// Trust-restored devices (healed by AnchorSnapshot) must receive a fresh
 /// KeyWrap within this window, otherwise they are downgraded to permanent
 /// observer mode.
@@ -104,3 +108,14 @@ pub const SKETCH_CPU_WINDOW_MS: u32 = 60_000;
 /// Maximum number of opaque (unreadable) nodes that may be stored per sender
 /// per conversation. Prevents resource exhaustion via targeted flooding.
 pub const MAX_OPAQUE_REQUESTS_PER_VOUCHER: usize = 500;
+
+/// Maximum number of vouchers (distinct devices) per node hash.
+/// Prevents unbounded memory growth from voucher accumulation.
+pub const MAX_VOUCHERS_PER_HASH: usize = 3;
+
+/// Blacklist tier 1 duration: 10 minutes.
+pub const BLACKLIST_TIER1_MS: i64 = 10 * 60 * 1000;
+/// Blacklist tier 2 duration: 1 hour.
+pub const BLACKLIST_TIER2_MS: i64 = 60 * 60 * 1000;
+/// Blacklist tier 3 duration: 24 hours.
+pub const BLACKLIST_TIER3_MS: i64 = 24 * 60 * 60 * 1000;

@@ -30,7 +30,7 @@ impl Plugin for Forwarder {
                 let formatted = format!("<{}> {}", peer_name_str, String::from_utf8_lossy(message));
 
                 // Forward to Conference 0 if it exists
-                // In a more robust design, we'd have a mapping, but original bot uses 0.
+                // TODO: Map groups to conferences instead of hardcoding 0.
                 let conf = bot.conference(ConferenceNumber(0));
                 let _ = conf.send_message(message_type, formatted.as_bytes());
             }

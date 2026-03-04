@@ -123,7 +123,7 @@ pub enum NodeEvent {
         node: dag::MerkleNode,
     },
     /// Node verified but conversation identity unconfirmed.
-    /// Content needs warning until admin chain is fully verified.
+    /// Content needs warning until admin chain is verified.
     NodeIdentityPending {
         conversation_id: ConversationId,
         hash: NodeHash,
@@ -136,7 +136,7 @@ pub enum NodeEvent {
     },
     /// Handshake with peer completed.
     PeerHandshakeComplete { peer_pk: PhysicalDevicePk },
-    /// Blob fully downloaded and verified.
+    /// Blob downloaded and verified.
     BlobAvailable { hash: NodeHash },
 }
 

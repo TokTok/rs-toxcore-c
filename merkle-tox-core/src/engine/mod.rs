@@ -96,11 +96,21 @@ pub struct MerkleToxEngine {
     /// Tracks number of KeywrapAck received per conversation for announcement key erasure.
     /// When ack_count / total_recipients >= 50%, old ephemeral keys should be erased.
     pub keywrap_ack_counts: HashMap<ConversationId, (u32, u32)>, // (acks_received, total_recipients)
+    /// Blacklist state per peer for 3-tier exponential escalation.
+    pub peer_blacklist: HashMap<PhysicalDevicePk, BlacklistState>,
     /// Last time a gossip sketch was broadcast per conversation.
     pub last_gossip_time: HashMap<ConversationId, Instant>,
     /// Our DelegationCertificate per conversation, captured from our
     /// AuthorizeDevice node. Needed for SoftAnchor authoring.
     pub self_certs: HashMap<ConversationId, crate::dag::DelegationCertificate>,
+    /// Node hashes currently being promoted from opaque store.
+    /// Prevents eviction of entries that are mid-promotion in `reverify_opaque_nodes`.
+    pub promotion_locked: HashSet<NodeHash>,
+    /// Per-peer CPU budget for sketch decode operations (token bucket).
+    pub sketch_cpu_budgets: HashMap<PhysicalDevicePk, CpuBudget>,
+    /// Network timestamp (ms) of our last Announcement per conversation.
+    /// Used for 30-day rotation trigger in `poll()`.
+    pub last_announcement_time_ms: HashMap<ConversationId, i64>,
 }
 
 /// State for pending KeyWrap awaiting KEYWRAP_ACK.
@@ -120,6 +130,80 @@ pub struct HandshakeRetryState {
     pub attempts: u32,
     /// Earliest time (network ms) to retry handshake.
     pub next_retry_ms: i64,
+    /// Start of the current retry window (network ms).
+    pub window_start_ms: i64,
+}
+
+/// Per-peer token-bucket CPU budget for IBLT sketch decode operations.
+#[derive(Debug, Clone)]
+pub struct CpuBudget {
+    pub remaining_ms: f64,
+    pub last_refill_ms: i64,
+}
+
+impl CpuBudget {
+    pub fn new(now_ms: i64) -> Self {
+        Self {
+            remaining_ms: tox_proto::constants::SKETCH_CPU_BUDGET_MS as f64,
+            last_refill_ms: now_ms,
+        }
+    }
+
+    /// Refills tokens based on elapsed time (token bucket at constant rate).
+    pub fn refill(&mut self, now_ms: i64) {
+        let elapsed = (now_ms - self.last_refill_ms).max(0) as f64;
+        let rate = tox_proto::constants::SKETCH_CPU_BUDGET_MS as f64
+            / tox_proto::constants::SKETCH_CPU_WINDOW_MS as f64;
+        self.remaining_ms = (self.remaining_ms + elapsed * rate)
+            .min(tox_proto::constants::SKETCH_CPU_BUDGET_MS as f64);
+        self.last_refill_ms = now_ms;
+    }
+
+    /// Tries to consume `cost_ms` from the budget. Returns false if insufficient.
+    pub fn try_consume(&mut self, cost_ms: f64) -> bool {
+        if self.remaining_ms >= cost_ms {
+            self.remaining_ms -= cost_ms;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Maximum handshake retries per peer within a 10-minute window.
+pub const HANDSHAKE_RETRY_CAP: u32 = 3;
+/// Duration of the handshake retry window (10 minutes in ms).
+pub const HANDSHAKE_RETRY_WINDOW_MS: i64 = 600_000;
+
+/// Blacklist state for a peer with 3-tier exponential escalation.
+#[derive(Debug, Clone)]
+pub struct BlacklistState {
+    /// Current blacklist tier (1-3). 0 means not blacklisted.
+    pub tier: u8,
+    /// Time (network ms) when the blacklist expires.
+    pub expires_at_ms: i64,
+}
+
+impl BlacklistState {
+    /// Returns the duration for the given tier.
+    pub fn tier_duration(tier: u8) -> i64 {
+        match tier {
+            1 => tox_proto::constants::BLACKLIST_TIER1_MS,
+            2 => tox_proto::constants::BLACKLIST_TIER2_MS,
+            _ => tox_proto::constants::BLACKLIST_TIER3_MS,
+        }
+    }
+
+    /// Escalates to the next tier, capping at 3.
+    pub fn escalate(&mut self, now_ms: i64) {
+        self.tier = (self.tier + 1).min(3);
+        self.expires_at_ms = now_ms + Self::tier_duration(self.tier);
+    }
+
+    /// Returns true if the peer is currently blacklisted.
+    pub fn is_active(&self, now_ms: i64) -> bool {
+        self.tier > 0 && now_ms < self.expires_at_ms
+    }
 }
 
 pub(crate) struct PendingCache {
@@ -229,7 +313,11 @@ impl MerkleToxEngine {
             equivocations: Vec::new(),
             handshake_retry_state: HashMap::new(),
             keywrap_ack_counts: HashMap::new(),
+            peer_blacklist: HashMap::new(),
             last_gossip_time: HashMap::new(),
+            promotion_locked: HashSet::new(),
+            sketch_cpu_budgets: HashMap::new(),
+            last_announcement_time_ms: HashMap::new(),
         }
     }
 
@@ -356,9 +444,33 @@ impl MerkleToxEngine {
                             node.hash(),
                         );
                     }
-                    ControlAction::Announcement { .. } => {
-                        self.peer_announcements
-                            .insert(node.sender_pk, action.clone());
+                    ControlAction::Announcement {
+                        pre_keys,
+                        last_resort_key,
+                    } => {
+                        use ed25519_dalek::{Verifier, VerifyingKey};
+                        let valid_pre_keys =
+                            if let Ok(vk) = VerifyingKey::from_bytes(node.sender_pk.as_bytes()) {
+                                pre_keys
+                                    .iter()
+                                    .filter(|spk| {
+                                        let sig = ed25519_dalek::Signature::from_bytes(
+                                            spk.signature.as_ref(),
+                                        );
+                                        vk.verify(spk.public_key.as_bytes(), &sig).is_ok()
+                                    })
+                                    .cloned()
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                        self.peer_announcements.insert(
+                            node.sender_pk,
+                            ControlAction::Announcement {
+                                pre_keys: valid_pre_keys,
+                                last_resort_key: last_resort_key.clone(),
+                            },
+                        );
                     }
                     _ => {}
                 }
@@ -641,21 +753,36 @@ impl MerkleToxEngine {
                     effects.extend(conv_effects);
                     // New nodes advertised via heads_dirty in SyncSessions
                 }
+            } else if self.check_sender_rekey_triggers(cid) {
+                // Per-device Sender Rekey for non-admins (admins get it via K_conv rotation)
+                let rekey_effects = self.sender_rekey(cid, store)?;
+                effects.extend(rekey_effects);
             }
         }
 
         // Check if conversation needs announcement rotation after 100 handshakes
-        let handshake_convs: Vec<ConversationId> = self
+        // or after 30 days since last announcement.
+        let now_ms = self.clock.network_time_ms();
+        let mut announcement_convs: Vec<ConversationId> = self
             .handshake_count_since_announcement
             .iter()
             .filter(|&(_, &count)| count >= tox_proto::constants::MAX_HANDSHAKES_PER_ANNOUNCEMENT)
             .map(|(cid, _)| *cid)
             .collect();
-        for cid in handshake_convs {
+        // Also trigger for conversations whose last announcement is older than 30 days
+        for (cid, &last_time) in &self.last_announcement_time_ms {
+            if now_ms - last_time >= tox_proto::constants::ANNOUNCEMENT_ROTATION_INTERVAL_MS
+                && !announcement_convs.contains(cid)
+            {
+                announcement_convs.push(*cid);
+            }
+        }
+        for cid in announcement_convs {
             match self.author_announcement(cid, store) {
                 Ok(ann_effects) => {
                     effects.extend(ann_effects);
                     self.handshake_count_since_announcement.insert(cid, 0);
+                    self.last_announcement_time_ms.insert(cid, now_ms);
                 }
                 Err(e) => {
                     debug!(
@@ -670,7 +797,8 @@ impl MerkleToxEngine {
         // If no ACK within 30s, retry with different OPK (max 3 attempts).
         const KEYWRAP_ACK_TIMEOUT: Duration = Duration::from_secs(30);
         const MAX_KEYWRAP_RETRIES: u32 = 3;
-        let mut keywrap_expired: Vec<NodeHash> = Vec::new();
+        // Collect expired pending info before retain drops it.
+        let mut removed_pending: HashMap<NodeHash, KeyWrapPending> = HashMap::new();
         self.keywrap_pending.retain(|hash, pending| {
             if pending.created_at.elapsed() < KEYWRAP_ACK_TIMEOUT {
                 true // keep: still waiting
@@ -680,7 +808,7 @@ impl MerkleToxEngine {
                     pending.conversation_id,
                     pending.attempts + 1
                 );
-                keywrap_expired.push(*hash);
+                removed_pending.insert(*hash, pending.clone());
                 false // remove: will be re-created on retry
             } else {
                 debug!(
@@ -690,15 +818,27 @@ impl MerkleToxEngine {
                 false // remove: exhausted retries
             }
         });
-        // Retry expired keywrap handshakes — schedule rotation
-        // which will consume a different OPK for the new attempt.
-        for hash in keywrap_expired {
-            // keywrap was already removed from pending; next rotate_conversation_key
-            // will create a new KeyWrap with a fresh OPK.
-            debug!(
-                "Scheduling keywrap retry for timed-out hash {}",
-                hex::encode(hash.as_bytes())
-            );
+        // Retry expired keywrap handshakes with a fresh OPK.
+        for (_hash, pending) in removed_pending {
+            let conv_id = pending.conversation_id;
+            let peer_pk = pending.recipient_pk;
+            let attempt = pending.attempts + 1;
+            if let Some(spk) = self.get_recipient_spk(&peer_pk) {
+                match self.author_x3dh_key_exchange(conv_id, peer_pk, spk, store) {
+                    Ok(fx) => {
+                        // Update attempt counter on the new pending entry.
+                        if let Some(new_pending) = self
+                            .keywrap_pending
+                            .values_mut()
+                            .find(|p| p.conversation_id == conv_id && p.recipient_pk == peer_pk)
+                        {
+                            new_pending.attempts = attempt;
+                        }
+                        effects.extend(fx);
+                    }
+                    Err(e) => debug!("KEYWRAP retry failed for {:?}: {}", conv_id, e),
+                }
+            }
         }
 
         // Handle Blob requests
@@ -988,6 +1128,27 @@ impl MerkleToxEngine {
                 session.common_mut().reachable = reachable;
             }
         }
+    }
+
+    /// Escalates blacklist tier for a peer (called on IBLT decode failure,
+    /// Bao root mismatch, or other protocol violations).
+    pub fn blacklist_escalate(&mut self, peer_pk: PhysicalDevicePk) {
+        let now = self.clock.network_time_ms();
+        let state = self
+            .peer_blacklist
+            .entry(peer_pk)
+            .or_insert(BlacklistState {
+                tier: 0,
+                expires_at_ms: 0,
+            });
+        state.escalate(now);
+    }
+
+    /// Returns true if a peer is currently blacklisted.
+    pub fn is_blacklisted(&self, peer_pk: &PhysicalDevicePk, now_ms: i64) -> bool {
+        self.peer_blacklist
+            .get(peer_pk)
+            .is_some_and(|bl| bl.is_active(now_ms))
     }
 }
 

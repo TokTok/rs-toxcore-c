@@ -45,7 +45,13 @@ fn test_forged_admin_signature_rejected() {
     node.topological_rank = 1;
     node.sequence_number = 2;
     node.network_timestamp = 1000;
-    node.content = Content::Control(ControlAction::SetTitle("Hacked!".to_string()));
+    node.content = Content::Control(ControlAction::Snapshot(
+        merkle_tox_core::dag::SnapshotData {
+            basis_hash: merkle_tox_core::dag::NodeHash::from([0u8; 32]),
+            members: vec![],
+            last_seq_numbers: vec![],
+        },
+    ));
     // Sign serialization with forger's key.
     let auth_data = node.serialize_for_auth();
     let sig = forger_sk.sign(&auth_data).to_bytes();
@@ -539,7 +545,11 @@ fn test_vouching_does_not_bypass_permission_check() {
         charlie.master_pk,
         &charlie.device_sk,
         vec![room.conv_id.to_node_hash()],
-        ControlAction::SetTitle("Hostile Takeover".to_string()),
+        ControlAction::Snapshot(merkle_tox_core::dag::SnapshotData {
+            basis_hash: merkle_tox_core::dag::NodeHash::from([0u8; 32]),
+            members: vec![],
+            last_seq_numbers: vec![],
+        }),
         1,
         1,
         1000,
@@ -563,7 +573,11 @@ fn test_vouching_does_not_bypass_permission_check() {
         alice.master_pk,
         &alice.master_sk,
         vec![room.conv_id.to_node_hash(), charlie_hash],
-        ControlAction::SetTitle("Good Title".to_string()),
+        ControlAction::Snapshot(merkle_tox_core::dag::SnapshotData {
+            basis_hash: merkle_tox_core::dag::NodeHash::from([0u8; 32]),
+            members: vec![],
+            last_seq_numbers: vec![],
+        }),
         2,
         2,
         1001,

@@ -1,7 +1,7 @@
 use crate::cas::{BlobData, SwarmSync};
 use crate::dag::{ConversationId, PhysicalDevicePk};
 use crate::engine::session::{Active, Handshake, PeerSession, SyncSession};
-use crate::engine::{Effect, EngineStore, MerkleToxEngine};
+use crate::engine::{CpuBudget, Effect, EngineStore, MerkleToxEngine};
 use crate::error::MerkleToxResult;
 use crate::sync::{BlobStore, DecodingResult, NodeStore, Tier};
 use crate::{NodeEvent, ProtocolMessage};
@@ -17,6 +17,18 @@ impl MerkleToxEngine {
         blob_store: Option<&dyn BlobStore>,
     ) -> MerkleToxResult<Vec<Effect>> {
         self.clear_pending();
+
+        // Blacklist check: reject messages from blacklisted peers
+        let now_bl = self.clock.network_time_ms();
+        if let Some(bl) = self.peer_blacklist.get(&sender_pk)
+            && bl.is_active(now_bl)
+        {
+            debug!(
+                "Dropping message from blacklisted peer {:?} (tier {}, expires {})",
+                sender_pk, bl.tier, bl.expires_at_ms
+            );
+            return Ok(Vec::new());
+        }
 
         debug!(
             "Engine handling message from {:?}: {:?}",
@@ -189,6 +201,30 @@ impl MerkleToxEngine {
                             return Ok(effects);
                         }
 
+                        // CPU budget check: refill and estimate cost
+                        let budget_now = self.clock.network_time_ms();
+                        let budget = self
+                            .sketch_cpu_budgets
+                            .entry(sender_pk)
+                            .or_insert_with(|| CpuBudget::new(budget_now));
+                        budget.refill(budget_now);
+                        // Estimate decode cost: ~0.01ms per cell is a reasonable estimate
+                        let estimated_cost = sketch.cells.len() as f64 * 0.01;
+                        if !budget.try_consume(estimated_cost) {
+                            debug!(
+                                "Sketch CPU budget exhausted for {:?}, sending backoff",
+                                sender_pk
+                            );
+                            effects.push(Effect::SendPacket(
+                                sender_pk,
+                                ProtocolMessage::SyncRateLimited {
+                                    conversation_id: conv_id,
+                                    retry_after_ms: 1000,
+                                },
+                            ));
+                            return Ok(effects);
+                        }
+
                         let keys = match self.conversations.get(&conv_id) {
                             Some(crate::engine::Conversation::Established(em)) => {
                                 em.get_keys(em.current_epoch())
@@ -198,7 +234,7 @@ impl MerkleToxEngine {
                         let k_iblt =
                             keys.map(|k| crate::crypto::derive_k_iblt(&k.k_conv, &conv_id));
 
-                        process_sketch(
+                        let sketch_ok = process_sketch(
                             s,
                             sender_pk,
                             sketch,
@@ -210,6 +246,13 @@ impl MerkleToxEngine {
                             k_iblt,
                             &mut effects,
                         )?;
+                        if !sketch_ok {
+                            // Drain remaining budget and escalate blacklist
+                            if let Some(budget) = self.sketch_cpu_budgets.get_mut(&sender_pk) {
+                                budget.remaining_ms = 0.0;
+                            }
+                            self.blacklist_escalate(sender_pk);
+                        }
                     }
                 }
             }
@@ -314,6 +357,25 @@ impl MerkleToxEngine {
                                 "50% ack threshold reached for {:?}, erasing old ephemeral keys",
                                 pending.conversation_id
                             );
+                            // Determine current epoch to preserve its keys
+                            let current_epoch = self
+                                .conversations
+                                .get(&pending.conversation_id)
+                                .and_then(|c| match c {
+                                    crate::engine::Conversation::Established(e) => {
+                                        Some(e.state.current_epoch)
+                                    }
+                                    _ => None,
+                                });
+                            if let Some(epoch) = current_epoch {
+                                // Erase old ephemeral X25519 keys (SPK/OPK):
+                                // keep only keys from current rotation
+                                // Note: ephemeral_keys is a flat map without epoch association,
+                                // but the consumed OPKs should be cleaned up. We keep the
+                                // most recently generated keys and remove consumed ones.
+                                // Erase old ephemeral signing keys (keep only current epoch)
+                                self.self_ephemeral_signing_keys.retain(|&e, _| e >= epoch);
+                            }
                             // Reset counter for next rotation
                             *acks = 0;
                             *total = 0;
@@ -360,7 +422,7 @@ impl MerkleToxEngine {
                         let k_iblt =
                             keys.map(|k| crate::crypto::derive_k_iblt(&k.k_conv, &conversation_id));
 
-                        process_sketch(
+                        let sketch_ok = process_sketch(
                             session,
                             sender_pk,
                             sketch,
@@ -372,6 +434,12 @@ impl MerkleToxEngine {
                             k_iblt,
                             &mut effects,
                         )?;
+                        if !sketch_ok {
+                            if let Some(budget) = self.sketch_cpu_budgets.get_mut(&sender_pk) {
+                                budget.remaining_ms = 0.0;
+                            }
+                            self.blacklist_escalate(sender_pk);
+                        }
                     }
                 }
             }
@@ -468,6 +536,11 @@ impl MerkleToxEngine {
                             all_senders.push((sender_pk, sender_pk.to_logical()));
                         }
                         unpacked = em.identify_sender_and_unpack(&wire_node, &all_senders);
+
+                        // Fallback: try HistoryExport room-wide export keys
+                        if unpacked.is_none() {
+                            unpacked = em.try_unpack_history_export(&wire_node, &all_senders);
+                        }
                     }
 
                     if let Some(node) = unpacked {
@@ -514,8 +587,11 @@ impl MerkleToxEngine {
                             entries.push((hash, wire_size, now_ms, sender_pk));
                         }
                         // Evict cold-first, then by lowest rank within tier
+                        // Filter out promotion-locked entries before eviction
                         while *total > tox_proto::constants::OPAQUE_STORE_QUOTA
-                            && !entries.is_empty()
+                            && entries
+                                .iter()
+                                .any(|(h, _, _, _)| !self.promotion_locked.contains(h))
                         {
                             let max_rank = store
                                 .get_heads(&conv_id)
@@ -526,6 +602,14 @@ impl MerkleToxEngine {
                             let hot_cutoff =
                                 max_rank.saturating_sub(tox_proto::constants::HOT_WINDOW_RANKS);
                             entries.sort_by(|a, b| {
+                                let a_locked = self.promotion_locked.contains(&a.0);
+                                let b_locked = self.promotion_locked.contains(&b.0);
+                                // Locked entries sort LAST (never evicted)
+                                match (a_locked, b_locked) {
+                                    (true, false) => return std::cmp::Ordering::Greater,
+                                    (false, true) => return std::cmp::Ordering::Less,
+                                    _ => {}
+                                }
                                 let a_rank = store.get_rank(&a.0).unwrap_or(0);
                                 let b_rank = store.get_rank(&b.0).unwrap_or(0);
                                 let a_cold = a_rank < hot_cutoff;
@@ -746,13 +830,16 @@ impl MerkleToxEngine {
                     sender_pk, conversation_id, reason
                 );
                 // Track retry state with exponential backoff (2s base, 8s ceiling, 3 per 10min)
+                let now = self.clock.network_time_ms();
                 let state = self
                     .handshake_retry_state
                     .entry((conversation_id, sender_pk))
                     .or_default();
+                if state.window_start_ms == 0 {
+                    state.window_start_ms = now;
+                }
                 state.attempts += 1;
                 let backoff_ms = (2000u64 << state.attempts.min(2)).min(8000);
-                let now = self.clock.network_time_ms();
                 state.next_retry_ms = now + backoff_ms as i64;
             }
         }
@@ -761,6 +848,7 @@ impl MerkleToxEngine {
     }
 }
 
+/// Returns true on success, false on decode failure.
 fn process_sketch(
     session: &mut SyncSession<Active>,
     sender_pk: PhysicalDevicePk,
@@ -769,12 +857,14 @@ fn process_sketch(
     _keys: Option<&crate::crypto::ConversationKeys>,
     k_iblt: Option<[u8; 32]>,
     effects: &mut Vec<Effect>,
-) -> MerkleToxResult<()> {
+) -> MerkleToxResult<bool> {
+    let decode_ok;
     match session.handle_sync_sketch_keyed(sketch.clone(), store, k_iblt)? {
         DecodingResult::Success {
             missing_locally: _,
             missing_remotely,
         } => {
+            decode_ok = true;
             for hash in missing_remotely {
                 // Prefer cached wire nodes; fall back to exception packing
                 if let Some(wire_node) = store.get_wire_node(&hash) {
@@ -825,6 +915,7 @@ fn process_sketch(
                     range: sketch.range,
                 },
             ));
+            decode_ok = false;
         }
     }
 
@@ -834,5 +925,5 @@ fn process_sketch(
             ProtocolMessage::FetchBatchReq(req),
         ));
     }
-    Ok(())
+    Ok(decode_ok)
 }

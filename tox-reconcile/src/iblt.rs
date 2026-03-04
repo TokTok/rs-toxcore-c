@@ -54,6 +54,16 @@ impl Tier {
             _ => Tier::Large,
         }
     }
+
+    /// Maximum number of symmetric differences decodable for this tier.
+    pub fn d_max(&self) -> usize {
+        match self {
+            Tier::Tiny => 10,
+            Tier::Small => 40,
+            Tier::Medium => 170,
+            Tier::Large => 680,
+        }
+    }
 }
 
 #[derive(Debug, Clone, ToxProto, PartialEq, Eq, Hash)]
@@ -227,6 +237,12 @@ impl IbltSketch {
                 in_other.push(NodeHash::from(id));
             }
             stats.cells_peeled += 1;
+
+            // D_max cap: abort if total differences exceed tier limit.
+            let d_max = Tier::from_cell_count(self.cells.len()).d_max();
+            if in_self.len() + in_other.len() > d_max {
+                return Err(ReconciliationError::DecodingFailed(stats));
+            }
 
             // Remove the element from all cells it maps to
             let indices = self.get_indices(&id);

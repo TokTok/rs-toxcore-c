@@ -250,14 +250,15 @@ impl MerkleToxEngine {
             if let Content::LegacyBridge {
                 source_pk,
                 text,
+                message_type,
                 dedup_id,
-                ..
             } = &node.content
             {
                 let expected = crate::crypto::derive_legacy_bridge_dedup_id(
+                    &conversation_id,
                     source_pk,
                     text,
-                    node.network_timestamp,
+                    *message_type,
                 );
                 if *dedup_id != expected {
                     return Err(MerkleToxError::Validation(
@@ -377,10 +378,26 @@ impl MerkleToxEngine {
                                     self.consumed_opk_ids.get(&wrapped.opk_id)
                                 {
                                     // Collision detected: same OPK consumed by two KeyWraps.
-                                    // Deterministic tie-breaker: lower topological_rank wins,
-                                    // then lexicographic sender_pk.
-                                    let this_wins = (node.topological_rank, &node.sender_pk)
-                                        < (*prev_rank, prev_sender);
+                                    // Tiebreaker depends on conversation type:
+                                    // - 1-on-1: lexicographic sender_pk comparison
+                                    // - Group: admin seniority (auth_rank, auth_hash)
+                                    let is_dm =
+                                        self.identity_manager.list_members(conversation_id).len()
+                                            <= 2;
+                                    let this_wins = if is_dm {
+                                        node.sender_pk < *prev_sender
+                                    } else {
+                                        // Group: compare admin seniority tuples
+                                        let this_seniority = self
+                                            .identity_manager
+                                            .get_admin_seniority(conversation_id, &node.sender_pk)
+                                            .unwrap_or((u64::MAX, NodeHash::from([0xFF; 32])));
+                                        let prev_seniority = self
+                                            .identity_manager
+                                            .get_admin_seniority(conversation_id, prev_sender)
+                                            .unwrap_or((u64::MAX, NodeHash::from([0xFF; 32])));
+                                        this_seniority < prev_seniority
+                                    };
                                     if !this_wins {
                                         debug!(
                                             "OPK collision: discarding entry from {:?} (rank {}), winner at rank {}",
@@ -490,7 +507,7 @@ impl MerkleToxEngine {
                             .handshake_count_since_announcement
                             .entry(conversation_id)
                             .or_insert(0) += 1;
-                        // Clear trust-restored state: device fully re-included
+                        // Clear trust-restored state: device re-included
                         self.trust_restored_devices
                             .remove(&(conversation_id, self.self_pk));
                     }
@@ -549,29 +566,26 @@ impl MerkleToxEngine {
                             }
                         }
                     }
-                    // Dispatch on payload length: 32-byte = rotation SKD (root SenderKey),
-                    // 72-byte = JIT SKD (K_chain || last_seq || K_header).
+                    // Dispatch on payload length: 72-byte = triplet (K_chain || last_seq || K_header),
+                    // 32-byte = legacy root SenderKey (backward compat).
                     if let Some(payload) = skd_payload {
                         let epoch = node.sequence_number >> 32;
                         if let Some(Conversation::Established(em)) =
                             self.conversations.get_mut(&conversation_id)
                         {
-                            if payload.len() == 32 {
-                                // Rotation SKD: store root SenderKey
-                                let mut sk = [0u8; 32];
-                                sk.copy_from_slice(&payload);
-                                em.state.sender_keys.insert(
-                                    (node.sender_pk, epoch),
-                                    crate::dag::SenderKey::from(sk),
-                                );
-                            } else if payload.len() == 72 {
-                                // JIT SKD: extract (K_chain, last_seq, K_header)
+                            if payload.len() == 72 {
+                                // Triplet: extract (K_chain, last_seq, K_header)
                                 let mut chain_key = [0u8; 32];
                                 chain_key.copy_from_slice(&payload[0..32]);
                                 let last_seq =
                                     u64::from_be_bytes(payload[32..40].try_into().unwrap());
                                 let mut k_header = [0u8; 32];
                                 k_header.copy_from_slice(&payload[40..72]);
+                                // Store root SenderKey (= chain_key for rotation SKD)
+                                em.state.sender_keys.insert(
+                                    (node.sender_pk, epoch),
+                                    crate::dag::SenderKey::from(chain_key),
+                                );
                                 // Seed ratchet at provided position
                                 em.state.sender_ratchets.insert(
                                     node.sender_pk,
@@ -581,6 +595,14 @@ impl MerkleToxEngine {
                                 em.state.jit_headers.insert(
                                     (node.sender_pk, epoch),
                                     crate::dag::HeaderKey::from(k_header),
+                                );
+                            } else if payload.len() == 32 {
+                                // Legacy: 32-byte root SenderKey
+                                let mut sk = [0u8; 32];
+                                sk.copy_from_slice(&payload);
+                                em.state.sender_keys.insert(
+                                    (node.sender_pk, epoch),
+                                    crate::dag::SenderKey::from(sk),
                                 );
                             }
                         }
@@ -781,9 +803,9 @@ impl MerkleToxEngine {
                 let sig_ok =
                     crate::identity::verify_delegation(cert, founder_pk, node.network_timestamp)
                         .is_ok();
-                let has_admin = cert.permissions.contains(crate::dag::Permissions::ADMIN);
+                let has_message = cert.permissions.contains(crate::dag::Permissions::MESSAGE);
                 let device_bound = cert.device_pk == node.sender_pk;
-                if sig_ok && has_admin && device_bound {
+                if sig_ok && has_message && device_bound {
                     verified = true;
                     tracing::debug!("SoftAnchor verified against Genesis founder's key.");
                 }
@@ -854,10 +876,10 @@ impl MerkleToxEngine {
 
         if authentic && let Some(conv) = self.conversations.get_mut(&conversation_id) {
             for parent_hash in &node.parents {
-                conv.vouchers_mut()
-                    .entry(*parent_hash)
-                    .or_default()
-                    .insert(node.sender_pk);
+                let set = conv.vouchers_mut().entry(*parent_hash).or_default();
+                if set.len() < tox_proto::constants::MAX_VOUCHERS_PER_HASH {
+                    set.insert(node.sender_pk);
+                }
             }
         }
 
@@ -1009,11 +1031,23 @@ impl MerkleToxEngine {
                 | ControlAction::RevokeDevice { .. }
                 | ControlAction::SetTitle(_)
                 | ControlAction::SetTopic(_)
-                | ControlAction::Invite(_)
                 | ControlAction::Snapshot(_)
                 | ControlAction::AnchorSnapshot { .. }
-                | ControlAction::SoftAnchor { .. }
                 | ControlAction::Genesis { .. } => Permissions::ADMIN,
+                ControlAction::SoftAnchor { .. } => Permissions::MESSAGE,
+                ControlAction::Invite(_) => {
+                    // Check genesis flags: FLAG_MEMBER_INVITE (0x02) allows MESSAGE-level invite
+                    let flags = self
+                        .conversations
+                        .get(&conversation_id)
+                        .map(|c| c.genesis_flags())
+                        .unwrap_or(0);
+                    if flags & crate::engine::conversation::FLAG_MEMBER_INVITE != 0 {
+                        Permissions::MESSAGE
+                    } else {
+                        Permissions::ADMIN
+                    }
+                }
                 ControlAction::Leave(target_pk) => {
                     if node.author_pk == *target_pk {
                         Permissions::NONE // Self-leave is always allowed
@@ -1473,6 +1507,12 @@ impl MerkleToxEngine {
             };
 
             for hash in opaque_hashes {
+                // Skip nodes locked by a concurrent promotion pass
+                if self.promotion_locked.contains(&hash) {
+                    continue;
+                }
+                self.promotion_locked.insert(hash);
+
                 let wire = {
                     let overlay = crate::engine::EngineStore {
                         store,
@@ -1480,14 +1520,21 @@ impl MerkleToxEngine {
                     };
                     match overlay.get_wire_node(&hash) {
                         Some(w) => w,
-                        None => continue,
+                        None => {
+                            self.promotion_locked.remove(&hash);
+                            continue;
+                        }
                     }
                 };
 
                 let all_senders = self
                     .identity_manager
                     .list_all_authorized_sender_pairs(conversation_id);
-                let unpacked = em.identify_sender_and_unpack(&wire, &all_senders);
+                let mut unpacked = em.identify_sender_and_unpack(&wire, &all_senders);
+                // Fallback: try HistoryExport room-wide export keys
+                if unpacked.is_none() {
+                    unpacked = em.try_unpack_history_export(&wire, &all_senders);
+                }
 
                 if let Some(node) = unpacked {
                     debug!(
@@ -1526,6 +1573,8 @@ impl MerkleToxEngine {
                     // Clean up wire node from cache after verification
                     self.pending_cache.lock().wire_nodes.remove(&hash);
                 }
+
+                self.promotion_locked.remove(&hash);
             }
 
             if !progress {

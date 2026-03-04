@@ -156,7 +156,7 @@ fn test_file_transfer_clip_bottom_2() {
 
 #[test]
 fn test_file_transfer_full_visible() {
-    // Fully visible in the middle
+    // Visible in the middle
     let (model, _) = setup_clipping_model(20);
     run_test(model, 10, "file_transfer_full_visible");
 }

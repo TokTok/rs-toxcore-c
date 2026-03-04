@@ -424,15 +424,18 @@ pub fn derive_k_payload_export(k_conv: &KConv) -> EncryptionKey {
 }
 
 /// Derives deterministic dedup_id for LegacyBridge nodes.
-/// dedup_id = Blake3-KDF("merkle-tox v1 legacy-bridge-dedup", source_pk || text || timestamp)
+/// dedup_id = blake3::hash(conversation_id || source_pk || text_length(u32-BE) || text || message_type)
 pub fn derive_legacy_bridge_dedup_id(
+    conversation_id: &crate::dag::ConversationId,
     source_pk: &PhysicalDevicePk,
     text: &str,
-    timestamp: i64,
+    message_type: u8,
 ) -> crate::dag::NodeHash {
-    let mut material = Vec::new();
-    material.extend_from_slice(source_pk.as_bytes());
-    material.extend_from_slice(text.as_bytes());
-    material.extend_from_slice(&timestamp.to_be_bytes());
-    crate::dag::NodeHash::from(derive_key("merkle-tox v1 legacy-bridge-dedup", &material))
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(conversation_id.as_bytes());
+    hasher.update(source_pk.as_bytes());
+    hasher.update(&(text.len() as u32).to_be_bytes());
+    hasher.update(text.as_bytes());
+    hasher.update(&[message_type]);
+    crate::dag::NodeHash::from(*hasher.finalize().as_bytes())
 }

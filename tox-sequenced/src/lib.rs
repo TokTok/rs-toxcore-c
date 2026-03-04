@@ -33,7 +33,7 @@ pub enum SessionEvent {
     MessageCompleted(protocol::MessageId, MessageType, Vec<u8>),
     /// A message that was being sent has failed (e.g., timed out).
     MessageFailed(protocol::MessageId, String),
-    /// An outgoing message has been fully acknowledged by the peer.
+    /// An outgoing message has been acknowledged by the peer.
     MessageAcked(protocol::MessageId),
     /// An outgoing message slot has become available.
     ReadyToSend,

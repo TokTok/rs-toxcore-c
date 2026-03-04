@@ -21,9 +21,10 @@ fn test_fs_store_get_verified_nodes_by_type() {
         sequence_number: 1,
         topological_rank: 0,
         network_timestamp: 100,
-        content: Content::Control(merkle_tox_core::dag::ControlAction::SetTitle(
-            "Admin".to_string(),
-        )),
+        content: Content::Control(merkle_tox_core::dag::ControlAction::RevokeDevice {
+            target_device_pk: PhysicalDevicePk::from([2u8; 32]),
+            reason: "test".to_string(),
+        }),
         metadata: vec![],
         authentication: NodeAuth::Signature(merkle_tox_core::dag::Ed25519Signature::from(
             [0u8; 64],

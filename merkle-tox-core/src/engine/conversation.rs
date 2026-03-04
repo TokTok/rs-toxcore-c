@@ -6,10 +6,17 @@ use crate::dag::{
 use ed25519_dalek::Verifier;
 use std::collections::{HashMap, HashSet};
 
+/// Genesis flag: only admins may invite.
+pub const FLAG_ADMIN_ONLY_INVITE: u64 = 0x01;
+/// Genesis flag: any member with MESSAGE permission may invite.
+pub const FLAG_MEMBER_INVITE: u64 = 0x02;
+
 #[derive(Clone)]
 pub struct Pending {
     pub speculative_nodes: HashSet<NodeHash>,
     pub vouchers: HashMap<NodeHash, HashSet<PhysicalDevicePk>>,
+    /// Genesis flags from the conversation's Genesis node.
+    pub genesis_flags: u64,
 }
 
 #[derive(Clone)]
@@ -32,8 +39,14 @@ pub struct Established {
     pub jit_headers: HashMap<(PhysicalDevicePk, u64), HeaderKey>,
     /// True when the conversation was established via a KeyWrap from an unverified
     /// sender. Content should be surfaced as "identity pending" until the admin chain
-    /// is fully verified.
+    /// is verified.
     pub identity_pending: bool,
+    /// Genesis flags from the conversation's Genesis node.
+    pub genesis_flags: u64,
+    /// Content messages THIS device has authored since last sender rekey.
+    pub self_message_count: u32,
+    /// Timestamp of THIS device's last SenderKey rotation.
+    pub self_last_rekey_time_ms: i64,
 }
 
 #[derive(Clone)]
@@ -61,6 +74,20 @@ impl Conversation {
         matches!(self, Conversation::Established(_))
     }
 
+    pub fn genesis_flags(&self) -> u64 {
+        match self {
+            Conversation::Pending(c) => c.state.genesis_flags,
+            Conversation::Established(c) => c.state.genesis_flags,
+        }
+    }
+
+    pub fn set_genesis_flags(&mut self, flags: u64) {
+        match self {
+            Conversation::Pending(c) => c.state.genesis_flags = flags,
+            Conversation::Established(c) => c.state.genesis_flags = flags,
+        }
+    }
+
     pub fn vouchers(&self) -> &HashMap<NodeHash, HashSet<PhysicalDevicePk>> {
         match self {
             Conversation::Pending(c) => &c.state.vouchers,
@@ -83,6 +110,7 @@ impl ConversationData<Pending> {
             state: Pending {
                 speculative_nodes: HashSet::new(),
                 vouchers: HashMap::new(),
+                genesis_flags: 0,
             },
         }
     }
@@ -109,6 +137,9 @@ impl ConversationData<Pending> {
                 shared_keys_sent_to: HashSet::new(),
                 jit_headers: HashMap::new(),
                 identity_pending: false,
+                genesis_flags: self.state.genesis_flags,
+                self_message_count: 0,
+                self_last_rekey_time_ms: now_ms,
             },
         }
     }
@@ -136,6 +167,9 @@ impl ConversationData<Established> {
                 shared_keys_sent_to: HashSet::new(),
                 jit_headers: HashMap::new(),
                 identity_pending: false,
+                genesis_flags: 0,
+                self_message_count: 0,
+                self_last_rekey_time_ms: now_ms,
             },
         }
     }
@@ -159,6 +193,8 @@ impl ConversationData<Established> {
         self.state.last_rotation_time_ms = now_ms;
         self.state.shared_keys_sent_to.clear(); // Epoch change invalidates JIT tracking
         self.state.jit_headers.clear();
+        self.state.self_message_count = 0;
+        self.state.self_last_rekey_time_ms = now_ms;
         self.state.current_epoch
     }
 
@@ -282,6 +318,21 @@ impl ConversationData<Established> {
             .sender_ratchets
             .insert(sender_pk, (seq, next_chain_key, Some(node_hash), epoch_id))
             .and_then(|(_, _, h, _)| h)
+    }
+
+    /// Update the last-seen sequence number for a sender WITHOUT advancing the
+    /// ratchet chain key. Used for exception nodes (Admin, SKD, Announcement)
+    /// that carry no per-message encryption.
+    pub fn track_sender_seq(&mut self, sender_pk: PhysicalDevicePk, seq: u64, epoch_id: u64) {
+        if let Some(entry) = self.state.sender_ratchets.get_mut(&sender_pk) {
+            let (s, _, _, e) = entry;
+            if epoch_id > *e || (epoch_id == *e && seq > *s) {
+                *s = seq;
+                *e = epoch_id;
+            }
+        }
+        // If no ratchet entry yet, don't create one. The ratchet seed
+        // comes from SKD processing, not from sequence tracking.
     }
 
     pub fn get_sender_last_seq(&self, sender_pk: &PhysicalDevicePk) -> u64 {
@@ -453,6 +504,49 @@ impl ConversationData<Established> {
             }
         }
 
+        None
+    }
+
+    /// Tries to unpack an encrypted wire node using room-wide export keys.
+    ///
+    /// HistoryExport nodes are encrypted with `k_header_export` / `k_payload_export`
+    /// derived from `k_conv`. This tries each epoch's export keys and each known
+    /// sender to decrypt the node.
+    pub fn try_unpack_history_export(
+        &self,
+        wire: &WireNode,
+        all_senders: &[(PhysicalDevicePk, LogicalIdentityPk)],
+    ) -> Option<MerkleNode> {
+        if !wire.flags.contains(crate::dag::WireFlags::ENCRYPTED) {
+            return None;
+        }
+
+        for keys in self.state.epochs.values() {
+            let k_header_export = crate::crypto::derive_k_header_export(&keys.k_conv);
+            let k_payload_export = crate::crypto::derive_k_payload_export(&keys.k_conv);
+            let k_msg = MessageKey::from(*k_payload_export.as_bytes());
+
+            // Check sender_hint first
+            let hint = crate::crypto::compute_sender_hint(&k_msg);
+            if hint != wire.sender_hint {
+                continue;
+            }
+
+            // Try routing decryption with export k_header
+            if let Some(seq) = MerkleNode::try_decrypt_routing(wire, &k_header_export) {
+                // Try each known sender
+                for &(sender_pk, logical_pk) in all_senders {
+                    if let Ok(node) =
+                        MerkleNode::unpack_wire_content(wire, sender_pk, logical_pk, seq, &k_msg)
+                    {
+                        // Verify it's actually a HistoryExport
+                        if matches!(node.content, crate::dag::Content::HistoryExport { .. }) {
+                            return Some(node);
+                        }
+                    }
+                }
+            }
+        }
         None
     }
 }

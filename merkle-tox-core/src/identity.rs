@@ -29,11 +29,11 @@ pub enum IdentityError {
 
 #[derive(ToxProto)]
 pub struct DelegationSignData {
+    pub version: u32,
+    pub conversation_id: ConversationId,
     pub device_pk: PhysicalDevicePk,
     pub permissions: Permissions,
     pub expires_at: i64,
-    pub version: u32,
-    pub conversation_id: ConversationId,
 }
 
 /// Current delegation certificate protocol version.
@@ -989,6 +989,25 @@ impl IdentityManager {
         pairs.sort_unstable();
         pairs.dedup();
         pairs
+    }
+
+    /// Returns the admin seniority tuple `(auth_rank, auth_hash)` for a device
+    /// with ADMIN permissions in the given conversation. Used for KeyWrap
+    /// collision tiebreaker in group conversations.
+    pub fn get_admin_seniority(
+        &self,
+        conversation_id: ConversationId,
+        device_pk: &PhysicalDevicePk,
+    ) -> Option<(u64, NodeHash)> {
+        self.authorized_devices
+            .get(&(conversation_id, *device_pk))
+            .and_then(|records| {
+                records
+                    .iter()
+                    .filter(|r| r.permissions.contains(Permissions::ADMIN))
+                    .map(|r| (r.auth_rank, r.auth_hash))
+                    .min()
+            })
     }
 
     /// Returns list of authorized device PKs for logical identity in conversation.

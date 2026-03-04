@@ -352,13 +352,16 @@ fn test_key_rotation_skips_last_resort_only_members() {
     apply_effects(effects, &store);
 
     let bob_cert = make_cert(&bob.master_sk, bob.device_pk, Permissions::all(), 9_999_999);
+    // auth_bob references auth_alice (last Admin head), not invite_bob (now Content).
+    // Invite is Content-type under the new classification, so Admin chain isolation
+    // prevents Admin nodes from referencing it.
     let auth_bob = create_admin_node(
         &conv_id,
         bob.master_pk,
         &bob.master_sk,
-        vec![invite_bob.hash()],
+        vec![auth_alice.hash()],
         ControlAction::AuthorizeDevice { cert: bob_cert },
-        3,
+        2,
         1,
         1000,
     );

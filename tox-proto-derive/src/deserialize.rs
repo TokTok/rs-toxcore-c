@@ -212,7 +212,7 @@ pub fn derive_tox_deserialize_impl(input: DeriveInput) -> TokenStream {
                     next_idx += 1;
                 }
 
-                // Detect #[tox(catch_all)] — skip generating a match arm
+                // Detect #[tox(catch_all)] to skip generating a match arm.
                 let mut is_catch_all = false;
                 for attr in &v.attrs {
                     if attr.path().is_ident("tox") {

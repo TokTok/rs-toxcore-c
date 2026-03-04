@@ -58,6 +58,7 @@ impl MerkleToxEngine {
             Content::Control(ControlAction::Genesis {
                 creator_pk,
                 created_at,
+                flags,
                 ..
             }) => {
                 self.identity_manager.add_member(
@@ -69,6 +70,10 @@ impl MerkleToxEngine {
                 // Record genesis node as initial anchor for KeyWrap nodes.
                 self.latest_anchor_hashes
                     .insert(conversation_id, node.hash());
+                // Store genesis flags for invite permission checks.
+                if let Some(conv) = self.conversations.get_mut(&conversation_id) {
+                    conv.set_genesis_flags(*flags);
+                }
                 // Promote identity_pending to false: Genesis confirms admin chain root.
                 if let Some(Conversation::Established(e)) =
                     self.conversations.get_mut(&conversation_id)
@@ -129,7 +134,7 @@ impl MerkleToxEngine {
                         .contains(crate::dag::Permissions::ADMIN);
                     if is_admin_revoke
                         && let Ok(mut r_effects) =
-                            self.rotate_conversation_key(conversation_id, store)
+                            self.rotate_conversation_key_post_revocation(conversation_id, store)
                     {
                         effects.append(&mut r_effects);
                     }
@@ -305,13 +310,32 @@ impl MerkleToxEngine {
                         }
                     }
                 }
+
+                // Same-epoch SKD = sender rekey. Reset ratchet for this sender
+                // so peek_keys re-initializes from the new SenderKey.
+                if let Some(Conversation::Established(em)) =
+                    self.conversations.get_mut(&conversation_id)
+                    && epoch == em.current_epoch()
+                {
+                    em.state.sender_ratchets.remove(&node_ref.sender_pk);
+                }
             }
             _ => {}
         }
 
-        // Advance ratchet if keys are available
+        // Advance ratchet if keys are available (exception nodes skip ratchet advancement
+        // but still track sequence numbers for ordering).
         let now = self.clock.network_time_ms();
-        if let Some(Conversation::Established(em)) = self.conversations.get_mut(&conversation_id) {
+        if node.node().skips_ratchet() {
+            if let Some(Conversation::Established(em)) =
+                self.conversations.get_mut(&conversation_id)
+            {
+                let epoch = node_ref.sequence_number >> 32;
+                em.track_sender_seq(node_ref.sender_pk, node_ref.sequence_number, epoch);
+            }
+        } else if let Some(Conversation::Established(em)) =
+            self.conversations.get_mut(&conversation_id)
+        {
             if let Some((_, k_next)) =
                 em.peek_keys(&node_ref.sender_pk, node_ref.sequence_number, now)
             {

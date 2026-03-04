@@ -104,7 +104,7 @@ impl FragmentBuffer {
         self.received_count.0 == self.total_fragments.0
     }
 
-    /// Consumes the buffer and returns the fully assembled message.
+    /// Consumes the buffer and returns the assembled message.
     pub fn assemble(self) -> Option<Vec<u8>> {
         if !self.is_complete() {
             return None;
@@ -139,7 +139,7 @@ impl FragmentBuffer {
         self.highest_index
     }
 
-    /// Returns the total expected size of this message when fully assembled.
+    /// Returns the total expected size of this message when assembled.
     ///
     /// If the exact size is not yet known, a conservative estimate is returned
     /// based on the fragments received so far.

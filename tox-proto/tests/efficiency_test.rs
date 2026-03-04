@@ -78,7 +78,7 @@ fn test_size_efficiency_primitives() {
 fn test_size_efficiency_byte_specialization() {
     // [u8; 32] should be 1 (marker) + 1 (len) + 32 = 34 bytes
     // If it were an array, it would be 1 (marker) + 32 * (1 byte per u8) = 33+ bytes,
-    // but u8 is often 1 byte, so it might be similar, but bin is more robust.
+    // but u8 is often 1 byte, so it might be similar, but bin handles values > 127 efficiently.
     // For values > 127, array would be 2 bytes per element.
 
     let data = [255u8; 32];

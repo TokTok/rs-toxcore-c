@@ -10,9 +10,11 @@ for messages and control actions.
 `MerkleNode` is the atomic unit of the DAG, serialized using **MessagePack** and
 identified by its **Blake3** hash.
 
-**Hash Scope**: Computed over the **complete** serialized `WireNode`,
-**including** the `authentication` field, ensuring nodes with identical content
-but different authenticators produce distinct hashes.
+**Hash Scope**: Computed over the **complete** serialized `MerkleNode` (logical
+view), **including** the `authentication` field but **excluding** the
+`pow_nonce` (which is `#[tox(skip)]`). The hash MUST be deterministic — it
+cannot depend on encryption nonces or compression choices that vary per
+serialization. The `WireNode` is an ephemeral transport encoding only.
 
 **Serialization Note**: Structures and enums are serialized as **MessagePack
 Arrays (Positional)** via `#[derive(ToxProto)]`. Field names are omitted;
@@ -108,9 +110,10 @@ On the wire, the node is serialized as a `WireNode` struct (MessagePack Array):
     -   **EXCEPTION**: `KeyWrap` (Content ID 1), `SenderKeyDistribution` (ID 2),
         **Admin Nodes**, and `SoftAnchor` nodes set this field to `[0x00, 0x00,
         0x00, 0x00]` (the `sender_pk` is already in cleartext for these node
-        types). `HistoryExport` (ID 3) also sets this to `[0x00, 0x00, 0x00,
-        0x00]` but encrypts its routing header using a room-wide key (see
-        below).
+        types). `HistoryExport` (ID 3) computes its hint from the room-wide
+        `K_payload_export` key (i.e., `Blake3-KDF("merkle-tox v1 hint",
+        K_payload_export)`) so that recipients can distinguish export nodes from
+        normal content without trial-decrypting routing.
 3.  `encrypted_routing`: `Vec<u8>`
     -   Contains: `nonce (12B) || ciphertext` where the plaintext is
         `[sequence_number]`. (The `sender_pk` is omitted here to save 32 bytes
@@ -129,10 +132,12 @@ On the wire, the node is serialized as a `WireNode` struct (MessagePack Array):
         they possess any routing keys.
     -   **EXCEPTION (HistoryExport)**: `HistoryExport` (ID 3) nodes encrypt this
         field using a room-wide key: `K_header_export = Blake3-KDF("merkle-tox
-        v1 header-export", K_conv)`. The plaintext is `[sender_pk,
-        sequence_number]`. This hides the device-to-device export relationship
-        from relays while allowing the new device (which just received `K_conv`
-        via `KeyWrap`) to decrypt the routing header without needing
+        v1 header-export", K_conv)`. The plaintext is `[sequence_number]` only
+        (same 8-byte format as normal content routing; the `sender_pk` is
+        omitted because successful Poly1305 trial-decryption identifies the
+        sender). This hides the device-to-device export relationship from relays
+        while allowing the new device (which just received `K_conv` via
+        `KeyWrap`) to decrypt the routing header without needing
         `K_header_epoch_n`.
 4.  `payload_data`: `Vec<u8>` (Optionally encrypted and/or compressed)
     -   Contains: `[network_timestamp, content, metadata]`

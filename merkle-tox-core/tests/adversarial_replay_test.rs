@@ -48,7 +48,11 @@ fn test_cross_room_admin_node_replay_protection() {
         alice.master_pk,
         &alice.master_sk,
         vec![room_a.conv_id.to_node_hash()],
-        ControlAction::SetTitle("Official Room A".to_string()),
+        ControlAction::Snapshot(merkle_tox_core::dag::SnapshotData {
+            basis_hash: merkle_tox_core::dag::NodeHash::from([0u8; 32]),
+            members: vec![],
+            last_seq_numbers: vec![],
+        }),
         1,
         1,
         1000,

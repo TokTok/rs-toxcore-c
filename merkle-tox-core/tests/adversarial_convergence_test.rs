@@ -79,7 +79,7 @@ fn test_partitioned_swarm_convergence() {
         receivers.push(rx);
     }
 
-    // Fully mesh them in their initial state
+    // Mesh them in their initial state
     for (i, node_i) in nodes.iter().enumerate() {
         for (j, identity_j) in identities.iter().enumerate() {
             if i != j {

@@ -14,7 +14,7 @@ pub const MAX_BACKOFF_EXPONENT: u32 = 6;
 /// An estimator for Round-Trip Time (RTT) and Retransmission Timeout (RTO).
 ///
 /// This implementation follows the algorithms defined in RFC 6298, using
-/// Smoothed RTT (SRTT) and RTT Variation (RTTVAR) to calculate a robust
+/// Smoothed RTT (SRTT) and RTT Variation (RTTVAR) to calculate the
 /// timeout for retransmissions.
 #[derive(Debug, Clone, Copy, ToxProto)]
 pub struct RttEstimator {

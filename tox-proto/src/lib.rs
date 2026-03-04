@@ -612,7 +612,7 @@ pub fn read_enum_header<R: Read>(reader: &mut R, ctx: &ToxContext) -> Result<(u8
     match marker {
         Marker::FixPos(idx) => Ok((idx, 1)),
         Marker::U8 => {
-            // Read raw data byte — marker was already consumed by read_marker.
+            // Read raw data byte. Marker was already consumed by read_marker.
             // rmp::decode::read_u8 would re-read the marker (reads marker+data).
             let mut buf = [0u8; 1];
             reader.read_exact(&mut buf)?;
@@ -623,7 +623,7 @@ pub fn read_enum_header<R: Read>(reader: &mut R, ctx: &ToxContext) -> Result<(u8
             Ok((idx, len as u32))
         }
         Marker::Array16 => {
-            // Read raw 2-byte big-endian length — marker already consumed.
+            // Read raw 2-byte big-endian length. Marker already consumed.
             let mut buf = [0u8; 2];
             reader.read_exact(&mut buf)?;
             let len = u16::from_be_bytes(buf);
@@ -631,7 +631,7 @@ pub fn read_enum_header<R: Read>(reader: &mut R, ctx: &ToxContext) -> Result<(u8
             Ok((idx, len as u32))
         }
         Marker::Array32 => {
-            // Read raw 4-byte big-endian length — marker already consumed.
+            // Read raw 4-byte big-endian length. Marker already consumed.
             let mut buf = [0u8; 4];
             reader.read_exact(&mut buf)?;
             let len = u32::from_be_bytes(buf);

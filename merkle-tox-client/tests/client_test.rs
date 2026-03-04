@@ -567,7 +567,14 @@ async fn test_client_automated_x3dh_onboarding() {
     // Capture Alice's responses. handle_event doesn't return messages, it authors them to store.
     let alice_heads = {
         let node_lock = alice_node.lock().await;
-        node_lock.store.get_heads(&conversation_id)
+        let mut heads = node_lock.store.get_heads(&conversation_id);
+        // KeyWrap nodes are admin-type, so also check admin heads.
+        for h in node_lock.store.get_admin_heads(&conversation_id) {
+            if !heads.contains(&h) {
+                heads.push(h);
+            }
+        }
+        heads
     };
 
     // Alice should have authored a KeyWrap node

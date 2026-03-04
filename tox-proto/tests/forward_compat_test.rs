@@ -78,7 +78,7 @@ fn test_unknown_roundtrip() {
         "re-serialized bytes must be identical to original"
     );
 
-    // Deserialize back as V2 — should recover the original
+    // Deserialize back as V2. Should recover the original.
     let recovered: EnumV2 = deserialize(&re_encoded).expect("V2 recovery");
     assert_eq!(recovered, original, "round-trip should preserve the value");
 }
@@ -163,7 +163,7 @@ fn test_high_discriminant_roundtrip() {
     // Discriminant 255: requires msgpack u8 marker (0xcc, 0xff).
     // This exercises the Marker::U8 branch of read_enum_header, which
     // previously called rmp::decode::read_u8 (reads marker+data) after
-    // the marker was already consumed — a double-read bug.
+    // the marker was already consumed, causing a double-read bug.
     let wire_255 = vec![0xcc, 0xff];
     let v1: EnumV1 = deserialize(&wire_255).expect("should capture disc 255");
     assert!(matches!(&v1, EnumV1::Unknown { discriminant: 255, data } if data.is_empty()));

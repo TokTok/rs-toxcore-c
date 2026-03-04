@@ -298,7 +298,7 @@ fn test_iblt_keyed_sketch_decodes() {
     sketch_b.insert(&hash2);
     sketch_b.insert(&hash3);
 
-    // Subtract b from a -- identical sets should decode to empty
+    // Subtract b from a. Identical sets should decode to empty.
     sketch_a.subtract(&sketch_b).unwrap();
     let (in_a_not_b, in_b_not_a, _stats) = sketch_a.decode().unwrap();
     assert!(
@@ -333,7 +333,7 @@ fn test_iblt_unkeyed_mismatch() {
     sketch_unkeyed.insert(&hash1);
     sketch_unkeyed.insert(&hash2);
 
-    // Subtract -- the different key derivation should produce garbage
+    // Subtract. The different key derivation should produce garbage.
     sketch_keyed.subtract(&sketch_unkeyed).unwrap();
     let result = sketch_keyed.decode();
 

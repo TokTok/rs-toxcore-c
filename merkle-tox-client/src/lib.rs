@@ -607,6 +607,9 @@ impl<T: Transport + 'static, S: NodeStore + BlobStore + 'static> MerkleToxClient
         let admin_nodes = node_lock
             .store
             .get_verified_nodes_by_type(&self.conversation_id, NodeType::Admin)?;
+        let content_nodes = node_lock
+            .store
+            .get_verified_nodes_by_type(&self.conversation_id, NodeType::Content)?;
 
         let mut new_state = ChatState {
             conversation_id: self.conversation_id,
@@ -614,6 +617,9 @@ impl<T: Transport + 'static, S: NodeStore + BlobStore + 'static> MerkleToxClient
         };
 
         for n in admin_nodes {
+            self.apply_node_internal(&mut new_state, &n.hash(), &n);
+        }
+        for n in content_nodes {
             self.apply_node_internal(&mut new_state, &n.hash(), &n);
         }
 

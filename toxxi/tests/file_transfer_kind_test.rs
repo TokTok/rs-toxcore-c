@@ -1,38 +1,8 @@
-use toxcore::tox::{Address, FriendNumber, ToxConnection, ToxUserStatus};
+use toxcore::tox::FriendNumber;
 use toxcore::types::{FileId, PublicKey};
-use toxxi::config::Config;
-use toxxi::model::{DomainState, FriendInfo, Model};
 use toxxi::msg::{Cmd, Msg, ToxAction, ToxEvent};
+use toxxi::testing::{add_test_friend, create_test_model};
 use toxxi::update::update;
-
-fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "I am a test".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    Model::new(domain, config.clone(), config)
-}
-
-fn add_test_friend(model: &mut Model, fid: FriendNumber, pk: PublicKey) {
-    model.session.friend_numbers.insert(fid, pk);
-    model.domain.friends.insert(
-        pk,
-        FriendInfo {
-            name: format!("Friend {}", fid.0),
-            public_key: Some(pk),
-            status_message: "".to_string(),
-            connection: ToxConnection::TOX_CONNECTION_TCP,
-            last_sent_message_id: None,
-            last_read_receipt: None,
-            is_typing: false,
-        },
-    );
-    model.ensure_friend_window(pk);
-}
 
 #[test]
 fn test_ignores_non_data_file_transfers() {

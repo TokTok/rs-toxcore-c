@@ -1,3 +1,4 @@
+use crate::completion::complete_friend_ids;
 use crate::model::{MessageContent, Model, PendingItem, WindowId};
 use crate::msg::{Cmd, ToxAction};
 use toxcore::tox::FriendNumber;
@@ -23,26 +24,7 @@ pub const COMMANDS: &[CommandDef] = &[
                 return vec![];
             }
 
-            let mut cmds = Vec::new();
-            match window_id {
-                WindowId::Group(chat_id) => {
-                    cmds.push(Cmd::Tox(ToxAction::LeaveGroup(chat_id)));
-                }
-                WindowId::Conference(conf_id) => {
-                    cmds.push(Cmd::Tox(ToxAction::DeleteConference(conf_id)));
-                }
-                _ => {}
-            }
-
-            // Remove window and conversation
-            model.ui.window_ids.remove(active_idx);
-            model.domain.conversations.remove(&window_id);
-            model.ui.window_state.remove(&window_id);
-
-            // Adjust active index
-            if model.ui.active_window_index >= model.ui.window_ids.len() {
-                model.ui.active_window_index = model.ui.window_ids.len().saturating_sub(1);
-            }
+            let cmds = model.close_window(window_id);
 
             model.add_status_message(MessageContent::Text("Window closed.".to_owned()));
 
@@ -161,25 +143,7 @@ pub const COMMANDS: &[CommandDef] = &[
             }
             if args.len() == 2 && args[0] == "invite" {
                 let prefix = args[1];
-                let mut ids: Vec<_> = model
-                    .session
-                    .friend_numbers
-                    .iter()
-                    .map(|(fn_num, pk)| {
-                        let name = model
-                            .domain
-                            .friends
-                            .get(pk)
-                            .map(|i| i.name.clone())
-                            .unwrap_or_else(|| format!("Friend {}", fn_num.0));
-                        (fn_num.0.to_string(), name)
-                    })
-                    .collect();
-                ids.sort_by(|a, b| a.0.cmp(&b.0));
-                return ids
-                    .into_iter()
-                    .filter(|(id, _)| id.starts_with(prefix))
-                    .collect();
+                return complete_friend_ids(model, prefix);
             }
             vec![]
         }),
@@ -228,6 +192,7 @@ pub const COMMANDS: &[CommandDef] = &[
                             vec![Cmd::Tox(ToxAction::JoinConference(
                                 pk,
                                 (*cookie).to_owned(),
+                                None,
                             ))]
                         } else {
                             model.add_error_message(MessageContent::Text(format!(
@@ -305,25 +270,7 @@ pub const COMMANDS: &[CommandDef] = &[
             }
             if args.len() == 2 {
                 let prefix = args[1];
-                let mut ids: Vec<_> = model
-                    .session
-                    .friend_numbers
-                    .iter()
-                    .map(|(fn_num, pk)| {
-                        let name = model
-                            .domain
-                            .friends
-                            .get(pk)
-                            .map(|i| i.name.clone())
-                            .unwrap_or_else(|| format!("Friend {}", fn_num.0));
-                        (fn_num.0.to_string(), name)
-                    })
-                    .collect();
-                ids.sort_by(|a, b| a.0.cmp(&b.0));
-                return ids
-                    .into_iter()
-                    .filter(|(id, _)| id.starts_with(prefix))
-                    .collect();
+                return complete_friend_ids(model, prefix);
             }
             vec![]
         }),
@@ -411,8 +358,11 @@ pub const COMMANDS: &[CommandDef] = &[
     },
     CommandDef {
         name: "accept",
-        args: (None, "[index]"),
-        desc: (None, "Accept a pending request or invite"),
+        args: (None, "[index] [password]"),
+        desc: (
+            None,
+            "Accept a pending request or invite, with the group's password if it has one",
+        ),
         exec: |model, args| {
             if model.domain.pending_items.is_empty() {
                 model.add_error_message(MessageContent::Text("No pending items.".to_owned()));
@@ -433,7 +383,13 @@ pub const COMMANDS: &[CommandDef] = &[
                 return vec![];
             }
 
-            let item = model.domain.pending_items.remove(index);
+            let item = model.domain.pending_items[index].clone();
+            // A recorded invite stays pending here until it's joined, and a
+            // request until its friend is added.
+            let invite = model.invite_of(&item);
+            if invite.is_none() && !matches!(item, PendingItem::FriendRequest { .. }) {
+                model.domain.pending_items.remove(index);
+            }
             match item {
                 PendingItem::FriendRequest { pk, .. } => {
                     vec![Cmd::Tox(ToxAction::AcceptFriend(pk))]
@@ -458,12 +414,17 @@ pub const COMMANDS: &[CommandDef] = &[
                         )));
                     }
 
-                    vec![Cmd::Tox(ToxAction::AcceptGroupInvite(
-                        friend,
-                        invite_data,
-                        group_name,
-                        String::new(),
-                    ))]
+                    let password = args.get(1).map(|password| (*password).to_owned());
+                    match invite {
+                        Some(invite) => crate::sync::invites::answer(model, invite, true, password),
+                        None => vec![Cmd::Tox(ToxAction::AcceptGroupInvite(
+                            friend,
+                            invite_data,
+                            group_name,
+                            password.unwrap_or_default(),
+                            None,
+                        ))],
+                    }
                 }
                 PendingItem::ConferenceInvite { friend, cookie, .. } => {
                     if let Some(info) = model.domain.friends.get(&friend) {
@@ -472,7 +433,10 @@ pub const COMMANDS: &[CommandDef] = &[
                             info.name
                         )));
                     }
-                    vec![Cmd::Tox(ToxAction::JoinConference(friend, cookie))]
+                    match invite {
+                        Some(invite) => crate::sync::invites::answer(model, invite, true, None),
+                        None => vec![Cmd::Tox(ToxAction::JoinConference(friend, cookie, None))],
+                    }
                 }
             }
         },
@@ -506,9 +470,12 @@ pub const COMMANDS: &[CommandDef] = &[
                 return vec![];
             }
 
-            model.domain.pending_items.remove(index);
+            let item = model.domain.pending_items.remove(index);
             model.add_status_message(MessageContent::Text("Item rejected.".to_owned()));
-            vec![]
+            match model.invite_of(&item) {
+                Some(invite) => crate::sync::invites::answer(model, invite, false, None),
+                None => vec![],
+            }
         },
         complete: Some(|model, _args| {
             (0..model.domain.pending_items.len())
@@ -520,21 +487,21 @@ pub const COMMANDS: &[CommandDef] = &[
         name: "ignore",
         args: (None, "<name|peer_id>"),
         desc: (None, "Toggle ignore for a peer in the current group"),
-        exec: |model, args| handle_ignore_command(model, args, true),
+        exec: |model, args| handle_ignore_command(model, args, true), // ignore
         complete: Some(complete_ignore_command),
     },
     CommandDef {
         name: "unignore",
         args: (None, "<name|peer_id>"),
         desc: (None, "Stop ignoring a peer in the current group"),
-        exec: |model, args| handle_ignore_command(model, args, false),
+        exec: |model, args| handle_ignore_command(model, args, false), // unignore
         complete: Some(complete_ignore_command),
     },
 ];
 
-fn handle_ignore_command(model: &mut Model, args: &[&str], toggle: bool) -> Vec<Cmd> {
+fn handle_ignore_command(model: &mut Model, args: &[&str], ignore: bool) -> Vec<Cmd> {
     if args.is_empty() {
-        let cmd = if toggle { "/ignore" } else { "/unignore" };
+        let cmd = if ignore { "/ignore" } else { "/unignore" };
         model.add_error_message(MessageContent::Text(format!(
             "Usage: {} <name|public_key>",
             cmd
@@ -563,7 +530,7 @@ fn handle_ignore_command(model: &mut Model, args: &[&str], toggle: bool) -> Vec<
 
     let (pk, name, is_ignored) = if let Some(peer) = peer_info {
         let pk = peer.id.0;
-        let new_state = if toggle { !peer.is_ignored } else { false };
+        let new_state = ignore;
 
         if peer.is_ignored == new_state {
             let msg = if new_state {

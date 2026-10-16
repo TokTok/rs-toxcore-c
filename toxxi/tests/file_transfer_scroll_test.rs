@@ -18,7 +18,6 @@ fn setup_clipping_model(trailing_messages: usize) -> (Model, GroupChatId) {
     let self_pk = PublicKey([0u8; 32]);
     let domain = DomainState::new(
         Address::from_public_key(self_pk, 0),
-        self_pk,
         "Tester".to_string(),
         "".to_string(),
         ToxUserStatus::TOX_USER_STATUS_NONE,
@@ -81,6 +80,7 @@ fn setup_clipping_model(trailing_messages: usize) -> (Model, GroupChatId) {
             progress: 0.5,
             speed: "100 KB/s".to_string(),
             is_incoming: true,
+            blob: None,
         },
         timestamp: model.time_provider.now_local(),
         status: MessageStatus::Incoming,
@@ -159,61 +159,4 @@ fn test_file_transfer_full_visible() {
     // Visible in the middle
     let (model, _) = setup_clipping_model(20);
     run_test(model, 10, "file_transfer_full_visible");
-}
-
-#[test]
-fn test_game_card_full_visible() {
-    let config = Config::default();
-    let self_pk = PublicKey([0u8; 32]);
-    let domain = DomainState::new(
-        Address::from_public_key(self_pk, 0),
-        self_pk,
-        "Tester".to_string(),
-        "".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-
-    let fixed_system_time = UNIX_EPOCH + Duration::from_secs(1672574400);
-    let fixed_instant = Instant::now();
-    let tp = Arc::new(FakeTimeProvider::new(fixed_instant, fixed_system_time));
-
-    let mut model = Model::new(domain, config.clone(), config).with_time_provider(tp);
-
-    let group_id = GroupChatId([1u8; 32]);
-    let window_id = WindowId::Group(group_id);
-
-    let conversation = Conversation {
-        name: "Test Group".to_string(),
-        messages: Vec::new(),
-        topic: None,
-        peers: Vec::new(),
-        self_role: Some(ToxGroupRole::TOX_GROUP_ROLE_FOUNDER),
-        self_name: Some("Tester".to_string()),
-        ignored_peers: HashSet::new(),
-    };
-
-    let friend_pk = PublicKey([1u8; 32]);
-    model.domain.conversations.insert(window_id, conversation);
-    model.ui.window_ids = vec![WindowId::Console, window_id];
-    model.ui.active_window_index = 1;
-
-    let game_msg = Message {
-        internal_id: InternalMessageId(101),
-        sender: "Alice".to_string(),
-        sender_pk: Some(friend_pk),
-        is_self: false,
-        content: MessageContent::GameInvite {
-            game_type: "Chess".to_string(),
-            challenger: "Alice".to_string(),
-        },
-        timestamp: model.time_provider.now_local(),
-        status: MessageStatus::Incoming,
-        message_type: MessageType::TOX_MESSAGE_TYPE_NORMAL,
-        highlighted: false,
-    };
-    if let Some(conv) = model.domain.conversations.get_mut(&window_id) {
-        conv.messages.push(game_msg);
-    }
-
-    run_test(model, 0, "game_card_full_visible");
 }

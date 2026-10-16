@@ -1,3 +1,4 @@
+use crate::model::WindowId;
 use crate::widgets::{InputBox, InputBoxState};
 use ratatui::{
     buffer::Buffer,
@@ -9,6 +10,7 @@ use ratatui::{
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuickSwitcherItem {
+    pub window: WindowId,
     pub name: String,
     pub description: String,
     pub prefix: String,

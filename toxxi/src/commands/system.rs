@@ -117,6 +117,10 @@ pub const COMMANDS: &[CommandDef] = &[
                     }
                 }
                 model.invalidate_full_window_cache(active_id);
+            } else {
+                model.add_error_message(MessageContent::Text(
+                    "Usage: /clear [all | system]".to_owned(),
+                ));
             }
             vec![]
         },
@@ -186,6 +190,10 @@ pub const COMMANDS: &[CommandDef] = &[
                         idx
                     )));
                 }
+            } else {
+                model.add_error_message(MessageContent::Text(
+                    "Window index must be a number.".to_owned(),
+                ));
             }
             vec![]
         },
@@ -211,26 +219,6 @@ pub const COMMANDS: &[CommandDef] = &[
         args: (None, ""),
         desc: (None, "Restart Tox core"),
         exec: |_model, _args| vec![Cmd::App(AppCmd::ReloadTox)],
-        complete: None,
-    },
-    CommandDef {
-        name: "timeout",
-        args: (None, "<ms>"),
-        desc: (None, "Exit the application after some time"),
-        exec: |model, args| {
-            if args.is_empty() {
-                model.add_error_message(MessageContent::Text("Usage: /timeout <ms>".to_owned()));
-                return vec![];
-            }
-            if let Ok(ms) = args[0].parse::<u64>() {
-                model.add_status_message(MessageContent::Text(format!(
-                    "Application will quit in {} ms",
-                    ms
-                )));
-                return vec![Cmd::App(AppCmd::SetTimeout(ms))];
-            }
-            vec![]
-        },
         complete: None,
     },
     CommandDef {
@@ -404,7 +392,6 @@ pub const COMMANDS: &[CommandDef] = &[
                 let keys = [
                     ("ipv6_enabled", "Toggle IPv6 support"),
                     ("udp_enabled", "Toggle UDP support"),
-                    ("blocked_strings", "Manage blocked strings list"),
                     ("system_messages", "Configure system message types"),
                 ];
                 return keys

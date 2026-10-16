@@ -31,6 +31,27 @@ pub fn complete_command_arguments(input: &str, model: &Model) -> Vec<(String, St
     vec![]
 }
 
+pub fn complete_friend_ids(model: &Model, prefix: &str) -> Vec<(String, String)> {
+    let mut ids: Vec<_> = model
+        .session
+        .friend_numbers
+        .iter()
+        .map(|(fn_num, pk)| {
+            let name = model
+                .domain
+                .friends
+                .get(pk)
+                .map(|i| i.name.clone())
+                .unwrap_or_else(|| format!("Friend {}", fn_num.0));
+            (fn_num.0.to_string(), name)
+        })
+        .collect();
+    ids.sort_by(|a, b| a.0.cmp(&b.0));
+    ids.into_iter()
+        .filter(|(id, _)| id.starts_with(prefix))
+        .collect()
+}
+
 pub fn complete_text(input: &str, model: &Model) -> Vec<String> {
     // Friend name completion or Emoji completion
     // We complete based on the last word typed to support "Hello Alice" -> "Hello Alice"

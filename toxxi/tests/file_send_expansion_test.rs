@@ -1,19 +1,10 @@
-use toxcore::tox::{Address, ToxUserStatus};
 use toxcore::types::{FriendNumber, PublicKey};
 use toxxi::commands::io::COMMANDS;
-use toxxi::config::Config;
-use toxxi::model::{ConsoleMessageType, DomainState, Model};
+use toxxi::model::{ConsoleMessageType, Model};
+use toxxi::testing;
 
 fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "I am a test".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    let mut model = Model::new(domain, config.clone(), config);
+    let mut model = testing::create_test_model();
     // Add friend 0 so the file-send command's friend lookup succeeds
     // and reaches the path-expansion + file-existence-check arm we
     // actually want to test.

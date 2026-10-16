@@ -1,4 +1,5 @@
 use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+use toxxi::model::WindowId;
 use toxxi::testing::{buffer_to_string, configure_insta};
 use toxxi::widgets::{QuickSwitcher, QuickSwitcherItem, QuickSwitcherState};
 
@@ -10,11 +11,13 @@ fn test_render_quick_switcher() {
     state.input_state.text = "ali".to_string();
     state.items = vec![
         QuickSwitcherItem {
+            window: WindowId::Console,
             name: "Alice".to_string(),
             description: "Online".to_string(),
             prefix: "f".to_string(),
         },
         QuickSwitcherItem {
+            window: WindowId::Console,
             name: "Aliens Group".to_string(),
             description: "42 members".to_string(),
             prefix: "g".to_string(),

@@ -1,4 +1,4 @@
-use crate::widgets::{FileTransferCard, GameCard};
+use crate::widgets::FileTransferCard;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -14,7 +14,6 @@ use unicode_width::UnicodeWidthStr;
 pub enum MessageStatus {
     Sending,
     Delivered,
-    Read,
     Failed,
     System,
 }
@@ -31,11 +30,6 @@ pub enum MessageContent {
         paused: bool,
         eta: String,
     },
-    GameInvite {
-        game_type: String,
-        challenger: String,
-    },
-    System(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -184,7 +178,7 @@ impl ChatLayout {
 
         for (idx, msg) in messages.iter().enumerate().skip(actual_start_index) {
             let lines_count = match &msg.content {
-                MessageContent::Text(text) | MessageContent::System(text) => {
+                MessageContent::Text(text) => {
                     if let Some(cached_lines) = entry.lines.get(&idx) {
                         cached_lines.len()
                     } else {
@@ -194,7 +188,7 @@ impl ChatLayout {
                         len
                     }
                 }
-                MessageContent::FileTransfer { .. } | MessageContent::GameInvite { .. } => 3,
+                MessageContent::FileTransfer { .. } => 3,
             };
 
             let is_grouped = if idx > 0 {
@@ -231,7 +225,7 @@ impl ChatLayout {
         let wrap_width = content_width.saturating_sub(1);
 
         let lines_count = match &msg.content {
-            MessageContent::Text(text) | MessageContent::System(text) => {
+            MessageContent::Text(text) => {
                 let lines = wrap_text(text, wrap_width as usize);
                 let count = lines.len();
 
@@ -245,7 +239,7 @@ impl ChatLayout {
                 }
                 count
             }
-            MessageContent::FileTransfer { .. } | MessageContent::GameInvite { .. } => 3,
+            MessageContent::FileTransfer { .. } => 3,
         };
 
         self.total_height += lines_count;
@@ -277,13 +271,6 @@ impl MessageListState {
     pub fn select_previous(&mut self) {
         self.selected_index = self.selected_index.map(|i| i.saturating_sub(1));
         self.ensure_selected_visible = true;
-    }
-
-    pub fn jump_to_timestamp(&mut self, timestamp: u64, messages: &[ChatMessage]) {
-        if let Some(idx) = messages.iter().position(|m| m.unix_timestamp >= timestamp) {
-            self.selected_index = Some(idx);
-            self.ensure_selected_visible = true;
-        }
     }
 
     pub fn scroll_up(&mut self) {
@@ -368,10 +355,6 @@ impl<'a> MessageList<'a> {
         self.focused = focused;
         self
     }
-
-    pub fn get_sender_width(&self) -> u16 {
-        self.sender_width
-    }
 }
 
 impl<'a> StatefulWidget for MessageList<'a> {
@@ -404,7 +387,6 @@ impl<'a> StatefulWidget for MessageList<'a> {
         let get_status_symbol = |status: &MessageStatus| match status {
             MessageStatus::Sending => "○",
             MessageStatus::Delivered => "●",
-            MessageStatus::Read => "✓",
             MessageStatus::Failed => "!",
             MessageStatus::System => "⚙",
         };
@@ -438,7 +420,7 @@ impl<'a> StatefulWidget for MessageList<'a> {
                     };
 
                     let lines_count = match &msg.content {
-                        MessageContent::Text(text) | MessageContent::System(text) => {
+                        MessageContent::Text(text) => {
                             let wrap_width = content_width.saturating_sub(1);
                             if let Some(layout) = self.layout {
                                 if let Some(entry) = layout.cache.get(&wrap_width) {
@@ -517,7 +499,7 @@ impl<'a> StatefulWidget for MessageList<'a> {
             };
 
             let lines: Cow<'_, [WrappedLine]> = match &msg.content {
-                MessageContent::Text(text) | MessageContent::System(text) => {
+                MessageContent::Text(text) => {
                     let wrap_width = content_width.saturating_sub(1);
 
                     if let Some(layout) = self.layout {
@@ -534,7 +516,7 @@ impl<'a> StatefulWidget for MessageList<'a> {
                         Cow::Owned(wrap_text(text, wrap_width as usize))
                     }
                 }
-                MessageContent::FileTransfer { .. } | MessageContent::GameInvite { .. } => {
+                MessageContent::FileTransfer { .. } => {
                     // Cards are always 3 lines high. We use a placeholder for lines count.
                     Cow::Owned(vec![
                         WrappedLine {
@@ -596,14 +578,8 @@ impl<'a> StatefulWidget for MessageList<'a> {
                     .saturating_sub(scrollbar_adjustment);
 
                 match &msg.content {
-                    MessageContent::Text(_) | MessageContent::System(_) => {
-                        let mut style = if let MessageContent::System(_) = msg.content {
-                            Style::default()
-                                .fg(Color::Blue)
-                                .add_modifier(Modifier::ITALIC)
-                        } else {
-                            Style::default()
-                        };
+                    MessageContent::Text(_) => {
+                        let mut style = Style::default();
 
                         if self.focused && selected_index == Some(idx) {
                             style = style.bg(Color::Indexed(236)); // Subtle highlight
@@ -682,49 +658,12 @@ impl<'a> StatefulWidget for MessageList<'a> {
                             });
                         }
                     }
-                    MessageContent::GameInvite {
-                        game_type,
-                        challenger,
-                    } => {
-                        let card = GameCard::new(game_type.clone(), challenger.clone())
-                            .focused(self.focused && selected_index == Some(idx));
-
-                        for (line_idx, _) in lines_to_render {
-                            y = y.saturating_sub(1);
-                            if y < inner_area.y {
-                                break;
-                            }
-
-                            card.render_line(
-                                line_idx,
-                                Rect::new(content_x, y, content_width.saturating_sub(1), 1),
-                                buf,
-                            );
-                            render_gutter(GutterParams {
-                                buf,
-                                x: inner_area.x,
-                                y,
-                                msg,
-                                status_symbol,
-                                is_first_line: line_idx == 0,
-                                is_grouped,
-                                sender_width: self.sender_width,
-                                highlighted: msg.highlighted,
-                            });
-                        }
-                    }
                 }
             } else {
                 // Narrow mode implementation (Stacked layout)
                 match &msg.content {
-                    MessageContent::Text(_) | MessageContent::System(_) => {
-                        let mut style = if let MessageContent::System(_) = msg.content {
-                            Style::default()
-                                .fg(Color::Blue)
-                                .add_modifier(Modifier::ITALIC)
-                        } else {
-                            Style::default()
-                        };
+                    MessageContent::Text(_) => {
+                        let mut style = Style::default();
 
                         if self.focused && selected_index == Some(idx) {
                             style = style.bg(Color::Indexed(236));
@@ -766,25 +705,6 @@ impl<'a> StatefulWidget for MessageList<'a> {
                                 .paused(*paused)
                                 .eta(eta.clone())
                                 .focused(self.focused && selected_index == Some(idx));
-
-                        for (line_idx, _) in lines_to_render {
-                            y = y.saturating_sub(1);
-                            if y < inner_area.y {
-                                break;
-                            }
-                            card.render_line(
-                                line_idx,
-                                Rect::new(inner_area.x, y, inner_area.width.saturating_sub(1), 1),
-                                buf,
-                            );
-                        }
-                    }
-                    MessageContent::GameInvite {
-                        game_type,
-                        challenger,
-                    } => {
-                        let card = GameCard::new(game_type.clone(), challenger.clone())
-                            .focused(self.focused && selected_index == Some(idx));
 
                         for (line_idx, _) in lines_to_render {
                             y = y.saturating_sub(1);

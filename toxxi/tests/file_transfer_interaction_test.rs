@@ -1,51 +1,17 @@
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use toxcore::tox::Address;
-use toxcore::tox::{FriendNumber, ToxConnection, ToxUserStatus};
+use crossterm::event::{KeyCode, KeyModifiers};
+use toxcore::tox::FriendNumber;
 use toxcore::types::{FileId, PublicKey};
-use toxxi::config::Config;
-use toxxi::model::{DomainState, FriendInfo, MessageContent, Model, TransferStatus, UiMode};
+use toxxi::model::{MessageContent, TransferStatus, UiMode};
 use toxxi::msg::{Cmd, IOAction, IOEvent, Msg, ToxAction, ToxEvent};
+use toxxi::testing::{add_test_friend, create_test_model, send_key};
 use toxxi::update::update;
-
-fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "I am a test".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    Model::new(domain, config.clone(), config)
-}
-
-fn add_test_friend(model: &mut Model, fid: FriendNumber, pk: PublicKey) {
-    model.session.friend_numbers.insert(fid, pk);
-    model.domain.friends.insert(
-        pk,
-        FriendInfo {
-            name: format!("Friend {}", fid.0),
-            public_key: Some(pk),
-            status_message: "".to_string(),
-            connection: ToxConnection::TOX_CONNECTION_TCP,
-            last_sent_message_id: None,
-            last_read_receipt: None,
-            is_typing: false,
-        },
-    );
-    model.ensure_friend_window(pk);
-}
-
-fn key_event(code: KeyCode) -> Msg {
-    Msg::Input(Event::Key(KeyEvent::new(code, KeyModifiers::empty())))
-}
 
 #[test]
 fn test_esc_switches_to_navigation_mode() {
     let mut model = create_test_model();
     assert_eq!(model.ui.ui_mode, UiMode::Chat);
 
-    update(&mut model, key_event(KeyCode::Esc));
+    send_key(&mut model, KeyCode::Esc, KeyModifiers::NONE);
 
     assert_eq!(model.ui.ui_mode, UiMode::Navigation);
 }
@@ -73,14 +39,14 @@ fn test_accept_file_in_navigation_mode() {
     model.set_active_window(1);
 
     // 2. Switch to Navigation mode
-    update(&mut model, key_event(KeyCode::Esc));
+    send_key(&mut model, KeyCode::Esc, KeyModifiers::NONE);
 
     // 3. Select the file transfer message (it's the last one)
     // We might need to implement selection movement in update.rs
-    update(&mut model, key_event(KeyCode::Up));
+    send_key(&mut model, KeyCode::Up, KeyModifiers::NONE);
 
     // 4. Press 'a' to accept
-    let cmds = update(&mut model, key_event(KeyCode::Char('a')));
+    let cmds = send_key(&mut model, KeyCode::Char('a'), KeyModifiers::NONE);
 
     // 5. Verify commands
     let has_io_accept = cmds.iter().any(|c| matches!(c, Cmd::IO(IOAction::OpenFileForReceiving(f, n, ..)) if *f == pk && *n == file_id));
@@ -112,10 +78,10 @@ fn test_cancel_file_in_navigation_mode() {
         )),
     );
     model.set_active_window(1);
-    update(&mut model, key_event(KeyCode::Esc));
-    update(&mut model, key_event(KeyCode::Up));
+    send_key(&mut model, KeyCode::Esc, KeyModifiers::NONE);
+    send_key(&mut model, KeyCode::Up, KeyModifiers::NONE);
 
-    let cmds = update(&mut model, key_event(KeyCode::Char('x')));
+    let cmds = send_key(&mut model, KeyCode::Char('x'), KeyModifiers::NONE);
 
     let has_cancel = cmds.iter().any(|c| matches!(c, Cmd::Tox(ToxAction::FileControl(f, n, control))
         if *f == pk && *n == file_id && *control == toxcore::types::ToxFileControl::TOX_FILE_CONTROL_CANCEL));
@@ -143,15 +109,15 @@ fn test_toggle_pause_file_in_navigation_mode() {
         )),
     );
     model.set_active_window(1);
-    update(&mut model, key_event(KeyCode::Esc));
-    update(&mut model, key_event(KeyCode::Up));
+    send_key(&mut model, KeyCode::Esc, KeyModifiers::NONE);
+    send_key(&mut model, KeyCode::Up, KeyModifiers::NONE);
 
     // Initially not paused
     let p = model.domain.file_transfers.get(&file_id).unwrap();
     assert!(p.status == TransferStatus::Active);
 
     // Press 'p' to pause
-    let cmds = update(&mut model, key_event(KeyCode::Char('p')));
+    let cmds = send_key(&mut model, KeyCode::Char('p'), KeyModifiers::NONE);
     let has_pause = cmds.iter().any(|c| matches!(c, Cmd::Tox(ToxAction::FileControl(f, n, control))
         if *f == pk && *n == file_id && *control == toxcore::types::ToxFileControl::TOX_FILE_CONTROL_PAUSE));
     assert!(has_pause);
@@ -171,7 +137,7 @@ fn test_toggle_pause_file_in_navigation_mode() {
     );
 
     // Press 'p' again to resume
-    let cmds = update(&mut model, key_event(KeyCode::Char('p')));
+    let cmds = send_key(&mut model, KeyCode::Char('p'), KeyModifiers::NONE);
     let has_resume = cmds.iter().any(|c| matches!(c, Cmd::Tox(ToxAction::FileControl(f, n, control))
         if *f == pk && *n == file_id && *control == toxcore::types::ToxFileControl::TOX_FILE_CONTROL_RESUME));
     assert!(has_resume);
@@ -197,10 +163,10 @@ fn test_change_dest_prefills_command() {
         )),
     );
     model.set_active_window(1);
-    update(&mut model, key_event(KeyCode::Esc));
-    update(&mut model, key_event(KeyCode::Up));
+    send_key(&mut model, KeyCode::Esc, KeyModifiers::NONE);
+    send_key(&mut model, KeyCode::Up, KeyModifiers::NONE);
 
-    update(&mut model, key_event(KeyCode::Char('o')));
+    send_key(&mut model, KeyCode::Char('o'), KeyModifiers::NONE);
 
     assert_eq!(model.ui.ui_mode, UiMode::Chat);
     assert!(

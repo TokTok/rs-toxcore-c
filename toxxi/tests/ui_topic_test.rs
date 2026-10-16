@@ -1,33 +1,12 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
-use toxcore::tox::{Address, GroupNumber, ToxUserStatus};
-use toxcore::types::{GroupChatId, PublicKey};
-use toxxi::config::Config;
-use toxxi::model::{DomainState, Model, WindowId};
+use toxcore::tox::GroupNumber;
+use toxcore::types::GroupChatId;
+use toxxi::model::WindowId;
 use toxxi::msg::{Cmd, Msg, ToxAction, ToxEvent};
+use toxxi::testing::{create_test_model, send_key};
 use toxxi::ui::draw;
 use toxxi::update::update;
-
-fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "I am a test".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    Model::new(domain, config.clone(), config)
-}
-
-fn send_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Vec<Cmd> {
-    update(
-        model,
-        Msg::Input(crossterm::event::Event::Key(
-            crossterm::event::KeyEvent::new(code, mods),
-        )),
-    )
-}
 
 #[test]
 fn test_ui_topic_update_flow() {
@@ -89,7 +68,7 @@ fn test_ui_topic_update_flow() {
     // 3. Simulate Tox event arriving
     update(
         &mut model,
-        Msg::Tox(ToxEvent::GroupTopic(gnum, "New Topic".to_string())),
+        Msg::Tox(ToxEvent::GroupTopic(gnum, "New Topic".to_string(), None)),
     );
 
     // 4. Draw again and verify topic bar AND message list
@@ -114,7 +93,7 @@ fn test_ui_topic_update_flow() {
     // 5. Simulate the SAME Tox event arriving again (e.g. on reconn/reconcile)
     update(
         &mut model,
-        Msg::Tox(ToxEvent::GroupTopic(gnum, "New Topic".to_string())),
+        Msg::Tox(ToxEvent::GroupTopic(gnum, "New Topic".to_string(), None)),
     );
 
     // Draw again
@@ -188,6 +167,7 @@ fn test_ui_conference_topic_update_flow() {
         Msg::Tox(ToxEvent::ConferenceTitle(
             cnum,
             "New Conf Title".to_string(),
+            None,
         )),
     );
 
@@ -203,7 +183,7 @@ fn test_ui_conference_topic_update_flow() {
     // Check system message
     let chat_row: String = (25..80).map(|x| buffer[(x, 5)].symbol()).collect();
     assert!(
-        chat_row.contains("* Topic changed to: New Conf Title"),
+        chat_row.contains("* Title changed to: New Conf Title"),
         "Chat row should contain system message, got: '{}'",
         chat_row
     );

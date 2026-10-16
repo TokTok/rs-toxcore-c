@@ -11,6 +11,6 @@ expression: rendered
                                                             
                                                             
 [12:00] ●  Alice | Hello!                                   
-[12:01] ✓ Tester | Hey Alice, how are you?                  
+[12:01] ● Tester | Hey Alice, how are you?                  
 [12:02] ●  Alice | I'm good, thanks!                        
 ────────────────────────────────────────────────────────────

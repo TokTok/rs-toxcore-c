@@ -1,21 +1,6 @@
-use toxcore::tox::{Address, ToxUserStatus};
-use toxcore::types::PublicKey;
-use toxxi::config::Config;
-use toxxi::model::{DomainState, Model};
 use toxxi::msg::{AppCmd, Cmd};
+use toxxi::testing::create_test_model;
 use toxxi::update::handle_enter;
-
-fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "Status".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    Model::new(domain, config.clone(), config)
-}
 
 #[test]
 fn test_screenshot_command_extension() {

@@ -1,31 +1,8 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-use toxcore::tox::{Address, GroupNumber, ToxUserStatus};
+use crossterm::event::{KeyCode, KeyModifiers};
+use toxcore::tox::{GroupNumber, ToxUserStatus};
 use toxcore::types::PublicKey;
-use toxxi::config::Config;
-use toxxi::model::{DomainState, Model, PeerId, PeerInfo, WindowId};
-use toxxi::msg::Msg;
-use toxxi::update::update;
-
-fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "I am a test".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    Model::new(domain, config.clone(), config)
-}
-
-fn key_event(code: KeyCode) -> KeyEvent {
-    KeyEvent {
-        code,
-        modifiers: KeyModifiers::empty(),
-        kind: KeyEventKind::Press,
-        state: KeyEventState::empty(),
-    }
-}
+use toxxi::model::{Model, PeerId, PeerInfo, WindowId};
+use toxxi::testing::{create_test_model, send_key};
 
 fn get_input_text(model: &Model) -> String {
     model.ui.input_state.text.clone()
@@ -71,18 +48,12 @@ fn test_ui_popup_completion_flow() {
     assert_eq!(model.active_window_id(), WindowId::Group(chat_id));
 
     // 2. Type "b"
-    update(
-        &mut model,
-        Msg::Input(crossterm::event::Event::Key(key_event(KeyCode::Char('b')))),
-    );
+    send_key(&mut model, KeyCode::Char('b'), KeyModifiers::NONE);
     assert_eq!(get_input_text(&model), "b");
     assert!(!model.ui.completion.active);
 
     // 3. Type Tab -> Should trigger completion
-    update(
-        &mut model,
-        Msg::Input(crossterm::event::Event::Key(key_event(KeyCode::Tab))),
-    );
+    send_key(&mut model, KeyCode::Tab, KeyModifiers::NONE);
 
     // Verify completion state
     assert!(model.ui.completion.active, "Completion should be active");
@@ -117,10 +88,7 @@ fn test_ui_popup_completion_flow() {
     assert_eq!(cursor_y, 0, "Cursor y should be 0");
 
     // 4. Type Tab again -> Cycle to second
-    update(
-        &mut model,
-        Msg::Input(crossterm::event::Event::Key(key_event(KeyCode::Tab))),
-    );
+    send_key(&mut model, KeyCode::Tab, KeyModifiers::NONE);
     let text_second = get_input_text(&model);
     assert_eq!(text_second, format!("{}: ", second));
 
@@ -133,25 +101,16 @@ fn test_ui_popup_completion_flow() {
     );
 
     // 5. Type Tab again -> Cycle back to first
-    update(
-        &mut model,
-        Msg::Input(crossterm::event::Event::Key(key_event(KeyCode::Tab))),
-    );
+    send_key(&mut model, KeyCode::Tab, KeyModifiers::NONE);
     assert_eq!(get_input_text(&model), format!("{}: ", first));
 
     // 6. Test Up/Down
     // Down -> Cycle to second
-    update(
-        &mut model,
-        Msg::Input(crossterm::event::Event::Key(key_event(KeyCode::Down))),
-    );
+    send_key(&mut model, KeyCode::Down, KeyModifiers::NONE);
     assert_eq!(get_input_text(&model), format!("{}: ", second));
 
     // Up -> Cycle back to first
-    update(
-        &mut model,
-        Msg::Input(crossterm::event::Event::Key(key_event(KeyCode::Up))),
-    );
+    send_key(&mut model, KeyCode::Up, KeyModifiers::NONE);
     assert_eq!(get_input_text(&model), format!("{}: ", first));
 
     // 7. Type a character -> Should dismiss popup
@@ -159,10 +118,7 @@ fn test_ui_popup_completion_flow() {
         model.ui.completion.active,
         "Completion should be active before typing"
     );
-    update(
-        &mut model,
-        Msg::Input(crossterm::event::Event::Key(key_event(KeyCode::Char('x')))),
-    );
+    send_key(&mut model, KeyCode::Char('x'), KeyModifiers::NONE);
 
     // Popup should be closed
     assert!(

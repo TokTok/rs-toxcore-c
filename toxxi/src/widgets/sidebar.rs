@@ -1,3 +1,4 @@
+use crate::model::WindowId;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -16,6 +17,7 @@ pub enum ContactStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SidebarItem {
     pub name: String,
+    pub window: Option<WindowId>,
     pub status: ContactStatus,
     pub unread_count: u32,
     pub item_type: SidebarItemType,
@@ -27,12 +29,18 @@ impl SidebarItem {
     pub fn new(name: impl Into<String>, item_type: SidebarItemType) -> Self {
         Self {
             name: name.into(),
+            window: None,
             status: ContactStatus::Offline,
             unread_count: 0,
             item_type,
             is_typing: false,
             status_message: None,
         }
+    }
+
+    pub fn window(mut self, window: WindowId) -> Self {
+        self.window = Some(window);
+        self
     }
 
     pub fn status(mut self, status: ContactStatus) -> Self {
@@ -68,28 +76,11 @@ pub enum SidebarItemType {
 pub struct SidebarState {
     pub list_state: ListState,
     pub items: Vec<SidebarItem>,
-    pub collapsed_categories: Vec<SidebarItemType>,
 }
 
 impl SidebarState {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn toggle_category(&mut self, item_type: SidebarItemType) {
-        if let Some(pos) = self
-            .collapsed_categories
-            .iter()
-            .position(|&t| t == item_type)
-        {
-            self.collapsed_categories.remove(pos);
-        } else {
-            self.collapsed_categories.push(item_type);
-        }
-    }
-
-    pub fn is_collapsed(&self, item_type: SidebarItemType) -> bool {
-        self.collapsed_categories.contains(&item_type)
     }
 }
 
@@ -139,33 +130,20 @@ impl<'a> StatefulWidget for Sidebar<'a> {
         }
 
         let mut list_items = Vec::new();
-        let mut current_category = None;
 
         for (idx, item) in state.items.iter().enumerate() {
             if item.item_type == SidebarItemType::Category {
-                current_category = Some(match item.name.as_str() {
-                    "Friends" => SidebarItemType::Friend,
-                    "Groups" => SidebarItemType::Group,
-                    "Conferences" => SidebarItemType::Conference,
-                    _ => SidebarItemType::Category,
-                });
-
-                let is_collapsed = current_category
-                    .map(|t| state.is_collapsed(t))
-                    .unwrap_or(false);
-                let symbol = if is_collapsed { "▶" } else { "▼" };
-
                 if !self.narrow_mode {
                     // Add a small gap before categories (except the first one)
                     if idx > 0 {
                         list_items.push(ListItem::new(""));
                     }
 
-                    let label = match current_category {
-                        Some(SidebarItemType::Friend) => format!("{} 👤 Friends", symbol),
-                        Some(SidebarItemType::Group) => format!("{} 👥 Groups", symbol),
-                        Some(SidebarItemType::Conference) => format!("{} 🧑‍🤝‍🧑 Conferences", symbol),
-                        _ => format!("{} {}", symbol, item.name),
+                    let label = match item.name.as_str() {
+                        "Friends" => "▼ 👤 Friends".to_string(),
+                        "Groups" => "▼ 👥 Groups".to_string(),
+                        "Conferences" => "▼ 🧑‍🤝‍🧑 Conferences".to_string(),
+                        _ => format!("▼ {}", item.name),
                     };
                     list_items.push(
                         ListItem::new(label).style(
@@ -175,12 +153,6 @@ impl<'a> StatefulWidget for Sidebar<'a> {
                         ),
                     );
                 }
-                continue;
-            }
-
-            if let Some(cat) = current_category
-                && state.is_collapsed(cat)
-            {
                 continue;
             }
 

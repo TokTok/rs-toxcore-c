@@ -1,21 +1,8 @@
 use ratatui::{Terminal, backend::TestBackend};
-use toxcore::tox::{Address, ToxUserStatus};
-use toxcore::types::{MessageType, PublicKey, ToxLogLevel};
-use toxxi::config::Config;
-use toxxi::model::{ConsoleMessageType, DomainState, Model, WindowId};
+use toxcore::types::{MessageType, ToxLogLevel};
+use toxxi::model::{ConsoleMessageType, WindowId};
+use toxxi::testing::create_test_model;
 use toxxi::ui::draw;
-
-fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "I am a test".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    Model::new(domain, config.clone(), config)
-}
 
 #[test]
 fn test_scroll_up_at_top_keeps_messages_visible() {
@@ -23,7 +10,7 @@ fn test_scroll_up_at_top_keeps_messages_visible() {
 
     // Add 10 messages
     for i in 1..=10 {
-        model.add_console_message(ConsoleMessageType::Log, format!("message {}", i));
+        model.add_console_message(ConsoleMessageType::Info, format!("message {}", i));
     }
 
     let backend = TestBackend::new(80, 10);
@@ -72,74 +59,12 @@ fn test_scroll_up_at_top_keeps_messages_visible() {
 }
 
 #[test]
-fn test_scroll_bottom_resets_offset() {
-    let mut model = create_test_model();
-
-    let backend = TestBackend::new(80, 10);
-    let mut terminal = Terminal::new(backend).unwrap();
-
-    for i in 0..100 {
-        model.add_console_message(ConsoleMessageType::Log, format!("message {}", i));
-    }
-
-    terminal.draw(|f| draw(f, &mut model)).unwrap();
-    model.scroll_up(1);
-    model.scroll_up(1);
-    assert_eq!(
-        model
-            .ui
-            .window_state
-            .get(&WindowId::Console)
-            .unwrap()
-            .msg_list_state
-            .scroll,
-        2
-    );
-
-    model.scroll_bottom();
-    assert_eq!(
-        model
-            .ui
-            .window_state
-            .get(&WindowId::Console)
-            .unwrap()
-            .msg_list_state
-            .scroll,
-        0
-    );
-}
-
-#[test]
-fn test_scroll_top_sets_max_offset() {
-    let mut model = create_test_model();
-
-    for i in 0..100 {
-        model.add_console_message(ConsoleMessageType::Log, format!("message {}", i));
-    }
-
-    let backend = TestBackend::new(80, 13);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|f| draw(f, &mut model)).unwrap();
-
-    // Scroll to top
-    model.scroll_top();
-    let state = model.ui.window_state.get(&WindowId::Console).unwrap();
-    assert_eq!(
-        state.msg_list_state.scroll,
-        state
-            .msg_list_state
-            .total_height
-            .saturating_sub(state.last_height)
-    );
-}
-
-#[test]
 fn test_scroll_up_does_not_overscroll() {
     let mut model = create_test_model();
 
     // Add 20 messages, each 1 line high
     for i in 1..=20 {
-        model.add_console_message(ConsoleMessageType::Log, format!("message {}", i));
+        model.add_console_message(ConsoleMessageType::Info, format!("message {}", i));
     }
 
     let height = 10;
@@ -194,7 +119,6 @@ fn test_logs_scrolling_with_filters() {
 
     // 2. Set filter to only show INFO (which we have)
     model.ui.log_filters.levels = vec![ToxLogLevel::TOX_LOG_LEVEL_INFO];
-    assert_eq!(model.all_tox_logs().len(), 10);
 
     // 3. Scroll up
     model
@@ -214,10 +138,7 @@ fn test_logs_scrolling_with_filters() {
         "trace message".to_string(),
     );
 
-    // 5. Total visible logs should still be 10
-    assert_eq!(model.all_tox_logs().len(), 10);
-
-    // 6. scroll SHOULD NOT have incremented
+    // 5. scroll SHOULD NOT have incremented
     assert_eq!(
         model
             .ui

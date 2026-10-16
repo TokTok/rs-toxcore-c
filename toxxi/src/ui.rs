@@ -224,14 +224,13 @@ pub fn draw(f: &mut Frame, model: &mut Model) {
         f.render_stateful_widget(picker, f.area(), state);
     }
 
-    if model.ui.show_qr {
-        draw_qr_modal(f, model);
+    if let Some(data) = &model.ui.qr {
+        draw_qr_modal(f, data);
     }
 }
 
-fn draw_qr_modal(f: &mut Frame, model: &Model) {
-    let tox_id = model.domain.tox_id.to_string();
-    let modal = QrCodeModal::new(tox_id);
+fn draw_qr_modal(f: &mut Frame, data: &str) {
+    let modal = QrCodeModal::new(data.to_owned());
     let (width, height) = modal.required_size();
 
     let area = centered_rect(width, height, f.area());
@@ -266,11 +265,7 @@ fn draw_topic_bar(f: &mut Frame, area: Rect, model: &Model) {
         WindowId::Logs => "Tox Logs".to_owned(),
         WindowId::Files => "File Manager".to_owned(),
         WindowId::Friend(pk) => {
-            let mut text = if let Some(conv) = model.domain.conversations.get(&id) {
-                conv.name.clone()
-            } else {
-                format!("Friend {}", crate::utils::encode_hex(&pk.0[0..4]))
-            };
+            let mut text = model.window_name(id);
 
             if let Some(info) = model.domain.friends.get(&pk) {
                 if info.is_typing {
@@ -327,9 +322,6 @@ fn draw_messages(f: &mut Frame, area: Rect, model: &mut Model) {
                     MessageContent::FileTransfer { name, .. } => {
                         WidgetContent::Text(format!("[File Transfer: {}]", name))
                     }
-                    MessageContent::GameInvite { game_type, .. } => {
-                        WidgetContent::Text(format!("[Game Invite: {}]", game_type))
-                    }
                 };
                 cache.push(ChatMessage {
                     sender: format!("{:?}", msg.msg_type).to_uppercase(),
@@ -348,8 +340,6 @@ fn draw_messages(f: &mut Frame, area: Rect, model: &mut Model) {
             // Rebuild the cache whenever filtering or count changes.
             // Further optimization (like incremental appending) is possible but
             // currently omitted to avoid complexity, as log rendering is not a bottleneck.
-
-            // Implement `all_tox_logs` logic here to avoid borrow conflicts.
             let mut all_logs: Vec<_> = domain
                 .tox_logs
                 .values()
@@ -412,6 +402,7 @@ fn draw_messages(f: &mut Frame, area: Rect, model: &mut Model) {
                             progress,
                             speed,
                             is_incoming,
+                            ..
                         } => {
                             let (paused, eta) = if let Some(fid) = file_id {
                                 domain
@@ -442,16 +433,9 @@ fn draw_messages(f: &mut Frame, area: Rect, model: &mut Model) {
                                 eta,
                             }
                         }
-                        MessageContent::GameInvite {
-                            game_type,
-                            challenger,
-                        } => WidgetContent::GameInvite {
-                            game_type: game_type.clone(),
-                            challenger: challenger.clone(),
-                        },
                     };
 
-                    let status = if msg.sender == "System" {
+                    let status = if msg.sender == crate::model::SYSTEM_SENDER {
                         WidgetStatus::System
                     } else {
                         match msg.status {
@@ -578,20 +562,8 @@ fn draw_status_bar(f: &mut Frame, area: Rect, model: &Model) {
             .map(|s| s.unread_count)
             .unwrap_or(0);
 
-        let name = match win_id {
-            WindowId::Console => "Status".to_owned(),
-            WindowId::Logs => "Logs".to_owned(),
-            WindowId::Files => "Files".to_owned(),
-            _ => model
-                .domain
-                .conversations
-                .get(&win_id)
-                .map(|c| c.name.clone())
-                .unwrap_or_else(|| format!("{:?}", win_id)),
-        };
-
         windows.push(StatusWindow {
-            name,
+            name: model.window_name(win_id),
             index: i,
             unread,
             is_active: i == model.ui.active_window_index,
@@ -772,84 +744,59 @@ fn draw_sidebar(f: &mut Frame, area: Rect, model: &mut Model) {
     if model.ui.sidebar_cache.is_none() {
         let mut items = Vec::new();
 
+        let unread = |id: WindowId| {
+            model
+                .ui
+                .window_state
+                .get(&id)
+                .map(|s| s.unread_count as u32)
+                .unwrap_or(0)
+        };
+        let system_item = |id: WindowId| {
+            SidebarItem::new(model.window_name(id), SidebarItemType::Friend)
+                .window(id)
+                .unread(unread(id))
+        };
+
         // 1. Static Categories (System)
         items.push(SidebarItem::new("System", SidebarItemType::Category));
-
-        // Status (Console)
-        let status_unread = model
-            .ui
-            .window_state
-            .get(&WindowId::Console)
-            .map(|s| s.unread_count as u32)
-            .unwrap_or(0);
-        items.push(
-            SidebarItem::new("Status", SidebarItemType::Friend)
-                .status(match model.domain.self_connection_status {
-                    ToxConnection::TOX_CONNECTION_NONE => {
-                        crate::widgets::sidebar::ContactStatus::Offline
-                    }
-                    _ => crate::widgets::sidebar::ContactStatus::Online,
-                })
-                .unread(status_unread),
-        );
-
-        // Logs
-        let logs_unread = model
-            .ui
-            .window_state
-            .get(&WindowId::Logs)
-            .map(|s| s.unread_count as u32)
-            .unwrap_or(0);
-        items.push(SidebarItem::new("Logs", SidebarItemType::Friend).unread(logs_unread));
-
-        // Files
-        let files_unread = model
-            .ui
-            .window_state
-            .get(&WindowId::Files)
-            .map(|s| s.unread_count as u32)
-            .unwrap_or(0);
-        items.push(SidebarItem::new("Files", SidebarItemType::Friend).unread(files_unread));
+        items.push(system_item(WindowId::Console).status(
+            match model.domain.self_connection_status {
+                ToxConnection::TOX_CONNECTION_NONE => {
+                    crate::widgets::sidebar::ContactStatus::Offline
+                }
+                _ => crate::widgets::sidebar::ContactStatus::Online,
+            },
+        ));
+        items.push(system_item(WindowId::Logs));
+        items.push(system_item(WindowId::Files));
 
         // 2. Friends
         items.push(SidebarItem::new("Friends", SidebarItemType::Category));
 
-        let mut friend_ids: Vec<_> = model.domain.friends.keys().collect();
-        friend_ids.sort_by_key(|k| k.0);
+        let mut friends: Vec<_> = model.domain.friends.iter().collect();
+        friends.sort_by_key(|(k, _)| k.0);
 
-        for pk in friend_ids {
-            if let Some(friend) = model.domain.friends.get(pk) {
-                let win_id = WindowId::Friend(*pk);
-                let unread = model
-                    .ui
-                    .window_state
-                    .get(&win_id)
-                    .map(|s| s.unread_count as u32)
-                    .unwrap_or(0);
+        for (pk, friend) in friends {
+            let win_id = WindowId::Friend(*pk);
 
-                // FriendInfo currently doesn't store UserStatus (Away/Busy), only Connection.
-                // Map connection status to Online/Offline.
-                let status = match friend.connection {
-                    ToxConnection::TOX_CONNECTION_NONE => {
-                        crate::widgets::sidebar::ContactStatus::Offline
-                    }
-                    _ => crate::widgets::sidebar::ContactStatus::Online,
-                };
+            // FriendInfo currently doesn't store UserStatus (Away/Busy), only Connection.
+            // Map connection status to Online/Offline.
+            let status = match friend.connection {
+                ToxConnection::TOX_CONNECTION_NONE => {
+                    crate::widgets::sidebar::ContactStatus::Offline
+                }
+                _ => crate::widgets::sidebar::ContactStatus::Online,
+            };
 
-                let name = if let Some(conv) = model.domain.conversations.get(&win_id) {
-                    conv.name.clone()
-                } else {
-                    friend.name.clone()
-                };
-
-                items.push(
-                    SidebarItem::new(name, SidebarItemType::Friend)
-                        .status(status)
-                        .unread(unread)
-                        .typing(friend.is_typing)
-                        .status_message(friend.status_message.clone()),
-                );
-            }
+            items.push(
+                SidebarItem::new(model.window_name(win_id), SidebarItemType::Friend)
+                    .window(win_id)
+                    .status(status)
+                    .unread(unread(win_id))
+                    .typing(friend.is_typing)
+                    .status_message(friend.status_message.clone()),
+            );
         }
 
         // 3. Groups
@@ -867,22 +814,11 @@ fn draw_sidebar(f: &mut Frame, area: Rect, model: &mut Model) {
 
         for gid in group_ids {
             let win_id = WindowId::Group(*gid);
-            let unread = model
-                .ui
-                .window_state
-                .get(&win_id)
-                .map(|s| s.unread_count as u32)
-                .unwrap_or(0);
-            let name = if let Some(conv) = model.domain.conversations.get(&win_id) {
-                conv.name.clone()
-            } else {
-                format!("Group {}", crate::utils::encode_hex(&gid.0[0..4]))
-            };
-
             items.push(
-                SidebarItem::new(name, SidebarItemType::Group)
+                SidebarItem::new(model.window_name(win_id), SidebarItemType::Group)
+                    .window(win_id)
                     .status(crate::widgets::sidebar::ContactStatus::Online) // Groups are always "online" if we are
-                    .unread(unread),
+                    .unread(unread(win_id)),
             );
         }
 
@@ -901,22 +837,11 @@ fn draw_sidebar(f: &mut Frame, area: Rect, model: &mut Model) {
 
         for cid in conf_ids {
             let win_id = WindowId::Conference(*cid);
-            let unread = model
-                .ui
-                .window_state
-                .get(&win_id)
-                .map(|s| s.unread_count as u32)
-                .unwrap_or(0);
-            let name = if let Some(conv) = model.domain.conversations.get(&win_id) {
-                conv.name.clone()
-            } else {
-                format!("Conference {}", crate::utils::encode_hex(&cid.0[0..4]))
-            };
-
             items.push(
-                SidebarItem::new(name, SidebarItemType::Conference)
+                SidebarItem::new(model.window_name(win_id), SidebarItemType::Conference)
+                    .window(win_id)
                     .status(crate::widgets::sidebar::ContactStatus::Online)
-                    .unread(unread),
+                    .unread(unread(win_id)),
             );
         }
 
@@ -931,18 +856,10 @@ fn draw_sidebar(f: &mut Frame, area: Rect, model: &mut Model) {
     let active_id = model.active_window_id();
     let mut selected_index = None;
     let mut visual_index = 0;
-    let mut current_category = None;
     let narrow_mode = false; // Default for Sidebar
 
     for (idx, item) in state.items.iter().enumerate() {
         if item.item_type == SidebarItemType::Category {
-            current_category = Some(match item.name.as_str() {
-                "Friends" => SidebarItemType::Friend,
-                "Groups" => SidebarItemType::Group,
-                "Conferences" => SidebarItemType::Conference,
-                _ => SidebarItemType::Category,
-            });
-
             if !narrow_mode {
                 if idx > 0 {
                     visual_index += 1; // Spacer
@@ -952,61 +869,7 @@ fn draw_sidebar(f: &mut Frame, area: Rect, model: &mut Model) {
             continue;
         }
 
-        if let Some(cat) = current_category
-            && state.is_collapsed(cat)
-        {
-            continue;
-        }
-
-        let is_match = match active_id {
-            WindowId::Console => item.name == "Status",
-            WindowId::Logs => item.name == "Logs",
-            WindowId::Files => item.name == "Files",
-            WindowId::Friend(pk) => {
-                if item.item_type != SidebarItemType::Friend {
-                    false
-                } else {
-                    let name =
-                        if let Some(conv) = model.domain.conversations.get(&WindowId::Friend(pk)) {
-                            conv.name.clone()
-                        } else if let Some(info) = model.domain.friends.get(&pk) {
-                            info.name.clone()
-                        } else {
-                            format!("Friend {}", crate::utils::encode_hex(&pk.0[0..4]))
-                        };
-                    item.name == name
-                }
-            }
-            WindowId::Group(g) => {
-                if item.item_type != SidebarItemType::Group {
-                    false
-                } else {
-                    let name =
-                        if let Some(conv) = model.domain.conversations.get(&WindowId::Group(g)) {
-                            conv.name.clone()
-                        } else {
-                            format!("Group {}", crate::utils::encode_hex(&g.0[0..4]))
-                        };
-                    item.name == name
-                }
-            }
-            WindowId::Conference(c) => {
-                if item.item_type != SidebarItemType::Conference {
-                    false
-                } else {
-                    let name = if let Some(conv) =
-                        model.domain.conversations.get(&WindowId::Conference(c))
-                    {
-                        conv.name.clone()
-                    } else {
-                        format!("Conference {}", crate::utils::encode_hex(&c.0[0..4]))
-                    };
-                    item.name == name
-                }
-            }
-        };
-
-        if is_match {
+        if item.window == Some(active_id) {
             selected_index = Some(visual_index);
             break;
         }

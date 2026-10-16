@@ -1,29 +1,4 @@
-use toxxi::widgets::{ContactStatus, SidebarItem, SidebarItemType, SidebarState};
-
-#[test]
-fn test_sidebar_category_collapsing() {
-    let mut state = SidebarState {
-        items: vec![
-            SidebarItem::new("Friends", SidebarItemType::Category),
-            SidebarItem::new("Alice", SidebarItemType::Friend),
-            SidebarItem::new("Groups", SidebarItemType::Category),
-            SidebarItem::new("Rust Group", SidebarItemType::Group),
-        ],
-        ..Default::default()
-    };
-
-    // Initially nothing collapsed
-    assert!(!state.is_collapsed(SidebarItemType::Friend));
-
-    // Toggle Friends category
-    state.toggle_category(SidebarItemType::Friend);
-    assert!(state.is_collapsed(SidebarItemType::Friend));
-    assert!(!state.is_collapsed(SidebarItemType::Group));
-
-    // Toggle back
-    state.toggle_category(SidebarItemType::Friend);
-    assert!(!state.is_collapsed(SidebarItemType::Friend));
-}
+use toxxi::widgets::{ContactStatus, SidebarItem, SidebarItemType};
 
 #[test]
 fn test_sidebar_item_builder() {

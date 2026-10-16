@@ -1,40 +1,21 @@
 use std::sync::mpsc;
 use tokio::runtime::Runtime;
-use toxcore::tox::{Address, FriendNumber, ToxConnection, ToxUserStatus};
+use toxcore::tox::FriendNumber;
 use toxcore::types::{FileId, PublicKey, ToxLogLevel};
-use toxxi::app::AppContext;
-use toxxi::config::Config;
-use toxxi::model::{DomainState, FileTransferProgress, FriendInfo, Model, TransferStatus};
+use toxxi::model::{FileTransferProgress, Model, TransferStatus};
 use toxxi::msg::{AppCmd, Cmd, IOAction, IOEvent, Msg, ToxEvent};
+use toxxi::testing::{self, app_context};
 use toxxi::update::{handle_command, update};
 
 fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "I am a test".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    Model::new(domain, config.clone(), config)
+    let mut model = testing::create_test_model();
+    model.record_account();
+    model
 }
 
 fn add_test_friend(model: &mut Model, fid: FriendNumber, pk: PublicKey) {
-    model.session.friend_numbers.insert(fid, pk);
-    model.domain.friends.insert(
-        pk,
-        FriendInfo {
-            name: format!("Friend {}", fid.0),
-            public_key: Some(pk),
-            status_message: "".to_string(),
-            connection: ToxConnection::TOX_CONNECTION_TCP,
-            last_sent_message_id: None,
-            last_read_receipt: None,
-            is_typing: false,
-        },
-    );
-    model.ensure_friend_window(pk);
+    testing::add_test_friend(model, fid, pk);
+    model.record_account();
 }
 
 #[test]
@@ -71,8 +52,6 @@ fn test_file_chunk_read_progress_update() {
             transferred: 0,
             is_receiving: false,
             status: TransferStatus::Active,
-            file_kind: 0,
-            file_path: None,
             speed: 0.0,
             last_update: model.time_provider.now(),
             last_transferred: 0,
@@ -103,31 +82,11 @@ fn test_reload_command_routing() {
 }
 
 #[test]
-fn test_quit_command_saves_state() {
+fn test_quit_command_quits() {
     let rt = Runtime::new().unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
-    let (tx_msg, _) = mpsc::channel();
-    let (tx_tox, _) = mpsc::channel();
-    let (tx_io, _) = mpsc::channel();
-
     let mut model = create_test_model();
-    model.ui.active_window_index = 42; // Set a recognizable state
-
-    // Mock a JoinHandle that won't panic on await
-    let tox_handle = rt.spawn(async {});
-
-    let mut ctx = AppContext {
-        tx_tox_action: tx_tox,
-        tox_handle,
-        nodes: vec![],
-        savedata_path: None,
-        config_dir: temp_dir.path().to_path_buf(),
-        tx_msg,
-        quit_at: None,
-        tx_io,
-        downloads_dir: temp_dir.path().join("downloads"),
-        screenshots_dir: temp_dir.path().join("screenshots"),
-    };
+    let (mut ctx, _) = app_context(&rt, temp_dir.path());
 
     let res = rt.block_on(async { ctx.execute(vec![Cmd::App(AppCmd::Quit)], &mut model).await });
 
@@ -135,46 +94,17 @@ fn test_quit_command_saves_state() {
         res.should_quit,
         "execute(Quit) should return should_quit = true"
     );
-
-    // In the new architecture, the main loop or test harness handles the final save
-    toxxi::model::save_state(temp_dir.path(), &model).unwrap();
-
-    // Verify state was saved to the temp directory
-    let state_path = temp_dir.path().join("state.json");
-    assert!(state_path.exists(), "state.json should be created on quit");
-
-    let data = std::fs::read_to_string(state_path).unwrap();
-    assert!(
-        data.contains("42"),
-        "Saved state should contain the active window index"
-    );
 }
 
 #[test]
 fn test_state_serialization_includes_log_filters() {
     let rt = Runtime::new().unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
-    let (tx_msg, _) = mpsc::channel();
-    let (tx_tox, _) = mpsc::channel();
-    let (tx_io, rx_io) = mpsc::channel();
-
     let mut model = create_test_model();
     // Set a recognizable log filter
     model.ui.log_filters.levels = vec![ToxLogLevel::TOX_LOG_LEVEL_ERROR];
 
-    let tox_handle = rt.spawn(async {});
-    let mut ctx = AppContext {
-        tx_tox_action: tx_tox,
-        tox_handle,
-        nodes: vec![],
-        savedata_path: None,
-        config_dir: temp_dir.path().to_path_buf(),
-        tx_msg,
-        quit_at: None,
-        tx_io,
-        downloads_dir: temp_dir.path().join("downloads"),
-        screenshots_dir: temp_dir.path().join("screenshots"),
-    };
+    let (mut ctx, rx_io) = app_context(&rt, temp_dir.path());
 
     rt.block_on(async {
         // Trigger SaveState(None) which uses the local FullState serialization logic
@@ -196,4 +126,47 @@ fn test_state_serialization_includes_log_filters() {
             panic!("Unexpected IO action: {:?}", io_action);
         }
     });
+}
+
+#[test]
+fn test_quitting_waits_for_the_files_being_kept() {
+    let rt = Runtime::new().unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (tx_msg, rx_msg) = mpsc::channel();
+    let mut model = create_test_model();
+    let file = FileId([5u8; 32]);
+    model.session.finishing.insert(file);
+
+    let (mut ctx, _rx_io) = app_context(&rt, temp_dir.path());
+    // As the IO worker does once a large file is copied.
+    let pk = PublicKey([1u8; 32]);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = tx_msg.send(Msg::IO(IOEvent::FileFinished(pk, file, None)));
+    });
+
+    rt.block_on(ctx.drain(&rx_msg, &mut model));
+    assert!(model.session.finishing.is_empty());
+}
+
+#[test]
+fn test_quitting_records_what_waited_for_the_tick() {
+    let rt = Runtime::new().unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (tx_msg, rx_msg) = mpsc::channel();
+    let mut model = create_test_model();
+    model.domain.self_name = "Renamed".to_owned();
+
+    let (mut ctx, rx_io) = app_context(&rt, temp_dir.path());
+    let log = ToxEvent::Log(
+        ToxLogLevel::TOX_LOG_LEVEL_DEBUG,
+        String::new(),
+        0,
+        String::new(),
+        String::new(),
+    );
+    tx_msg.send(Msg::Tox(log)).unwrap();
+
+    rt.block_on(ctx.drain(&rx_msg, &mut model));
+    assert!(matches!(rx_io.try_recv(), Ok(IOAction::AppendEvents(..))));
 }

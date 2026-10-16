@@ -1,18 +1,17 @@
-use toxcore::tox::{Address, ConferenceNumber, GroupNumber, ToxUserStatus};
-use toxcore::types::{MessageType, PublicKey};
-use toxxi::config::Config;
-use toxxi::model::{DomainState, MessageContent, Model, WindowId};
+use ratatui::{Terminal, backend::TestBackend};
+use toxcore::tox::{ConferenceNumber, GroupNumber};
+use toxcore::types::MessageType;
+use toxxi::model::{MessageContent, Model, WindowId};
+use toxxi::testing::create_test_model;
+use toxxi::ui::draw;
 
-fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "I am a test".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    Model::new(domain, config.clone(), config)
+fn topic_bar(model: &mut Model) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
+    terminal.draw(|f| draw(f, model)).unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.width)
+        .map(|x| buffer[(x, 0)].symbol())
+        .collect()
 }
 
 #[test]
@@ -106,19 +105,17 @@ fn test_window_topic_group_conference() {
 
     // Console topic
     model.set_active_window(0);
-    assert!(
-        model.active_window_topic().contains(
-            "0000000000000000000000000000000000000000000000000000000000000000000000000000"
-        )
-    );
+    assert!(topic_bar(&mut model).contains(
+        "Tox ID: 0000000000000000000000000000000000000000000000000000000000000000000000000000"
+    ));
 
     // Group topic
     model.set_active_window(1);
-    assert_eq!(model.active_window_topic(), "Group 1");
+    assert!(topic_bar(&mut model).contains("Group 1"));
 
     // Conference topic
     model.set_active_window(2);
-    assert_eq!(model.active_window_topic(), "Conference 2");
+    assert!(topic_bar(&mut model).contains("Conference 2"));
 }
 
 // end of tests

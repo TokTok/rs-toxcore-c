@@ -1,31 +1,6 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-use toxcore::tox::{Address, ToxUserStatus};
-use toxcore::types::PublicKey;
-use toxxi::config::Config;
-use toxxi::model::{DomainState, InputMode, Model};
-use toxxi::msg::Msg;
-use toxxi::update::update;
-
-fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "I am a test".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    Model::new(domain, config.clone(), config)
-}
-
-fn key_event(code: KeyCode) -> KeyEvent {
-    KeyEvent {
-        code,
-        modifiers: KeyModifiers::empty(),
-        kind: KeyEventKind::Press,
-        state: KeyEventState::empty(),
-    }
-}
+use crossterm::event::{KeyCode, KeyModifiers};
+use toxxi::model::{InputMode, Model};
+use toxxi::testing::{create_test_model, send_key};
 
 fn get_input_text(model: &Model) -> String {
     model.ui.input_state.text.clone()
@@ -45,22 +20,13 @@ fn test_ui_multiline_navigation() {
     // 2. Insert two lines of text
     // "Line 1"
     for c in "Line 1".chars() {
-        update(
-            &mut model,
-            Msg::Input(crossterm::event::Event::Key(key_event(KeyCode::Char(c)))),
-        );
+        send_key(&mut model, KeyCode::Char(c), KeyModifiers::NONE);
     }
     // Enter
-    update(
-        &mut model,
-        Msg::Input(crossterm::event::Event::Key(key_event(KeyCode::Enter))),
-    );
+    send_key(&mut model, KeyCode::Enter, KeyModifiers::NONE);
     // "Line 2"
     for c in "Line 2".chars() {
-        update(
-            &mut model,
-            Msg::Input(crossterm::event::Event::Key(key_event(KeyCode::Char(c)))),
-        );
+        send_key(&mut model, KeyCode::Char(c), KeyModifiers::NONE);
     }
 
     // Verify state
@@ -69,10 +35,7 @@ fn test_ui_multiline_navigation() {
     assert_eq!(cursor_before_y, 1, "Should be on the second line");
 
     // 3. Press UP (Should move to previous line)
-    update(
-        &mut model,
-        Msg::Input(crossterm::event::Event::Key(key_event(KeyCode::Up))),
-    );
+    send_key(&mut model, KeyCode::Up, KeyModifiers::NONE);
 
     // 4. Verify cursor moved up
     model.ui.input_state.ensure_layout(80, "> ");
@@ -93,10 +56,7 @@ fn test_ui_multiline_navigation() {
     );
 
     // 5. Press UP again (Should trigger History if at top)
-    update(
-        &mut model,
-        Msg::Input(crossterm::event::Event::Key(key_event(KeyCode::Up))),
-    );
+    send_key(&mut model, KeyCode::Up, KeyModifiers::NONE);
 
     // Verify replaced by "History 2" (last item)
     let text = get_input_text(&model);
@@ -107,10 +67,7 @@ fn test_ui_multiline_navigation() {
     );
 
     // 6. Press DOWN (Should navigate within history item if it has trailing line, or return to saved input)
-    update(
-        &mut model,
-        Msg::Input(crossterm::event::Event::Key(key_event(KeyCode::Down))),
-    );
+    send_key(&mut model, KeyCode::Down, KeyModifiers::NONE);
 
     // Note: get_input_text flattens. "Line 1\nLine 2"
     let restored_text = get_input_text(&model);

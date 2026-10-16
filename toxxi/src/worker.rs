@@ -13,31 +13,59 @@ use toxcore::tox::{
     ToxSavedataType, ToxUserStatus,
 };
 use toxcore::types::{
-    GroupChatId, ConferenceId, FileId, GROUP_CHAT_ID_SIZE, PublicKey, Tox_Err_File_Send_Chunk,
-    Tox_Err_Friend_Send_Message, ToxError, ToxGroupRole, ToxLogLevel,
+    ConferenceId, FileId, GROUP_CHAT_ID_SIZE, GroupChatId, PublicKey, Tox_Err_File_Send_Chunk,
+    Tox_Err_Friend_Custom_Packet, Tox_Err_Friend_Send_Message, ToxError, ToxGroupRole,
+    ToxGroupTopicLock, ToxLogLevel,
 };
 
 use crate::bootstrap;
+use crate::call_bridge::{CallBridge, CallEvent};
 use crate::config;
-use crate::model::{ConferenceReconcileInfo, FriendInfo, GroupReconcileInfo, WindowId};
-use crate::msg::{IOAction, Msg, SystemEvent, ToxAction, ToxEvent};
+use crate::model::{
+    ConferenceReconcileInfo, FriendInfo, GroupReconcileInfo, GroupSettings, WindowId,
+};
+use crate::msg::{
+    GroupSetting, IOAction, LogContext, LogSeverity, Msg, SystemEvent, ToxAction, ToxEvent,
+};
+use crate::sync::event::ChatId;
+use crate::sync::frame::{Outbox, PACKET_ID, Reassembler, SendError};
 use crate::utils::{decode_hex, encode_hex};
 
 fn find_friend(tox: &Tox, pk: &PublicKey) -> Option<FriendNumber> {
     tox.lookup_friend(pk).ok().map(|f| f.get_number())
 }
 
+// Unlike the group list, it finds groups that are still joining.
 fn find_group(tox: &Tox, chat_id: &GroupChatId) -> Option<GroupNumber> {
-    for i in 0..tox.group_count() {
-        let gnum = GroupNumber(i);
-        let group = tox.group(gnum);
-        if let Ok(id) = group.chat_id()
-            && &id == chat_id
-        {
-            return Some(gnum);
-        }
+    tox.group_by_id(chat_id)
+        .ok()
+        .map(|group| group.get_number())
+}
+
+fn group_settings(tox: &Tox, gnum: GroupNumber) -> Option<GroupSettings> {
+    let group = tox.group(gnum);
+    Some(GroupSettings {
+        privacy: group.privacy_state().ok()?,
+        peer_limit: group.peer_limit().ok()?,
+        password: String::from_utf8_lossy(&group.password().ok()?).into_owned(),
+        topic_lock: group.topic_lock().ok()? == ToxGroupTopicLock::TOX_GROUP_TOPIC_LOCK_ENABLED,
+        voice_state: group.voice_state().ok()?,
+        self_pk: group.self_public_key().ok()?,
+    })
+}
+
+fn send_group_settings(tox: &Tox, tx: &mpsc::Sender<Msg>, gnum: GroupNumber) {
+    if let Some(settings) = group_settings(tox, gnum) {
+        let _ = tx.send(Msg::Tox(ToxEvent::GroupSettings(gnum, settings)));
     }
-    None
+}
+
+fn log_error(tx: &mpsc::Sender<Msg>, context: LogContext, message: impl Into<String>) {
+    let _ = tx.send(Msg::System(SystemEvent::Log {
+        severity: LogSeverity::Error,
+        context,
+        message: message.into(),
+    }));
 }
 
 fn find_conference(tox: &Tox, id: &ConferenceId) -> Option<ConferenceNumber> {
@@ -46,7 +74,6 @@ fn find_conference(tox: &Tox, id: &ConferenceId) -> Option<ConferenceNumber> {
 
 pub struct InitialState {
     pub tox_id: Address,
-    pub public_key: PublicKey,
     pub dht_id: DhtId,
     pub name: String,
     pub status_message: String,
@@ -73,7 +100,6 @@ pub fn get_initial_state(savedata_path: &Option<PathBuf>) -> Result<InitialState
 
     let temp_tox = Tox::new(temp_opts)?;
     let tox_id = temp_tox.address();
-    let self_public_key = temp_tox.public_key();
     let self_dht_id = temp_tox.dht_id();
     let self_name = String::from_utf8_lossy(&temp_tox.name()).into_owned();
     let self_status_message = String::from_utf8_lossy(&temp_tox.status_message()).into_owned();
@@ -95,17 +121,14 @@ pub fn get_initial_state(savedata_path: &Option<PathBuf>) -> Result<InitialState
                 public_key: Some(pk),
                 status_message,
                 connection,
-                last_sent_message_id: None,
-                last_read_receipt: None,
                 is_typing: false,
             },
         ));
     }
 
     let mut groups = Vec::new();
-    for i in 0..temp_tox.group_count() {
-        let gnum = GroupNumber(i);
-        let group = temp_tox.group(gnum);
+    for group in temp_tox.group_list() {
+        let gnum = group.get_number();
         let chat_id = group.chat_id()?;
         let gname = group.name().ok().and_then(|n| String::from_utf8(n).ok());
         let grole = group.self_role().ok();
@@ -136,7 +159,6 @@ pub fn get_initial_state(savedata_path: &Option<PathBuf>) -> Result<InitialState
 
     Ok(InitialState {
         tox_id,
-        public_key: self_public_key,
         dht_id: self_dht_id,
         name: self_name,
         status_message: self_status_message,
@@ -180,11 +202,11 @@ pub fn spawn_tox(
             let mut opts = match Options::new() {
                 Ok(o) => o,
                 Err(e) => {
-                    let _ = tx.send(Msg::System(SystemEvent::Log {
-                        severity: crate::msg::LogSeverity::Error,
-                        context: crate::msg::LogContext::Global,
-                        message: format!("Failed to create Options: {:?}", e),
-                    }));
+                    log_error(
+                        &tx,
+                        LogContext::Global,
+                        format!("Failed to create Options: {e:?}"),
+                    );
                     return;
                 }
             };
@@ -207,15 +229,16 @@ pub fn spawn_tox(
             let tox = match Tox::new(opts) {
                 Ok(t) => t,
                 Err(e) => {
-                    let _ = tx.send(Msg::System(SystemEvent::Log {
-                        severity: crate::msg::LogSeverity::Error,
-                        context: crate::msg::LogContext::Global,
-                        message: format!("Failed to create Tox: {:?}", e),
-                    }));
+                    log_error(
+                        &tx,
+                        LogContext::Global,
+                        format!("Failed to create Tox: {e:?}"),
+                    );
                     return;
                 }
             };
 
+            let _ = tx.send(Msg::Tox(ToxEvent::Started));
             let _ = tx.send(Msg::Tox(ToxEvent::Address(tox.address())));
             let _ = tx.send(Msg::Tox(ToxEvent::DhtId(tox.dht_id())));
 
@@ -223,13 +246,12 @@ pub fn spawn_tox(
                 let cnum = conf.number();
                 if let Ok(title_bytes) = conf.title() {
                     let title = String::from_utf8_lossy(&title_bytes).into_owned();
-                    let _ = tx.send(Msg::Tox(ToxEvent::ConferenceTitle(cnum, title)));
+                    let _ = tx.send(Msg::Tox(ToxEvent::ConferenceTitle(cnum, title, None)));
                 }
             }
 
-            for i in 0..tox.group_count() {
-                let gnum = GroupNumber(i);
-                let group = tox.group(gnum);
+            for group in tox.group_list() {
+                let gnum = group.get_number();
                 let name = group.name().ok().and_then(|n| String::from_utf8(n).ok());
                 let _ = tx.send(Msg::Tox(ToxEvent::GroupName(
                     gnum,
@@ -237,7 +259,7 @@ pub fn spawn_tox(
                 )));
                 if let Ok(topic_bytes) = group.topic() {
                     let topic = String::from_utf8_lossy(&topic_bytes).into_owned();
-                    let _ = tx.send(Msg::Tox(ToxEvent::GroupTopic(gnum, topic)));
+                    let _ = tx.send(Msg::Tox(ToxEvent::GroupTopic(gnum, topic, None)));
                 }
                 if let Ok(role) = group.self_role() {
                     let _ = tx.send(Msg::Tox(ToxEvent::GroupSelfRole(gnum, role)));
@@ -264,6 +286,27 @@ pub fn spawn_tox(
             let mut file_id_map: HashMap<FileId, (FriendNumber, FileNumber)> = HashMap::new();
             let mut file_number_map: HashMap<(FriendNumber, FileNumber), FileId> = HashMap::new();
             let mut file_size_map: HashMap<(FriendNumber, FileNumber), u64> = HashMap::new();
+            let mut sync_out = Outbox::default();
+            let mut sync_in: HashMap<FriendNumber, Reassembler> = HashMap::new();
+            let mut calls = match CallBridge::new(&tox) {
+                Ok(calls) => Some(calls),
+                Err(e) => {
+                    log_error(&tx, LogContext::Global, format!("No calls: {e:?}"));
+                    None
+                }
+            };
+            let call_events = |events: Vec<CallEvent>| {
+                for event in events {
+                    let Ok(pk) = tox.friend(event.friend()).public_key() else {
+                        continue;
+                    };
+                    let _ = tx.send(Msg::Tox(match event {
+                        CallEvent::Ringing { video, .. } => ToxEvent::CallRinging(pk, video),
+                        CallEvent::Connected { .. } => ToxEvent::CallConnected(pk),
+                        CallEvent::Ended { .. } => ToxEvent::CallEnded(pk),
+                    }));
+                }
+            };
 
             loop {
                 // Re-bootstrap logic
@@ -274,8 +317,8 @@ pub fn spawn_tox(
                         let logs = bootstrap::bootstrap_network(&tox, &nodes);
                         for log in logs {
                             let _ = tx.send(Msg::System(SystemEvent::Log {
-                                severity: crate::msg::LogSeverity::Info,
-                                context: crate::msg::LogContext::Global,
+                                severity: LogSeverity::Info,
+                                context: LogContext::Global,
                                 message: log,
                             }));
                         }
@@ -325,15 +368,15 @@ pub fn spawn_tox(
                         }
                         Err(e) => {
                             let context = if let Ok(pk) = tox.friend(friend_number).public_key() {
-                                crate::msg::LogContext::Friend(pk)
+                                LogContext::Friend(pk)
                             } else {
-                                crate::msg::LogContext::Global
+                                LogContext::Global
                             };
-                            let _ = tx.send(Msg::System(SystemEvent::Log {
-                                severity: crate::msg::LogSeverity::Error,
+                            log_error(
+                                &tx,
                                 context,
-                                message: format!("Error sending deferred file chunk: {:?}", e),
-                            }));
+                                format!("Error sending deferred file chunk: {e:?}"),
+                            );
                         }
                     }
                 }
@@ -353,7 +396,7 @@ pub fn spawn_tox(
                         ToxAction::SendMessage(pk, message_type, msg, internal_id) => {
                             if let Some(friend_number) = find_friend(&tox, &pk) {
                                 let friend = tox.friend(friend_number);
-                                match friend.send_message(message_type, msg.as_bytes()) {
+                                match friend.send_message(message_type, &msg) {
                                     Ok(id) => {
                                         let _ = tx.send(Msg::Tox(ToxEvent::MessageSent(friend_number, id, internal_id)));
                                     }
@@ -362,25 +405,18 @@ pub fn spawn_tox(
                                         let _ = tx.send(Msg::Tox(ToxEvent::MessageSendFailed(WindowId::Friend(pk), internal_id)));
                                     }
                                     Err(e) => {
-                                        let _ = tx.send(Msg::System(SystemEvent::Log {
-                                            severity: crate::msg::LogSeverity::Error,
-                                            context: crate::msg::LogContext::Friend(pk),
-                                            message: format!("Error sending message: {:?}", e),
-                                        }));
+                                        log_error(&tx, LogContext::Friend(pk), format!("Error sending message: {e:?}"));
                                         let pk = tox.friend(friend_number).public_key().unwrap();
                                         let _ = tx.send(Msg::Tox(ToxEvent::MessageSendFailed(WindowId::Friend(pk), internal_id)));
                                     }
                                 }
                             } else {
                                 // Log error: Friend not found
-                                let _ = tx.send(Msg::System(SystemEvent::Log {
-                                    severity: crate::msg::LogSeverity::Error,
-                                    context: crate::msg::LogContext::Global,
-                                    message: format!(
-                                        "SendMessage: Friend not found for PK {:?}",
-                                        pk
-                                    ),
-                                }));
+                                log_error(
+                                    &tx,
+                                    LogContext::Global,
+                                    format!("SendMessage: Friend not found for PK {pk:?}"),
+                                );
                                 let _ = tx.send(Msg::Tox(ToxEvent::MessageSendFailed(
                                     WindowId::Console,
                                     internal_id,
@@ -390,7 +426,7 @@ pub fn spawn_tox(
                         ToxAction::SendGroupMessage(chat_id, message_type, msg, internal_id) => {
                             if let Some(group_number) = find_group(&tox, &chat_id) {
                                 let group = tox.group(group_number);
-                                match group.send_message(message_type, msg.as_bytes()) {
+                                match group.send_message(message_type, &msg) {
                                     Ok(_) => {
                                         let _ = tx.send(Msg::Tox(ToxEvent::GroupMessageSent(
                                             group_number,
@@ -406,14 +442,13 @@ pub fn spawn_tox(
                                     }
                                 }
                             } else {
-                                let _ = tx.send(Msg::System(SystemEvent::Log {
-                                    severity: crate::msg::LogSeverity::Error,
-                                    context: crate::msg::LogContext::Global,
-                                    message: format!(
-                                        "SendGroupMessage: Group not found for GroupChatId {:?}",
-                                        chat_id
+                                log_error(
+                                    &tx,
+                                    LogContext::Global,
+                                    format!(
+                                        "SendGroupMessage: Group not found for GroupChatId {chat_id:?}"
                                     ),
-                                }));
+                                );
                                 let _ = tx.send(Msg::Tox(ToxEvent::MessageSendFailed(
                                     WindowId::Console,
                                     internal_id,
@@ -428,7 +463,7 @@ pub fn spawn_tox(
                         ) => {
                             if let Some(conference_number) = find_conference(&tox, &conference_id) {
                                 let conference = tox.conference(conference_number);
-                                match conference.send_message(message_type, msg.as_bytes()) {
+                                match conference.send_message(message_type, &msg) {
                                     Ok(_) => {
                                         let _ = tx.send(Msg::Tox(ToxEvent::ConferenceMessageSent(
                                             conference_number,
@@ -445,14 +480,13 @@ pub fn spawn_tox(
                                     }
                                 }
                             } else {
-                                let _ = tx.send(Msg::System(SystemEvent::Log {
-                                    severity: crate::msg::LogSeverity::Error,
-                                    context: crate::msg::LogContext::Global,
-                                    message: format!(
-                                        "SendConferenceMessage: Conference not found for ID {:?}",
-                                        conference_id
+                                log_error(
+                                    &tx,
+                                    LogContext::Global,
+                                    format!(
+                                        "SendConferenceMessage: Conference not found for ID {conference_id:?}"
                                     ),
-                                }));
+                                );
                                 let _ = tx.send(Msg::Tox(ToxEvent::MessageSendFailed(
                                     WindowId::Console,
                                     internal_id,
@@ -476,11 +510,11 @@ pub fn spawn_tox(
                                         )));
                                     }
                                     Err(e) => {
-                                        let _ = tx.send(Msg::System(SystemEvent::Log {
-                                            severity: crate::msg::LogSeverity::Error,
-                                            context: crate::msg::LogContext::Global,
-                                            message: format!("Error adding friend: {:?}", e),
-                                        }));
+                                        log_error(
+                                            &tx,
+                                            LogContext::Global,
+                                            format!("Error adding friend: {e:?}"),
+                                        );
                                     }
                                 }
                             }
@@ -499,12 +533,12 @@ pub fn spawn_tox(
                                 let _ = tox.friend(friend_number).delete();
                             }
                         }
-                        ToxAction::CreateGroup(name) => {
-                            if let Ok(group) = tox.group_new(
-                                ToxGroupPrivacyState::TOX_GROUP_PRIVACY_STATE_PUBLIC,
-                                name.as_bytes(),
-                                &tox.name(),
-                            ) {
+                        ToxAction::CreateGroup(name) => match tox.group_new(
+                            ToxGroupPrivacyState::TOX_GROUP_PRIVACY_STATE_PUBLIC,
+                            name.as_bytes(),
+                            &tox.name(),
+                        ) {
+                            Ok(group) => {
                                 if let Ok(chat_id) = group.chat_id() {
                                     let _ = tx.send(Msg::Tox(ToxEvent::GroupCreated(
                                         group.get_number(),
@@ -512,24 +546,21 @@ pub fn spawn_tox(
                                         Some(name),
                                     )));
                                 } else {
-                                    let _ = tx.send(Msg::System(SystemEvent::Log {
-                                        severity: crate::msg::LogSeverity::Error,
-                                        context: crate::msg::LogContext::Global,
-                                        message: "Failed to get chat_id for created group".into(),
-                                    }));
+                                    log_error(
+                                        &tx,
+                                        LogContext::Global,
+                                        "Failed to get chat_id for created group",
+                                    );
                                 }
-                            } else if let Err(e) = tox.group_new(
-                                ToxGroupPrivacyState::TOX_GROUP_PRIVACY_STATE_PUBLIC,
-                                name.as_bytes(),
-                                &tox.name(),
-                            ) {
-                                let _ = tx.send(Msg::System(SystemEvent::Log {
-                                    severity: crate::msg::LogSeverity::Error,
-                                    context: crate::msg::LogContext::Global,
-                                    message: format!("Failed to create group: {:?}", e),
-                                }));
                             }
-                        }
+                            Err(e) => {
+                                log_error(
+                                    &tx,
+                                    LogContext::Global,
+                                    format!("Failed to create group: {e:?}"),
+                                );
+                            }
+                        },
                         ToxAction::CreateConference => {
                             if let Ok(conf) = tox.conference_new() {
                                 if let Some(cid) = conf.id() {
@@ -538,13 +569,11 @@ pub fn spawn_tox(
                                         cid,
                                     )));
                                 } else {
-                                    let _ = tx.send(Msg::System(SystemEvent::Log {
-                                        severity: crate::msg::LogSeverity::Error,
-                                        context: crate::msg::LogContext::Global,
-                                        message:
-                                            "Failed to get conference ID for created conference"
-                                                .into(),
-                                    }));
+                                    log_error(
+                                        &tx,
+                                        LogContext::Global,
+                                        "Failed to get conference ID for created conference",
+                                    );
                                 }
                             }
                         }
@@ -565,15 +594,19 @@ pub fn spawn_tox(
                                 let mut chat_id_bytes = [0u8; GROUP_CHAT_ID_SIZE];
                                 chat_id_bytes.copy_from_slice(&bytes);
                                 let chat_id = GroupChatId(chat_id_bytes);
-                                match tox.group_join(
-                                    &chat_id,
-                                    &tox.name(),
-                                    if pass.is_empty() {
-                                        None
-                                    } else {
-                                        Some(pass.as_bytes())
-                                    },
-                                ) {
+                                match tox
+                                    .group_join(
+                                        &chat_id,
+                                        &tox.name(),
+                                        if pass.is_empty() {
+                                            None
+                                        } else {
+                                            Some(pass.as_bytes())
+                                        },
+                                    )
+                                    // Rejoining a group it has, Tox gives 0, not its number.
+                                    .and_then(|_| tox.group_by_id(&chat_id))
+                                {
                                     Ok(group) => {
                                         let name = group
                                             .name()
@@ -588,16 +621,17 @@ pub fn spawn_tox(
                                         }
                                     }
                                     Err(e) => {
-                                        let _ = tx.send(Msg::System(SystemEvent::Log {
-                                            severity: crate::msg::LogSeverity::Error,
-                                            context: crate::msg::LogContext::Global,
-                                            message: format!("Failed to join group: {:?}", e),
-                                        }));
+                                        log_error(
+                                            &tx,
+                                            LogContext::Global,
+                                            format!("Failed to join group: {e:?}"),
+                                        );
                                     }
                                 }
                             }
                         }
-                        ToxAction::AcceptGroupInvite(pk, invite_hex, _name, pass) => {
+                        ToxAction::AcceptGroupInvite(pk, invite_hex, _name, pass, invite) => {
+                            let mut joined = None;
                             if let Some(friend_number) = find_friend(&tox, &pk)
                                 && let Some(invite_data) = decode_hex(&invite_hex)
                             {
@@ -617,6 +651,7 @@ pub fn spawn_tox(
                                             .ok()
                                             .and_then(|n| String::from_utf8(n).ok());
                                         if let Ok(chat_id) = group.chat_id() {
+                                            joined = Some(ChatId::Group(chat_id));
                                             let _ = tx.send(Msg::Tox(ToxEvent::GroupCreated(
                                                 group.get_number(),
                                                 chat_id,
@@ -625,25 +660,27 @@ pub fn spawn_tox(
                                         }
                                     }
                                     Err(e) => {
-                                        let _ = tx.send(Msg::System(SystemEvent::Log {
-                                            severity: crate::msg::LogSeverity::Error,
-                                            context: crate::msg::LogContext::Global,
-                                            message: format!(
-                                                "Failed to accept group invite: {:?}",
-                                                e
-                                            ),
-                                        }));
+                                        log_error(
+                                            &tx,
+                                            LogContext::Global,
+                                            format!("Failed to accept group invite: {e:?}"),
+                                        );
                                     }
                                 }
                             }
+                            if let Some(invite) = invite {
+                                let _ = tx.send(Msg::Tox(ToxEvent::InviteJoined(invite, joined)));
+                            }
                         }
-                        ToxAction::JoinConference(pk, cookie_hex) => {
+                        ToxAction::JoinConference(pk, cookie_hex, invite) => {
+                            let mut joined = None;
                             if let Some(friend_number) = find_friend(&tox, &pk)
                                 && let Some(cookie) = decode_hex(&cookie_hex)
                             {
                                 match tox.conference_join(&tox.friend(friend_number), &cookie) {
                                     Ok(conf) => {
                                         if let Some(cid) = conf.id() {
+                                            joined = Some(ChatId::Conference(cid));
                                             let _ = tx.send(Msg::Tox(ToxEvent::ConferenceCreated(
                                                 conf.number(),
                                                 cid,
@@ -651,13 +688,16 @@ pub fn spawn_tox(
                                         }
                                     }
                                     Err(e) => {
-                                        let _ = tx.send(Msg::System(SystemEvent::Log {
-                                            severity: crate::msg::LogSeverity::Error,
-                                            context: crate::msg::LogContext::Global,
-                                            message: format!("Failed to join conference: {:?}", e),
-                                        }));
+                                        log_error(
+                                            &tx,
+                                            LogContext::Global,
+                                            format!("Failed to join conference: {e:?}"),
+                                        );
                                     }
                                 }
+                            }
+                            if let Some(invite) = invite {
+                                let _ = tx.send(Msg::Tox(ToxEvent::InviteJoined(invite, joined)));
                             }
                         }
                         ToxAction::InviteFriendToGroup(chat_id, pk) => {
@@ -686,6 +726,82 @@ pub fn spawn_tox(
                                 let _ = tox.group(group_number).set_ignore(*peer_id, ignore);
                             }
                         }
+                        ToxAction::SetGroupSetting(chat_id, setting) => {
+                            if let Some(gnum) = find_group(&tox, &chat_id) {
+                                let group = tox.group(gnum);
+                                let result = match setting {
+                                    GroupSetting::Privacy(privacy) => group
+                                        .set_privacy_state(privacy)
+                                        .map_err(|e| format!("{e:?}")),
+                                    GroupSetting::PeerLimit(limit) => {
+                                        group.set_peer_limit(limit).map_err(|e| format!("{e:?}"))
+                                    }
+                                    GroupSetting::Password(password) => group
+                                        .set_password(Some(password.as_bytes()))
+                                        .map_err(|e| format!("{e:?}")),
+                                    GroupSetting::TopicLock(lock) => group
+                                        .set_topic_lock(if lock {
+                                            ToxGroupTopicLock::TOX_GROUP_TOPIC_LOCK_ENABLED
+                                        } else {
+                                            ToxGroupTopicLock::TOX_GROUP_TOPIC_LOCK_DISABLED
+                                        })
+                                        .map_err(|e| format!("{e:?}")),
+                                    GroupSetting::VoiceState(voice_state) => group
+                                        .set_voice_state(voice_state)
+                                        .map_err(|e| format!("{e:?}")),
+                                };
+                                match result {
+                                    Ok(()) => send_group_settings(&tox, &tx, gnum),
+                                    Err(e) => {
+                                        log_error(
+                                            &tx,
+                                            LogContext::Group(chat_id),
+                                            format!("Error changing group settings: {e}"),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        ToxAction::ModerateGroupPeer(chat_id, pk, role) => {
+                            if let Some(gnum) = find_group(&tox, &chat_id)
+                                && let Some(peer_id) = group_peers
+                                    .get(&gnum)
+                                    .and_then(|peers| peers.get(&pk))
+                                    .copied()
+                            {
+                                let group = tox.group(gnum);
+                                let result = match role {
+                                    Some(role) => group.set_role(peer_id, role),
+                                    None => group.kick_peer(peer_id),
+                                };
+                                match (result, role) {
+                                    (Ok(()), Some(role)) => {
+                                        let name = group
+                                            .peer_name(peer_id)
+                                            .map(|n| String::from_utf8_lossy(&n).into_owned())
+                                            .unwrap_or_default();
+                                        let _ = tx.send(Msg::Tox(ToxEvent::GroupPeerName(
+                                            gnum, peer_id, name, role, pk,
+                                        )));
+                                    }
+                                    (Ok(()), None) => {
+                                        if let Some(peers) = group_peers.get_mut(&gnum) {
+                                            peers.remove(&pk);
+                                        }
+                                        let _ = tx.send(Msg::Tox(ToxEvent::GroupPeerLeave(
+                                            gnum, peer_id,
+                                        )));
+                                    }
+                                    (Err(e), _) => {
+                                        log_error(
+                                            &tx,
+                                            LogContext::Group(chat_id),
+                                            format!("Error moderating a peer: {e:?}"),
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         ToxAction::SetStatusMessage(msg) => {
                             let _ = tox.set_status_message(msg.as_bytes());
                         }
@@ -699,15 +815,15 @@ pub fn spawn_tox(
                         }
                         ToxAction::SetName(name) => {
                             if let Err(e) = tox.set_name(name.as_bytes()) {
-                                let _ = tx.send(Msg::System(SystemEvent::Log {
-                                    severity: crate::msg::LogSeverity::Error,
-                                    context: crate::msg::LogContext::Global,
-                                    message: format!("Error setting name: {:?}", e),
-                                }));
+                                log_error(
+                                    &tx,
+                                    LogContext::Global,
+                                    format!("Error setting name: {e:?}"),
+                                );
                             } else {
                                 let _ = tx.send(Msg::System(SystemEvent::Log {
-                                    severity: crate::msg::LogSeverity::Info,
-                                    context: crate::msg::LogContext::Global,
+                                    severity: LogSeverity::Info,
+                                    context: LogContext::Global,
                                     message: format!("Name successfully set to: {}", name),
                                 }));
                             }
@@ -716,11 +832,11 @@ pub fn spawn_tox(
                             if let Some(group_number) = find_group(&tox, &chat_id) {
                                 let group = tox.group(group_number);
                                 if let Err(e) = group.self_set_name(name_str.as_bytes()) {
-                                    let _ = tx.send(Msg::System(SystemEvent::Log {
-                                        severity: crate::msg::LogSeverity::Error,
-                                        context: crate::msg::LogContext::Group(chat_id),
-                                        message: format!("Error setting group nickname: {:?}", e),
-                                    }));
+                                    log_error(
+                                        &tx,
+                                        LogContext::Group(chat_id),
+                                        format!("Error setting group nickname: {e:?}"),
+                                    );
                                 } else {
                                     let pk = tox.public_key();
                                     let role = group
@@ -737,38 +853,43 @@ pub fn spawn_tox(
                                     )));
                                 }
                             } else {
-                                let _ = tx.send(Msg::System(SystemEvent::Log {
-                                    severity: crate::msg::LogSeverity::Error,
-                                    context: crate::msg::LogContext::Group(chat_id),
-                                    message: format!(
-                                        "SetGroupNickname: Group not found for GroupChatId {:?}",
-                                        chat_id
+                                log_error(
+                                    &tx,
+                                    LogContext::Group(chat_id),
+                                    format!(
+                                        "SetGroupNickname: Group not found for GroupChatId {chat_id:?}"
                                     ),
-                                }));
+                                );
                             }
                         }
                         ToxAction::SetGroupTopic(chat_id, topic) => {
                             if let Some(group_number) = find_group(&tox, &chat_id) {
-                                if let Err(e) = tox.group(group_number).set_topic(topic.as_bytes())
-                                {
-                                    let _ = tx.send(Msg::System(SystemEvent::Log {
-                                        severity: crate::msg::LogSeverity::Error,
-                                        context: crate::msg::LogContext::Group(chat_id),
-                                        message: format!("Error setting group topic: {:?}", e),
-                                    }));
+                                let group = tox.group(group_number);
+                                if let Err(e) = group.set_topic(topic.as_bytes()) {
+                                    log_error(
+                                        &tx,
+                                        LogContext::Group(chat_id),
+                                        format!("Error setting group topic: {e:?}"),
+                                    );
                                 } else {
-                                    let _ = tx
-                                        .send(Msg::Tox(ToxEvent::GroupTopic(group_number, topic)));
+                                    let setter = group
+                                        .self_name()
+                                        .ok()
+                                        .map(|n| String::from_utf8_lossy(&n).into_owned());
+                                    let _ = tx.send(Msg::Tox(ToxEvent::GroupTopic(
+                                        group_number,
+                                        topic,
+                                        setter,
+                                    )));
                                 }
                             } else {
-                                let _ = tx.send(Msg::System(SystemEvent::Log {
-                                    severity: crate::msg::LogSeverity::Error,
-                                    context: crate::msg::LogContext::Global,
-                                    message: format!(
-                                        "SetGroupTopic: Group not found for GroupChatId {:?}",
-                                        chat_id
+                                log_error(
+                                    &tx,
+                                    LogContext::Global,
+                                    format!(
+                                        "SetGroupTopic: Group not found for GroupChatId {chat_id:?}"
                                     ),
-                                }));
+                                );
                             }
                         }
                         ToxAction::SetConferenceTopic(conference_id, topic) => {
@@ -777,21 +898,28 @@ pub fn spawn_tox(
                                     .conference(conference_number)
                                     .set_title(topic.as_bytes())
                                 {
-                                    let _ = tx.send(Msg::System(SystemEvent::Log {
-                                        severity: crate::msg::LogSeverity::Error,
-                                        context: crate::msg::LogContext::Global,
-                                        message: format!("Error setting conference title: {:?}", e),
-                                    }));
+                                    log_error(
+                                        &tx,
+                                        LogContext::Global,
+                                        format!("Error setting conference title: {e:?}"),
+                                    );
+                                } else {
+                                    // Tox tells of others' titles, not our own.
+                                    let setter = String::from_utf8_lossy(&tox.name()).into_owned();
+                                    let _ = tx.send(Msg::Tox(ToxEvent::ConferenceTitle(
+                                        conference_number,
+                                        topic,
+                                        Some(setter),
+                                    )));
                                 }
                             } else {
-                                let _ = tx.send(Msg::System(SystemEvent::Log {
-                                    severity: crate::msg::LogSeverity::Error,
-                                    context: crate::msg::LogContext::Global,
-                                    message: format!(
-                                        "SetConferenceTopic: Conference not found for ID {:?}",
-                                        conference_id
+                                log_error(
+                                    &tx,
+                                    LogContext::Global,
+                                    format!(
+                                        "SetConferenceTopic: Conference not found for ID {conference_id:?}"
                                     ),
-                                }));
+                                );
                             }
                         }
                         ToxAction::Bootstrap(host, port, dht_id) => {
@@ -828,20 +956,19 @@ pub fn spawn_tox(
                                                     pk, file_id, path, file_size,
                                                 )));
                                         } else {
-                                            let _ = tx.send(Msg::System(SystemEvent::Log {
-                                                severity: crate::msg::LogSeverity::Error,
-                                                context: crate::msg::LogContext::Friend(pk),
-                                                message: "Failed to get FileId for sent file"
-                                                    .into(),
-                                            }));
+                                            log_error(
+                                                &tx,
+                                                LogContext::Friend(pk),
+                                                "Failed to get FileId for sent file",
+                                            );
                                         }
                                     }
                                     Err(e) => {
-                                        let _ = tx.send(Msg::System(SystemEvent::Log {
-                                            severity: crate::msg::LogSeverity::Error,
-                                            context: crate::msg::LogContext::Friend(pk),
-                                            message: format!("Error sending file: {:?}", e),
-                                        }));
+                                        log_error(
+                                            &tx,
+                                            LogContext::Friend(pk),
+                                            format!("Error sending file: {e:?}"),
+                                        );
                                     }
                                 }
                             }
@@ -854,14 +981,11 @@ pub fn spawn_tox(
                                     .file(&tox.friend(friend_number), file_number)
                                     .control(control)
                                 {
-                                    let _ = tx.send(Msg::System(SystemEvent::Log {
-                                        severity: crate::msg::LogSeverity::Error,
-                                        context: crate::msg::LogContext::Global,
-                                        message: format!(
-                                            "Error controlling file (ID: {}): {:?}",
-                                            file_id, e
-                                        ),
-                                    }));
+                                    log_error(
+                                        &tx,
+                                        LogContext::Global,
+                                        format!("Error controlling file (ID: {file_id}): {e:?}"),
+                                    );
                                 }
 
                                 if control
@@ -909,11 +1033,11 @@ pub fn spawn_tox(
                                         ));
                                     }
                                     Err(e) => {
-                                        let _ = tx.send(Msg::System(SystemEvent::Log {
-                                            severity: crate::msg::LogSeverity::Error,
-                                            context: crate::msg::LogContext::Friend(pk),
-                                            message: format!("Error sending file chunk: {:?}", e),
-                                        }));
+                                        log_error(
+                                            &tx,
+                                            LogContext::Friend(pk),
+                                            format!("Error sending file chunk: {e:?}"),
+                                        );
                                     }
                                 }
 
@@ -934,6 +1058,36 @@ pub fn spawn_tox(
                                     .seek(position);
                             }
                         }
+                        ToxAction::SyncSend(pk, message) => {
+                            if let Some(friend) = find_friend(&tox, &pk) {
+                                sync_out.push(friend, &message);
+                            }
+                        }
+                        ToxAction::CallConnect {
+                            friend,
+                            device,
+                            video,
+                        } => {
+                            match (
+                                &mut calls,
+                                find_friend(&tox, &friend),
+                                find_friend(&tox, &device),
+                            ) {
+                                (Some(calls), Some(friend), Some(device)) => {
+                                    call_events(calls.connect(friend, device, video));
+                                }
+                                _ => {
+                                    let _ = tx.send(Msg::Tox(ToxEvent::CallEnded(friend)));
+                                }
+                            }
+                        }
+                        ToxAction::CallHangUp(pk) => {
+                            if let (Some(calls), Some(friend)) =
+                                (&mut calls, find_friend(&tox, &pk))
+                            {
+                                calls.hang_up(friend);
+                            }
+                        }
                         ToxAction::Shutdown => {
                             if let Some(path) = &savedata_path {
                                 let data = tox.savedata();
@@ -951,6 +1105,16 @@ pub fn spawn_tox(
                     break;
                 }
 
+                sync_out.flush(|friend, packet| {
+                    match tox.friend(friend).send_lossless_packet(packet) {
+                        Ok(()) => Ok(()),
+                        Err(ToxError::FriendCustomPacket(
+                            Tox_Err_Friend_Custom_Packet::TOX_ERR_FRIEND_CUSTOM_PACKET_SENDQ,
+                        )) => Err(SendError::Full),
+                        Err(_) => Err(SendError::Gone),
+                    }
+                });
+
                 // Process Tox Events
                 if let Ok(events) = tox.events() {
                     for event in &events {
@@ -961,11 +1125,10 @@ pub fn spawn_tox(
                                 let _ = tx.send(Msg::Tox(ToxEvent::ConnectionStatus(status)));
                             }
                             Event::FriendMessage(e) => {
-                                let msg = String::from_utf8_lossy(e.message()).into_owned();
                                 let _ = tx.send(Msg::Tox(ToxEvent::Message(
                                     e.friend_number(),
                                     e.message_type(),
-                                    msg,
+                                    e.message().to_vec(),
                                 )));
                             }
                             Event::FriendRequest(e) => {
@@ -974,6 +1137,10 @@ pub fn spawn_tox(
                                     tx.send(Msg::Tox(ToxEvent::FriendRequest(e.public_key(), msg)));
                             }
                             Event::FriendConnectionStatus(e) => {
+                                if e.connection_status() == ToxConnection::TOX_CONNECTION_NONE {
+                                    sync_in.remove(&e.friend_number());
+                                    sync_out.remove(e.friend_number());
+                                }
                                 let pk = tox.friend(e.friend_number()).public_key().ok();
                                 let _ = tx.send(Msg::Tox(ToxEvent::FriendStatus(
                                     e.friend_number(),
@@ -993,11 +1160,54 @@ pub fn spawn_tox(
                                     msg,
                                 )));
                             }
+                            Event::FriendStatus(e) => {
+                                let _ = tx.send(Msg::Tox(ToxEvent::FriendUserStatus(
+                                    e.friend_number(),
+                                    e.status(),
+                                )));
+                            }
+                            Event::GroupPrivacyState(e) => {
+                                send_group_settings(&tox, &tx, e.group_number());
+                            }
+                            Event::GroupVoiceState(e) => {
+                                send_group_settings(&tox, &tx, e.group_number());
+                            }
+                            Event::GroupTopicLock(e) => {
+                                send_group_settings(&tox, &tx, e.group_number());
+                            }
+                            Event::GroupPeerLimit(e) => {
+                                send_group_settings(&tox, &tx, e.group_number());
+                            }
+                            Event::GroupPassword(e) => {
+                                send_group_settings(&tox, &tx, e.group_number());
+                            }
                             Event::FriendTyping(e) => {
                                 let _ = tx.send(Msg::Tox(ToxEvent::FriendTyping(
                                     e.friend_number(),
                                     e.typing(),
                                 )));
+                            }
+                            Event::FriendLosslessPacket(e)
+                                if e.data().first() == Some(&PACKET_ID) =>
+                            {
+                                let friend = e.friend_number();
+                                match sync_in.entry(friend).or_default().push(e.data()) {
+                                    Ok(Some(message)) => {
+                                        let _ = tx
+                                            .send(Msg::Tox(ToxEvent::SyncMessage(friend, message)));
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) => {
+                                        let _ = tx.send(Msg::System(SystemEvent::Log {
+                                            severity: LogSeverity::Warning,
+                                            context: LogContext::Global,
+                                            message: format!(
+                                                "Dropped sync message from friend {}: {:?}",
+                                                friend.0, err
+                                            ),
+                                        }));
+                                    }
+                                }
                             }
                             Event::FriendReadReceipt(e) => {
                                 let _ = tx.send(Msg::Tox(ToxEvent::ReadReceipt(
@@ -1012,12 +1222,11 @@ pub fn spawn_tox(
                                     .map(|n| String::from_utf8_lossy(&n).into_owned())
                                     .unwrap_or_else(|_| format!("Peer {}", e.peer_id().0));
                                 let pk = group.peer_public_key(e.peer_id()).ok();
-                                let content = String::from_utf8_lossy(e.message()).into_owned();
                                 let _ = tx.send(Msg::Tox(ToxEvent::GroupMessage(
                                     e.group_number(),
                                     e.message_type(),
                                     name,
-                                    content,
+                                    e.message().to_vec(),
                                     pk,
                                 )));
                             }
@@ -1029,12 +1238,11 @@ pub fn spawn_tox(
                                         .map(|n| String::from_utf8_lossy(&n).into_owned())
                                         .unwrap_or_else(|_| format!("Peer {}", e.peer_number().0));
                                     let pk = conf.peer_public_key(e.peer_number()).ok();
-                                    let content = String::from_utf8_lossy(e.message()).into_owned();
                                     let _ = tx.send(Msg::Tox(ToxEvent::ConferenceMessage(
                                         e.conference_number(),
                                         e.message_type(),
                                         name,
-                                        content,
+                                        e.message().to_vec(),
                                         pk,
                                     )));
                                 }
@@ -1067,12 +1275,24 @@ pub fn spawn_tox(
                                     let _ = tx.send(Msg::Tox(ToxEvent::GroupSelfRole(gnum, role)));
                                 }
                                 let topic = String::from_utf8_lossy(e.topic()).into_owned();
-                                let _ = tx.send(Msg::Tox(ToxEvent::GroupTopic(gnum, topic)));
+                                let setter = group
+                                    .peer_name(e.peer_id())
+                                    .ok()
+                                    .map(|n| String::from_utf8_lossy(&n).into_owned());
+                                let _ =
+                                    tx.send(Msg::Tox(ToxEvent::GroupTopic(gnum, topic, setter)));
+                            }
+                            Event::GroupJoinFail(e) => {
+                                let _ = tx.send(Msg::Tox(ToxEvent::GroupJoinFail(
+                                    e.group_number(),
+                                    e.fail_type(),
+                                )));
                             }
                             Event::GroupSelfJoin(e) => {
                                 let gnum = e.group_number();
                                 let group = tox.group(gnum);
                                 let _ = tx.send(Msg::Tox(ToxEvent::GroupSelfJoin(gnum)));
+                                send_group_settings(&tox, &tx, gnum);
                                 if let Ok(name_bytes) = group.name() {
                                     let name = String::from_utf8_lossy(&name_bytes).into_owned();
                                     let _ = tx.send(Msg::Tox(ToxEvent::GroupName(gnum, name)));
@@ -1082,14 +1302,21 @@ pub fn spawn_tox(
                                 }
                                 if let Ok(topic_bytes) = group.topic() {
                                     let topic = String::from_utf8_lossy(&topic_bytes).into_owned();
-                                    let _ = tx.send(Msg::Tox(ToxEvent::GroupTopic(gnum, topic)));
+                                    let _ =
+                                        tx.send(Msg::Tox(ToxEvent::GroupTopic(gnum, topic, None)));
                                 }
                             }
                             Event::ConferenceTitle(e) => {
                                 let title = String::from_utf8_lossy(e.title()).into_owned();
+                                let setter = tox
+                                    .conference(e.conference_number())
+                                    .peer_name(e.peer_number())
+                                    .ok()
+                                    .map(|n| String::from_utf8_lossy(&n).into_owned());
                                 let _ = tx.send(Msg::Tox(ToxEvent::ConferenceTitle(
                                     e.conference_number(),
                                     title,
+                                    setter,
                                 )));
                             }
                             Event::GroupPeerJoin(e) => {
@@ -1194,6 +1421,7 @@ pub fn spawn_tox(
                                     let _ = tx.send(Msg::Tox(ToxEvent::ConferenceTitle(
                                         e.conference_number(),
                                         title,
+                                        None,
                                     )));
                                 }
                                 if let Ok(peers) = conf.peer_list() {
@@ -1334,14 +1562,6 @@ pub fn spawn_tox(
                                         e.position(),
                                         e.data().to_vec(),
                                     ));
-                                    // Notify UI for testing
-                                    let _ = tx.send(Msg::Tox(ToxEvent::FileRecvChunk(
-                                        e.friend_number(),
-                                        file_id,
-                                        e.position(),
-                                        e.data().to_vec(),
-                                    )));
-
                                     // Check for completion
                                     if let Some(size) =
                                         file_size_map.get(&(e.friend_number(), e.file_number()))
@@ -1353,15 +1573,15 @@ pub fn spawn_tox(
                                         file_size_map.remove(&(e.friend_number(), e.file_number()));
                                     }
                                 } else {
-                                    let _ = tx.send(Msg::System(SystemEvent::Log {
-                                        severity: crate::msg::LogSeverity::Error,
-                                        context: crate::msg::LogContext::Global,
-                                        message: format!(
+                                    log_error(
+                                        &tx,
+                                        LogContext::Global,
+                                        format!(
                                             "Failed to get FileId for RecvChunk friend={} file={}",
                                             e.friend_number().0,
                                             e.file_number().0
                                         ),
-                                    }));
+                                    );
                                 }
                             }
                             Event::FileRecvControl(e) => {
@@ -1394,8 +1614,12 @@ pub fn spawn_tox(
                     }
                 }
 
-                let interval = tox.iteration_interval();
-                thread::sleep(Duration::from_millis(interval.max(1) as u64));
+                let mut interval = Duration::from_millis(tox.iteration_interval().max(1).into());
+                if let Some(calls) = &mut calls {
+                    call_events(calls.iterate());
+                    interval = interval.min(calls.iteration_interval());
+                }
+                thread::sleep(interval);
             }
             if exit_thread {
                 break;

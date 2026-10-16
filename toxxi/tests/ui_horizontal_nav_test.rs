@@ -1,33 +1,7 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
-use toxcore::tox::{Address, ToxUserStatus};
-use toxcore::types::PublicKey;
-use toxxi::config::Config;
-use toxxi::model::{DomainState, Model};
-use toxxi::msg::Msg;
+use toxxi::testing::{create_test_model, send_key};
 use toxxi::ui::draw;
-use toxxi::update::update;
-
-fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "I am a test".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    Model::new(domain, config.clone(), config)
-}
-
-fn key_event(code: KeyCode) -> KeyEvent {
-    KeyEvent {
-        code,
-        modifiers: KeyModifiers::empty(),
-        kind: KeyEventKind::Press,
-        state: KeyEventState::empty(),
-    }
-}
 
 #[test]
 fn test_ui_horizontal_navigation_rendering() {
@@ -39,33 +13,18 @@ fn test_ui_horizontal_navigation_rendering() {
 
     // 1. Insert text "ABC"
     for c in "ABC".chars() {
-        update(
-            &mut model,
-            Msg::Input(crossterm::event::Event::Key(key_event(KeyCode::Char(c)))),
-        );
+        send_key(&mut model, KeyCode::Char(c), KeyModifiers::NONE);
     }
 
     // 2. Move Cursor Left 2 times (to 'B')
-    update(
-        &mut model,
-        Msg::Input(crossterm::event::Event::Key(key_event(KeyCode::Left))),
-    );
-    update(
-        &mut model,
-        Msg::Input(crossterm::event::Event::Key(key_event(KeyCode::Left))),
-    );
+    send_key(&mut model, KeyCode::Left, KeyModifiers::NONE);
+    send_key(&mut model, KeyCode::Left, KeyModifiers::NONE);
 
     // 3. Move Right 1 time (to 'C')
-    update(
-        &mut model,
-        Msg::Input(crossterm::event::Event::Key(key_event(KeyCode::Right))),
-    );
+    send_key(&mut model, KeyCode::Right, KeyModifiers::NONE);
 
     // 4. Press Right Arrow again (should stay at end, not scroll)
-    update(
-        &mut model,
-        Msg::Input(crossterm::event::Event::Key(key_event(KeyCode::Right))),
-    );
+    send_key(&mut model, KeyCode::Right, KeyModifiers::NONE);
 
     model.ui.input_state.ensure_layout(80, "> ");
     let (cursor_x, cursor_y) = model.ui.input_state.cursor();

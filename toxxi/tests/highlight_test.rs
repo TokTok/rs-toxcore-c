@@ -1,18 +1,11 @@
-use toxcore::tox::ToxUserStatus;
-use toxcore::types::{Address, GroupChatId, PublicKey};
-use toxxi::config::Config;
-use toxxi::model::{DomainState, Model, WindowId};
+use toxcore::types::GroupChatId;
+use toxxi::model::{Model, WindowId};
+use toxxi::testing;
 
 fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "iphy".to_string(),
-        "I am iphy".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    Model::new(domain, config.clone(), config)
+    let mut model = testing::create_test_model();
+    model.domain.self_name = "iphy".to_string();
+    model
 }
 
 #[test]

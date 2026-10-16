@@ -1,3 +1,4 @@
+use crate::completion::complete_friend_ids;
 use crate::model::{LogFilters, MessageContent, TransferStatus, WindowId};
 use crate::msg::{Cmd, IOAction, ToxAction};
 use std::fs::metadata;
@@ -308,25 +309,7 @@ pub const COMMANDS: &[CommandDef] = &[
             }
             if args.len() == 2 {
                 let prefix = args[1];
-                let mut ids: Vec<_> = model
-                    .session
-                    .friend_numbers
-                    .iter()
-                    .map(|(fn_num, pk)| {
-                        let name = model
-                            .domain
-                            .friends
-                            .get(pk)
-                            .map(|i| i.name.clone())
-                            .unwrap_or_else(|| format!("Friend {}", fn_num.0));
-                        (fn_num.0.to_string(), name)
-                    })
-                    .collect();
-                ids.sort_by(|a, b| a.0.cmp(&b.0));
-                return ids
-                    .into_iter()
-                    .filter(|(id, _)| id.starts_with(prefix))
-                    .collect();
+                return complete_friend_ids(model, prefix);
             }
             if args.len() == 3 {
                 if args[0] == "send" {

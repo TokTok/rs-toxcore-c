@@ -1,21 +1,9 @@
 use ratatui::{Terminal, backend::TestBackend};
-use toxcore::tox::{Address, GroupNumber, ToxUserStatus};
+use toxcore::tox::{GroupNumber, ToxUserStatus};
 use toxcore::types::{MessageType, PublicKey};
-use toxxi::config::Config;
-use toxxi::model::{DomainState, Model, PeerId};
+use toxxi::model::PeerId;
+use toxxi::testing::create_test_model;
 use toxxi::ui::draw;
-
-fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "I am a test".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    Model::new(domain, config.clone(), config)
-}
 
 #[test]
 fn test_peer_list_shows_when_empty() {

@@ -1,10 +1,9 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use toxcore::tox::{FriendNumber, ToxConnection};
+use toxcore::tox::FriendNumber;
 use toxcore::types::{FileId, MessageType, PublicKey, ToxFileControl};
-use toxxi::model::{
-    FileTransferProgress, FriendInfo, MessageStatus, TransferStatus, UiMode, WindowId,
-};
+use toxxi::model::{FileTransferProgress, MessageStatus, TransferStatus, UiMode, WindowId};
 use toxxi::msg::{Cmd, IOAction, ToxAction};
+use toxxi::testing::add_test_friend;
 
 // Helper to setup a basic test environment
 fn setup_test_env() -> (toxxi::model::Model, ()) {
@@ -15,10 +14,8 @@ fn setup_test_env() -> (toxxi::model::Model, ()) {
     // Create a dummy model
     let pk = PublicKey([0; 32]);
     let tox_id = Address::from_public_key(pk, 0);
-    let self_pk = tox_id.public_key();
     let domain = DomainState::new(
         tox_id,
-        self_pk,
         "Test User".to_string(),
         "".to_string(),
         ToxUserStatus::TOX_USER_STATUS_NONE,
@@ -27,23 +24,6 @@ fn setup_test_env() -> (toxxi::model::Model, ()) {
     let model = toxxi::model::Model::new(domain, config.clone(), config.clone());
 
     (model, ())
-}
-
-fn add_test_friend(model: &mut toxxi::model::Model, fid: FriendNumber, pk: PublicKey) {
-    model.session.friend_numbers.insert(fid, pk);
-    model.domain.friends.insert(
-        pk,
-        FriendInfo {
-            name: format!("Friend {}", fid.0),
-            public_key: Some(pk),
-            status_message: "".to_string(),
-            connection: ToxConnection::TOX_CONNECTION_TCP,
-            last_sent_message_id: None,
-            last_read_receipt: None,
-            is_typing: false,
-        },
-    );
-    model.ensure_friend_window(pk);
 }
 
 #[tokio::test]
@@ -75,8 +55,6 @@ async fn test_chat_window_file_accept() {
             transferred: 0,
             is_receiving: true,
             status: TransferStatus::Active,
-            file_kind: 0,
-            file_path: None,
             speed: 0.0,
             last_update: std::time::Instant::now(),
             last_transferred: 0,
@@ -98,6 +76,7 @@ async fn test_chat_window_file_accept() {
                 progress: 0.0,
                 speed: "0 B/s".to_string(),
                 is_incoming: true,
+                blob: None,
             },
             timestamp: model.time_provider.now_local(),
             status: MessageStatus::Incoming,

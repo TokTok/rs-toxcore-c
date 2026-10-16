@@ -1,46 +1,9 @@
-use crossterm::event::Event as CrosstermEvent;
-use crossterm::event::KeyEvent;
 use crossterm::event::{KeyCode, KeyModifiers};
-use toxcore::tox::{Address, FriendNumber, ToxConnection, ToxUserStatus};
+use toxcore::tox::FriendNumber;
 use toxcore::types::PublicKey;
-use toxxi::config::Config;
-use toxxi::model::{ConsoleMessageType, DomainState, FriendInfo, Model, WindowId};
-use toxxi::msg::{Cmd, Msg, ToxAction};
-use toxxi::update::update;
-
-fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "I am a test".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    Model::new(domain, config.clone(), config)
-}
-
-fn add_test_friend(model: &mut Model, fid: FriendNumber, pk: PublicKey) {
-    model.session.friend_numbers.insert(fid, pk);
-    model.domain.friends.insert(
-        pk,
-        FriendInfo {
-            name: format!("Friend {}", fid.0),
-            public_key: Some(pk),
-            status_message: "".to_string(),
-            connection: ToxConnection::TOX_CONNECTION_TCP,
-            last_sent_message_id: None,
-            last_read_receipt: None,
-            is_typing: false,
-        },
-    );
-    model.ensure_friend_window(pk);
-}
-
-fn send_key(model: &mut Model, code: KeyCode, modifiers: KeyModifiers) -> Vec<Cmd> {
-    let event = CrosstermEvent::Key(KeyEvent::new(code, modifiers));
-    update(model, Msg::Input(event))
-}
+use toxxi::model::{ConsoleMessageType, WindowId};
+use toxxi::msg::{Cmd, ToxAction};
+use toxxi::testing::{add_test_friend, create_test_model, send_key};
 
 fn get_text(input: &toxxi::widgets::InputBoxState) -> String {
     input.text.clone()
@@ -110,7 +73,7 @@ fn test_block_feature() {
     assert!(!cmds.is_empty());
     let found = cmds.iter().any(|c| {
         if let Cmd::Tox(ToxAction::SendMessage(f, _, msg, _)) = c {
-            *f == pk && msg == "now I can say hunter2"
+            *f == pk && msg == b"now I can say hunter2"
         } else {
             false
         }
@@ -135,6 +98,10 @@ fn test_block_case_insensitive() {
         send_key(&mut model, KeyCode::Char(c), KeyModifiers::empty());
     }
     let cmds = send_key(&mut model, KeyCode::Enter, KeyModifiers::empty());
-    assert!(cmds.is_empty());
+    assert!(
+        !cmds
+            .iter()
+            .any(|cmd| matches!(cmd, Cmd::Tox(ToxAction::SendMessage(..))))
+    );
     assert!(!model.ui.input_blocked_indices.is_empty());
 }

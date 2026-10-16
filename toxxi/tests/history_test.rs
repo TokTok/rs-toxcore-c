@@ -1,35 +1,13 @@
-use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
-use toxcore::tox::{Address, ToxUserStatus};
-use toxcore::types::PublicKey;
-use toxxi::config::Config;
-use toxxi::model::{DomainState, Model};
-use toxxi::msg::Msg;
-use toxxi::update::update;
-
-fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "I am a test".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    Model::new(domain, config.clone(), config)
-}
-
-fn send_key(model: &mut Model, code: KeyCode) {
-    let event = CrosstermEvent::Key(KeyEvent::new(code, KeyModifiers::empty()));
-    update(model, Msg::Input(event));
-    model.ui.input_state.ensure_layout(80, "> ");
-}
+use crossterm::event::{KeyCode, KeyModifiers};
+use toxxi::model::Model;
+use toxxi::testing::{create_test_model, send_key};
 
 fn send_char(model: &mut Model, c: char) {
-    send_key(model, KeyCode::Char(c));
+    send_key(model, KeyCode::Char(c), KeyModifiers::NONE);
 }
 
 fn send_enter(model: &mut Model) {
-    send_key(model, KeyCode::Enter);
+    send_key(model, KeyCode::Enter, KeyModifiers::NONE);
 }
 
 fn get_text(input: &toxxi::widgets::InputBoxState) -> String {
@@ -57,19 +35,19 @@ fn test_history_navigation() {
     assert_eq!(model.ui.input_history[1], "second");
 
     // Press Up -> "second"
-    send_key(&mut model, KeyCode::Up);
+    send_key(&mut model, KeyCode::Up, KeyModifiers::NONE);
     assert_eq!(get_text(&model.ui.input_state), "second");
 
     // Press Up -> "first"
-    send_key(&mut model, KeyCode::Up);
+    send_key(&mut model, KeyCode::Up, KeyModifiers::NONE);
     assert_eq!(get_text(&model.ui.input_state), "first");
 
     // Press Down -> "second"
-    send_key(&mut model, KeyCode::Down);
+    send_key(&mut model, KeyCode::Down, KeyModifiers::NONE);
     assert_eq!(get_text(&model.ui.input_state), "second");
 
     // Press Down -> "" (original input)
-    send_key(&mut model, KeyCode::Down);
+    send_key(&mut model, KeyCode::Down, KeyModifiers::NONE);
     assert_eq!(get_text(&model.ui.input_state), "");
 }
 
@@ -89,11 +67,11 @@ fn test_history_save_current_input() {
     }
 
     // Press Up -> "history"
-    send_key(&mut model, KeyCode::Up);
+    send_key(&mut model, KeyCode::Up, KeyModifiers::NONE);
     assert_eq!(get_text(&model.ui.input_state), "history");
 
     // Press Down -> "current"
-    send_key(&mut model, KeyCode::Down);
+    send_key(&mut model, KeyCode::Down, KeyModifiers::NONE);
     assert_eq!(get_text(&model.ui.input_state), "current");
 }
 

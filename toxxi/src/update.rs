@@ -2,10 +2,15 @@ use crate::commands;
 use crate::completion;
 use crate::config::SystemMessageType;
 use crate::model::{
-    ConsoleMessageType, FileTransferProgress, FriendInfo, InputMode, MessageStatus, Model, PeerId,
-    PeerInfo, PendingItem, TransferStatus, WindowId,
+    ConsoleMessageType, FileTransferProgress, FriendInfo, InputMode, InternalMessageId,
+    MessageStatus, Model, PeerId, PeerInfo, PendingItem, TransferStatus, WindowId,
 };
 use crate::msg::{AppCmd, Cmd, IOAction, IOEvent, Msg, SystemEvent, ToxAction, ToxEvent};
+use crate::sync::event::{Content, EventId};
+use crate::sync::files;
+use crate::sync::pairing::PairingCode;
+use crate::sync::protocol::BLOB_FILE_KIND;
+use crate::text;
 use crate::utils::split_message;
 use crate::widgets::{
     EmojiPickerState, InputBoxState, Outcome, QuickSwitcherItem, QuickSwitcherState,
@@ -13,8 +18,156 @@ use crate::widgets::{
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyModifiers};
 use std::time::Duration;
 use toxcore::types::{
-    GROUP_MAX_MESSAGE_LENGTH, MAX_MESSAGE_LENGTH, MessageType, ToxFileControl, ToxUserStatus,
+    FileId, GROUP_MAX_MESSAGE_LENGTH, MAX_MESSAGE_LENGTH, MessageType, PublicKey, ToxFileControl,
+    ToxGroupJoinFail, ToxUserStatus,
 };
+
+/// Starts receiving `file_id` from `pk` into the downloads directory.
+pub fn accept_file(model: &mut Model, pk: PublicKey, file_id: FileId) -> Vec<Cmd> {
+    let Some(progress) = model.domain.file_transfers.get_mut(&file_id) else {
+        return Vec::new();
+    };
+    progress.status = TransferStatus::Active;
+    receive_file(pk, file_id, progress.filename.clone(), progress.total_size)
+}
+
+fn receive_file(pk: PublicKey, file_id: FileId, filename: String, size: u64) -> Vec<Cmd> {
+    vec![
+        Cmd::IO(IOAction::OpenFileForReceiving(pk, file_id, filename, size)),
+        Cmd::Tox(ToxAction::FileControl(
+            pk,
+            file_id,
+            ToxFileControl::TOX_FILE_CONTROL_RESUME,
+        )),
+    ]
+}
+
+/// A file transfer selected in navigation mode.
+struct SelectedFile {
+    pk: PublicKey,
+    file_id: FileId,
+    name: String,
+    size: u64,
+    incoming: bool,
+    acceptable: bool,
+    /// Whether it can still be paused or cancelled.
+    open: bool,
+}
+
+/// Handles the navigation keys the Files window and chats share.
+fn navigate_files(
+    model: &mut Model,
+    id: WindowId,
+    code: KeyCode,
+    count: usize,
+    selected: Option<SelectedFile>,
+) -> Vec<Cmd> {
+    let list = &mut model.ui.window_state.entry(id).or_default().msg_list_state;
+    let (file, control) = match (code, selected) {
+        (KeyCode::Up, _) => {
+            list.select_previous();
+            return Vec::new();
+        }
+        (KeyCode::Down, _) => {
+            list.select_next(count);
+            return Vec::new();
+        }
+        (KeyCode::Enter | KeyCode::Char('i'), _) => {
+            model.ui.ui_mode = crate::model::UiMode::Chat;
+            return Vec::new();
+        }
+        (KeyCode::Char('x'), Some(file)) if file.open => {
+            (file, ToxFileControl::TOX_FILE_CONTROL_CANCEL)
+        }
+        (KeyCode::Char('p'), Some(file)) if file.open => {
+            let is_paused = model
+                .domain
+                .file_transfers
+                .get(&file.file_id)
+                .is_some_and(|p| p.status == TransferStatus::Paused);
+            let control = if is_paused {
+                ToxFileControl::TOX_FILE_CONTROL_RESUME
+            } else {
+                ToxFileControl::TOX_FILE_CONTROL_PAUSE
+            };
+            (file, control)
+        }
+        _ => return Vec::new(),
+    };
+    vec![Cmd::Tox(ToxAction::FileControl(
+        file.pk,
+        file.file_id,
+        control,
+    ))]
+}
+
+/// Puts the command accepting `file` in the input box, unless its friend
+/// number is unknown.
+fn prefill_file_accept(model: &mut Model, file: &SelectedFile) -> bool {
+    let Some(friend) = model
+        .session
+        .friend_numbers
+        .iter()
+        .find(|(_, pk)| **pk == file.pk)
+        .map(|(friend, _)| *friend)
+    else {
+        return false;
+    };
+    model.ui.input_state.set_value(format!(
+        "/file accept {} {} {}",
+        friend.0, file.file_id, file.name
+    ));
+    set_cursor_to_end(&mut model.ui.input_state);
+    model.ui.ui_mode = crate::model::UiMode::Chat;
+    true
+}
+
+/// Carries out a device's answer to the file that event `file` in
+/// `window_id` started. One no longer offered has ended, as if declined.
+pub fn answer_file(
+    model: &mut Model,
+    window_id: WindowId,
+    file: &EventId,
+    accepted: bool,
+) -> Vec<Cmd> {
+    let (
+        WindowId::Friend(pk),
+        Some(Content::File {
+            file_id: Some(file_id),
+            incoming: true,
+            ..
+        }),
+    ) = (
+        window_id,
+        model.events.get(file).map(|event| &event.content),
+    )
+    else {
+        return Vec::new();
+    };
+    let file_id = *file_id;
+    let offered = model
+        .domain
+        .file_transfers
+        .get(&file_id)
+        .is_some_and(|progress| progress.friend_pk == pk && progress.is_receiving);
+    if accepted && offered {
+        return accept_file(model, pk, file_id);
+    }
+    let mut cmds = Vec::new();
+    if offered {
+        model.domain.file_transfers.remove(&file_id);
+        cmds.push(Cmd::Tox(ToxAction::FileControl(
+            pk,
+            file_id,
+            ToxFileControl::TOX_FILE_CONTROL_CANCEL,
+        )));
+    }
+    model.ensure_friend_window(pk);
+    if let Some(msg) = model.update_file_status(pk, file_id, MessageStatus::Failed) {
+        cmds.extend(model.record(window_id, &msg));
+    }
+    cmds
+}
 
 fn get_text_string(input: &InputBoxState) -> String {
     input.text.clone()
@@ -24,14 +177,23 @@ fn set_cursor_to_end(input: &mut InputBoxState) {
     input.cursor_pos = input.text.len();
 }
 
+/// Whether `msg` can change what the screen shows: Tox's logs show only in
+/// the Logs window.
+pub fn shows(model: &Model, msg: &Msg) -> bool {
+    !matches!(msg, Msg::Tox(ToxEvent::Log(..))) || model.active_window_id() == WindowId::Logs
+}
+
 pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
     let mut cmds = Vec::new();
+    let tick = matches!(msg, Msg::System(SystemEvent::Tick));
 
     match msg {
         Msg::Input(CrosstermEvent::Key(key)) => {
+            model.read_active();
             cmds.extend(handle_key_event(model, key));
         }
         Msg::Input(CrosstermEvent::Paste(text)) => {
+            model.read_active();
             model.ui.input_state.insert_str(&text);
             cmds.extend(update_typing_status(model));
         }
@@ -46,13 +208,19 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         }
         _ => {}
     }
+    // Messages come many a second: what they change in the account waits for
+    // the next tick.
+    if !tick {
+        model.session.account_dirty = true;
+    } else if model.session.account_dirty {
+        cmds.extend(model.record_account());
+    }
 
     cmds
 }
 
 fn handle_key_event(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<Cmd> {
-    if model.ui.show_qr {
-        model.ui.show_qr = false;
+    if model.ui.qr.take().is_some() {
         return vec![];
     }
 
@@ -95,80 +263,11 @@ fn handle_key_event(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<C
             KeyCode::Enter => {
                 if let Some(selected_idx) = state.list_state.selected() {
                     let filtered = state.filtered_items();
-                    if let Some(item) = filtered.get(selected_idx) {
-                        let target_name = &item.name;
-                        let mut target_idx = None;
-
-                        // Check System windows first
-                        if target_name == "Status" {
-                            target_idx = Some(0);
-                        }
-                        // Console is 0
-                        else if target_name == "Logs"
-                            && let Some(pos) = model
-                                .ui
-                                .window_ids
-                                .iter()
-                                .position(|w| *w == WindowId::Logs)
-                        {
-                            target_idx = Some(pos);
-                        } else if target_name == "Files"
-                            && let Some(pos) = model
-                                .ui
-                                .window_ids
-                                .iter()
-                                .position(|w| *w == WindowId::Files)
-                        {
-                            target_idx = Some(pos);
-                        }
-
-                        if target_idx.is_none() {
-                            for (i, win_id) in model.ui.window_ids.iter().enumerate() {
-                                let name = match win_id {
-                                    WindowId::Friend(pk) => {
-                                        if let Some(c) = model.domain.conversations.get(win_id) {
-                                            c.name.clone()
-                                        } else if let Some(f) = model.domain.friends.get(pk) {
-                                            f.name.clone()
-                                        } else {
-                                            format!(
-                                                "Friend {}",
-                                                crate::utils::encode_hex(&pk.0[0..4])
-                                            )
-                                        }
-                                    }
-                                    WindowId::Group(g) => {
-                                        if let Some(c) = model.domain.conversations.get(win_id) {
-                                            c.name.clone()
-                                        } else {
-                                            format!(
-                                                "Group {}",
-                                                crate::utils::encode_hex(&g.0[0..4])
-                                            )
-                                        }
-                                    }
-                                    WindowId::Conference(c) => {
-                                        if let Some(conv) = model.domain.conversations.get(win_id) {
-                                            conv.name.clone()
-                                        } else {
-                                            format!(
-                                                "Conference {}",
-                                                crate::utils::encode_hex(&c.0[0..4])
-                                            )
-                                        }
-                                    }
-                                    _ => String::new(),
-                                };
-                                if &name == target_name {
-                                    target_idx = Some(i);
-                                    break;
-                                }
-                            }
-                        }
-
-                        if let Some(idx) = target_idx {
-                            model.set_active_window(idx);
-                        }
+                    if let Some(item) = filtered.get(selected_idx)
+                        && let Some(pos) =
+                            model.ui.window_ids.iter().position(|w| *w == item.window)
+                    {
+                        model.set_active_window(pos);
                     }
                 }
                 model.ui.quick_switcher = None;
@@ -261,220 +360,83 @@ fn handle_key_event(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<C
     if model.ui.ui_mode == crate::model::UiMode::Navigation {
         let id = model.active_window_id();
 
+        let selected_index = model
+            .ui
+            .window_state
+            .entry(id)
+            .or_default()
+            .msg_list_state
+            .selected_index;
+
         if id == WindowId::Files {
             let mut transfers: Vec<_> = model.domain.file_transfers.iter().collect();
             // Sort by friend PK for stability
             transfers.sort_by_key(|(_, p)| p.friend_pk.0);
             let count = transfers.len();
-            let state = model.ui.window_state.entry(id).or_default();
+            let selected =
+                selected_index
+                    .and_then(|idx| transfers.get(idx))
+                    .map(|&(file_id, progress)| SelectedFile {
+                        pk: progress.friend_pk,
+                        file_id: *file_id,
+                        name: progress.filename.clone(),
+                        size: progress.total_size,
+                        incoming: progress.is_receiving,
+                        acceptable: progress.is_receiving,
+                        open: true,
+                    });
 
-            match key.code {
-                KeyCode::Up => {
-                    state.msg_list_state.select_previous();
+            match (key.code, selected) {
+                (KeyCode::Char('a'), Some(file)) if file.acceptable => {
+                    cmds.extend(accept_file(model, file.pk, file.file_id));
                 }
-                KeyCode::Down => {
-                    state.msg_list_state.select_next(count);
-                }
-                KeyCode::Char('a') => {
-                    if let Some(idx) = state.msg_list_state.selected_index
-                        && let Some(&(file_id, progress)) = transfers.get(idx)
-                        && progress.is_receiving
-                    {
-                        cmds.push(Cmd::IO(IOAction::OpenFileForReceiving(
-                            progress.friend_pk,
-                            *file_id,
-                            progress.filename.clone(),
-                            progress.total_size,
-                        )));
-                        cmds.push(Cmd::Tox(ToxAction::FileControl(
-                            progress.friend_pk,
-                            *file_id,
-                            toxcore::types::ToxFileControl::TOX_FILE_CONTROL_RESUME,
-                        )));
+                (KeyCode::Char('o'), Some(file)) if file.incoming => {
+                    if !prefill_file_accept(model, &file) {
+                        model.add_console_message(
+                            ConsoleMessageType::Error,
+                            "Friend number not found for file transfer (needed for command)"
+                                .to_owned(),
+                        );
                     }
                 }
-                KeyCode::Char('x') => {
-                    if let Some(idx) = state.msg_list_state.selected_index
-                        && let Some(&(file_id, progress)) = transfers.get(idx)
-                    {
-                        cmds.push(Cmd::Tox(ToxAction::FileControl(
-                            progress.friend_pk,
-                            *file_id,
-                            toxcore::types::ToxFileControl::TOX_FILE_CONTROL_CANCEL,
-                        )));
-                    }
-                }
-                KeyCode::Char('p') => {
-                    if let Some(idx) = state.msg_list_state.selected_index
-                        && let Some(&(file_id, progress)) = transfers.get(idx)
-                    {
-                        let control = if progress.status == TransferStatus::Paused {
-                            toxcore::types::ToxFileControl::TOX_FILE_CONTROL_RESUME
-                        } else {
-                            toxcore::types::ToxFileControl::TOX_FILE_CONTROL_PAUSE
-                        };
-                        cmds.push(Cmd::Tox(ToxAction::FileControl(
-                            progress.friend_pk,
-                            *file_id,
-                            control,
-                        )));
-                    }
-                }
-                KeyCode::Char('o') => {
-                    if let Some(idx) = state.msg_list_state.selected_index
-                        && let Some(&(file_id, progress)) = transfers.get(idx)
-                    {
-                        // Need to resolve PK to FriendNumber for the command string
-                        let mut friend_num = None;
-                        for (num, p) in &model.session.friend_numbers {
-                            if p == &progress.friend_pk {
-                                friend_num = Some(*num);
-                                break;
-                            }
-                        }
-
-                        if progress.is_receiving {
-                            if let Some(f) = friend_num {
-                                model.ui.input_state.set_value(format!(
-                                    "/file accept {} {} {}",
-                                    f.0, file_id, progress.filename
-                                ));
-                                set_cursor_to_end(&mut model.ui.input_state);
-                                model.ui.ui_mode = crate::model::UiMode::Chat;
-                            } else {
-                                model.add_console_message(
-                                    ConsoleMessageType::Error,
-                                    "Friend number not found for file transfer (needed for command)".to_owned(),
-                                );
-                            }
-                        }
-                    }
-                }
-                KeyCode::Enter | KeyCode::Char('i') => {
-                    model.ui.ui_mode = crate::model::UiMode::Chat;
-                }
-                _ => {}
+                (code, selected) => cmds.extend(navigate_files(model, id, code, count, selected)),
             }
             return cmds;
         }
 
         let count = model.total_messages_for(id);
-        let state = model.ui.window_state.entry(id).or_default();
-
-        match key.code {
-            KeyCode::Up => {
-                state.msg_list_state.select_previous();
-            }
-            KeyCode::Down => {
-                state.msg_list_state.select_next(count);
-            }
-            KeyCode::Char('a') => {
-                if let Some(idx) = state.msg_list_state.selected_index
-                    && let Some(conv) = model.domain.conversations.get(&id)
-                    && let Some(msg) = conv.messages.get(idx)
-                    && let crate::model::MessageContent::FileTransfer {
-                        file_id: Some(file),
+        let selected = selected_index
+            .and_then(|idx| model.domain.conversations.get(&id)?.messages.get(idx))
+            .and_then(|msg| match (id, &msg.content) {
+                (
+                    WindowId::Friend(pk),
+                    crate::model::MessageContent::FileTransfer {
+                        file_id: Some(file_id),
                         name,
                         size,
                         is_incoming,
                         ..
-                    } = &msg.content
-                    && *is_incoming
-                    && msg.status != MessageStatus::Received
-                    && let WindowId::Friend(pk) = id
-                {
-                    cmds.push(Cmd::IO(IOAction::OpenFileForReceiving(
-                        pk,
-                        *file,
-                        name.clone(),
-                        *size,
-                    )));
-                    cmds.push(Cmd::Tox(ToxAction::FileControl(
-                        pk,
-                        *file,
-                        toxcore::types::ToxFileControl::TOX_FILE_CONTROL_RESUME,
-                    )));
-                }
-            }
-            KeyCode::Char('x') => {
-                if let Some(idx) = state.msg_list_state.selected_index
-                    && let Some(conv) = model.domain.conversations.get(&id)
-                    && let Some(msg) = conv.messages.get(idx)
-                    && let crate::model::MessageContent::FileTransfer {
-                        file_id: Some(file),
-                        ..
-                    } = &msg.content
-                    && matches!(msg.status, MessageStatus::Incoming | MessageStatus::Pending)
-                    && let WindowId::Friend(pk) = id
-                {
-                    cmds.push(Cmd::Tox(ToxAction::FileControl(
-                        pk,
-                        *file,
-                        toxcore::types::ToxFileControl::TOX_FILE_CONTROL_CANCEL,
-                    )));
-                }
-            }
-            KeyCode::Char('p') => {
-                if let Some(idx) = state.msg_list_state.selected_index
-                    && let Some(conv) = model.domain.conversations.get(&id)
-                    && let Some(msg) = conv.messages.get(idx)
-                    && let crate::model::MessageContent::FileTransfer {
-                        file_id: Some(file),
-                        ..
-                    } = &msg.content
-                    && matches!(msg.status, MessageStatus::Incoming | MessageStatus::Pending)
-                    && let WindowId::Friend(pk) = id
-                {
-                    let is_paused = model
-                        .domain
-                        .file_transfers
-                        .get(file)
-                        .map(|p| p.status == TransferStatus::Paused)
-                        .unwrap_or(false);
-                    let control = if is_paused {
-                        toxcore::types::ToxFileControl::TOX_FILE_CONTROL_RESUME
-                    } else {
-                        toxcore::types::ToxFileControl::TOX_FILE_CONTROL_PAUSE
-                    };
-                    cmds.push(Cmd::Tox(ToxAction::FileControl(pk, *file, control)));
-                }
-            }
-            KeyCode::Char('o') => {
-                if let Some(idx) = state.msg_list_state.selected_index
-                    && let Some(conv) = model.domain.conversations.get(&id)
-                    && let Some(msg) = conv.messages.get(idx)
-                    && let crate::model::MessageContent::FileTransfer {
-                        file_id: Some(file),
-                        name,
-                        is_incoming,
-                        ..
-                    } = &msg.content
-                    && *is_incoming
-                    && let WindowId::Friend(pk) = id
-                {
-                    // Find friend number for command
-                    let mut friend_num = None;
-                    for (num, p) in &model.session.friend_numbers {
-                        if p == &pk {
-                            friend_num = Some(*num);
-                            break;
-                        }
-                    }
+                    },
+                ) => Some(SelectedFile {
+                    pk,
+                    file_id: *file_id,
+                    name: name.clone(),
+                    size: *size,
+                    incoming: *is_incoming,
+                    acceptable: *is_incoming && msg.status != MessageStatus::Received,
+                    open: matches!(msg.status, MessageStatus::Incoming | MessageStatus::Pending),
+                }),
+                _ => None,
+            });
 
-                    if let Some(f) = friend_num {
-                        model
-                            .ui
-                            .input_state
-                            .set_value(format!("/file accept {} {} {}", f.0, file, name));
-                        set_cursor_to_end(&mut model.ui.input_state);
-                        model.ui.ui_mode = crate::model::UiMode::Chat;
-                    }
-                }
+        match (key.code, selected) {
+            (KeyCode::Char('a'), Some(file)) if file.acceptable => {
+                cmds.extend(receive_file(file.pk, file.file_id, file.name, file.size));
             }
-            KeyCode::Enter | KeyCode::Char('i') => {
-                model.ui.ui_mode = crate::model::UiMode::Chat;
+            (KeyCode::Char('o'), Some(file)) if file.incoming => {
+                prefill_file_accept(model, &file);
             }
-            _ => {}
+            (code, selected) => cmds.extend(navigate_files(model, id, code, count, selected)),
         }
         return cmds;
     }
@@ -554,44 +516,28 @@ fn handle_key_event(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<C
             let mut items = Vec::new();
 
             // System
-            items.push(QuickSwitcherItem {
-                name: "Status".to_owned(),
-                description: "System Status & Console".to_owned(),
-                prefix: ">".to_owned(),
-            });
-            items.push(QuickSwitcherItem {
-                name: "Logs".to_owned(),
-                description: "Tox Core Logs".to_owned(),
-                prefix: ">".to_owned(),
-            });
-            items.push(QuickSwitcherItem {
-                name: "Files".to_owned(),
-                description: "File Manager".to_owned(),
-                prefix: ">".to_owned(),
-            });
+            for (window, description) in [
+                (WindowId::Console, "System Status & Console"),
+                (WindowId::Logs, "Tox Core Logs"),
+                (WindowId::Files, "File Manager"),
+            ] {
+                items.push(QuickSwitcherItem {
+                    window,
+                    name: model.window_name(window),
+                    description: description.to_owned(),
+                    prefix: ">".to_owned(),
+                });
+            }
 
             // Friends
-            let mut friend_pks: Vec<_> = model.domain.friends.keys().collect();
-            friend_pks.sort();
-            for pk in friend_pks {
-                let name =
-                    if let Some(conv) = model.domain.conversations.get(&WindowId::Friend(*pk)) {
-                        conv.name.clone()
-                    } else if let Some(info) = model.domain.friends.get(pk) {
-                        info.name.clone()
-                    } else {
-                        format!("Friend {}", crate::utils::encode_hex(&pk.0[0..4]))
-                    };
-
-                let status = if let Some(info) = model.domain.friends.get(pk) {
-                    format!("{:?}", info.connection)
-                } else {
-                    "Offline".to_owned()
-                };
-
+            let mut friends: Vec<_> = model.domain.friends.iter().collect();
+            friends.sort_by_key(|(pk, _)| *pk);
+            for (pk, info) in friends {
+                let window = WindowId::Friend(*pk);
                 items.push(QuickSwitcherItem {
-                    name,
-                    description: status,
+                    window,
+                    name: model.window_name(window),
+                    description: format!("{:?}", info.connection),
                     prefix: "f".to_owned(),
                 });
             }
@@ -612,21 +558,18 @@ fn handle_key_event(model: &mut Model, key: crossterm::event::KeyEvent) -> Vec<C
             });
 
             for id in conv_ids {
+                let prefix = match id {
+                    WindowId::Group(_) => "g",
+                    WindowId::Conference(_) => "c",
+                    _ => continue,
+                };
                 if let Some(conv) = model.domain.conversations.get(id) {
-                    if let WindowId::Group(_) = id {
-                        items.push(QuickSwitcherItem {
-                            name: conv.name.clone(),
-                            description: conv.topic.clone().unwrap_or_default(),
-                            prefix: "g".to_owned(),
-                        });
-                    }
-                    if let WindowId::Conference(_) = id {
-                        items.push(QuickSwitcherItem {
-                            name: conv.name.clone(),
-                            description: conv.topic.clone().unwrap_or_default(),
-                            prefix: "c".to_owned(),
-                        });
-                    }
+                    items.push(QuickSwitcherItem {
+                        window: *id,
+                        name: conv.name.clone(),
+                        description: conv.topic.clone().unwrap_or_default(),
+                        prefix: prefix.to_owned(),
+                    });
                 }
             }
 
@@ -990,11 +933,11 @@ fn history_down(model: &mut Model) {
 fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
     let mut cmds = Vec::new();
     match event {
-        ToxEvent::Message(friend_number, message_type, content) => {
+        ToxEvent::Message(friend_number, message_type, bytes) => {
             if let Some(pk) = model.session.friend_numbers.get(&friend_number).cloned()
-                && let Some(msg) = model.add_friend_message(pk, message_type, content)
+                && let Some(msg) = model.add_friend_message(pk, message_type, text::of(&bytes))
             {
-                cmds.push(Cmd::IO(IOAction::LogMessage(WindowId::Friend(pk), msg)));
+                cmds.extend(model.record_received(WindowId::Friend(pk), &msg, bytes));
             }
         }
         ToxEvent::Log(level, file, line, func, message) => {
@@ -1018,17 +961,43 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
                     .domain
                     .friends
                     .entry(pk)
-                    .or_insert_with(|| FriendInfo {
-                        name: format!("Friend {}", crate::utils::encode_hex(&pk.0[0..4])),
-                        public_key: Some(pk),
-                        status_message: String::new(),
-                        connection: status,
-                        last_sent_message_id: None,
-                        last_read_receipt: None,
-                        is_typing: false,
-                    });
+                    .or_insert_with(|| FriendInfo::new(pk, status));
                 info.connection = status;
+                model.domain.pending_items.retain(
+                    |item| !matches!(item, PendingItem::FriendRequest { pk: from, .. } if *from == pk),
+                );
                 model.invalidate_sidebar_cache();
+                cmds.extend(crate::sync::friend_status(model, pk, status));
+            }
+        }
+        ToxEvent::InviteJoined(invite, chat) => {
+            cmds.extend(crate::sync::invites::joined(model, invite, chat));
+        }
+        ToxEvent::GroupJoinFail(group, fail) => {
+            if let Some(chat_id) = model.session.group_numbers.get(&group).copied() {
+                model.add_console_message(
+                    ConsoleMessageType::Error,
+                    format!("Couldn't join group {}: {:?}", chat_id, fail),
+                );
+                cmds.extend(crate::sync::invites::refused(
+                    model,
+                    chat_id,
+                    fail == ToxGroupJoinFail::TOX_GROUP_JOIN_FAIL_INVALID_PASSWORD,
+                ));
+            }
+        }
+        ToxEvent::CallRinging(pk, video) => {
+            cmds.extend(crate::sync::calls::ringing(model, pk, video));
+        }
+        ToxEvent::CallConnected(pk) => {
+            cmds.extend(crate::sync::calls::connected(model, pk));
+        }
+        ToxEvent::CallEnded(pk) => {
+            cmds.extend(crate::sync::calls::ended(model, pk));
+        }
+        ToxEvent::SyncMessage(friend, message) => {
+            if let Some(&pk) = model.session.friend_numbers.get(&friend) {
+                cmds.extend(crate::sync::received(model, pk, &message));
             }
         }
         ToxEvent::FriendName(friend, name) => {
@@ -1050,6 +1019,11 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
                 model.invalidate_sidebar_cache();
             }
         }
+        ToxEvent::FriendUserStatus(friend, status) => {
+            if let Some(pk) = model.session.friend_numbers.get(&friend) {
+                model.session.friend_statuses.insert(*pk, status);
+            }
+        }
         ToxEvent::FriendTyping(friend, is_typing) => {
             if let Some(pk) = model.session.friend_numbers.get(&friend) {
                 if let Some(info) = model.domain.friends.get_mut(pk) {
@@ -1066,7 +1040,7 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
                     MessageStatus::Sent(msg_id.0),
                 )
             {
-                cmds.push(Cmd::IO(IOAction::LogMessage(WindowId::Friend(pk), msg)));
+                cmds.extend(model.record(WindowId::Friend(pk), &msg));
             }
         }
         ToxEvent::GroupMessageSent(group, internal_id) => {
@@ -1077,7 +1051,7 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
                     MessageStatus::Received,
                 )
             {
-                cmds.push(Cmd::IO(IOAction::LogMessage(WindowId::Group(chat_id), msg)));
+                cmds.extend(model.record(WindowId::Group(chat_id), &msg));
             }
         }
         ToxEvent::ConferenceMessageSent(conference, internal_id) => {
@@ -1088,29 +1062,30 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
                     MessageStatus::Received,
                 )
             {
-                cmds.push(Cmd::IO(IOAction::LogMessage(
-                    WindowId::Conference(conf_id),
-                    msg,
-                )));
+                cmds.extend(model.record(WindowId::Conference(conf_id), &msg));
             }
         }
         ToxEvent::MessageSendFailed(window_id, internal_id) => {
             if let Some(msg) =
                 model.mark_message_status(window_id, internal_id, MessageStatus::Pending)
             {
-                cmds.push(Cmd::IO(IOAction::LogMessage(window_id, msg)));
+                cmds.extend(model.record(window_id, &msg));
             }
         }
         ToxEvent::ReadReceipt(friend, msg_id) => {
-            if let Some(pk) = model.session.friend_numbers.get(&friend)
-                && let Some(conv) = model.domain.conversations.get_mut(&WindowId::Friend(*pk))
+            if let Some(&pk) = model.session.friend_numbers.get(&friend)
+                && let Some(conv) = model.domain.conversations.get_mut(&WindowId::Friend(pk))
             {
+                let mut delivered = Vec::new();
                 for m in conv.messages.iter_mut() {
-                    if let MessageStatus::Sent(id) = m.status
-                        && id <= msg_id.0
-                    {
+                    // Each message has its own receipt.
+                    if m.status == MessageStatus::Sent(msg_id.0) {
                         m.status = MessageStatus::Received;
+                        delivered.push(m.clone());
                     }
+                }
+                for m in delivered {
+                    cmds.extend(model.record(WindowId::Friend(pk), &m));
                 }
             }
         }
@@ -1141,26 +1116,35 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
         }
         ToxEvent::GroupMessage(group_number, t, s, m, pk) => {
             if let Some(chat_id) = model.session.group_numbers.get(&group_number).cloned()
-                && let Some(msg) = model.add_group_message(chat_id, t, s, m, pk)
+                && let Some(msg) = model.add_group_message(chat_id, t, s, text::of(&m), pk)
             {
-                cmds.push(Cmd::IO(IOAction::LogMessage(WindowId::Group(chat_id), msg)));
+                cmds.extend(model.record_received(WindowId::Group(chat_id), &msg, m));
             }
         }
         ToxEvent::ConferenceMessage(conf_number, t, s, m, pk) => {
             if let Some(conf_id) = model.session.conference_numbers.get(&conf_number).cloned()
-                && let Some(msg) = model.add_conference_message(conf_id, t, s, m, pk)
+                && let Some(msg) = model.add_conference_message(conf_id, t, s, text::of(&m), pk)
             {
-                cmds.push(Cmd::IO(IOAction::LogMessage(
-                    WindowId::Conference(conf_id),
-                    msg,
-                )));
+                cmds.extend(model.record_received(WindowId::Conference(conf_id), &msg, m));
             }
         }
         ToxEvent::FriendRequest(pk, msg) => {
-            model
-                .domain
-                .pending_items
-                .push(PendingItem::FriendRequest { pk, message: msg });
+            let now = model.time_provider.now();
+            if let Some(code) = PairingCode::from_request(&msg)
+                && model.session.pairing.redeem(code, now)
+            {
+                model.add_status_message(crate::model::MessageContent::Text(format!(
+                    "Paired a new device: {}",
+                    pk
+                )));
+                cmds.push(Cmd::Tox(ToxAction::AcceptFriend(pk)));
+                cmds.extend(crate::sync::set_device(model, pk, true));
+            } else {
+                model
+                    .domain
+                    .pending_items
+                    .push(PendingItem::FriendRequest { pk, message: msg });
+            }
         }
         ToxEvent::GroupInvite(f, d, n) => {
             if let Some(pk) = model.session.friend_numbers.get(&f).cloned() {
@@ -1192,7 +1176,7 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
                     });
             }
         }
-        ToxEvent::GroupTopic(g, t) => {
+        ToxEvent::GroupTopic(g, t, setter) => {
             if let Some(chat_id) = model.session.group_numbers.get(&g).cloned() {
                 model.ensure_group_window(chat_id);
                 let window_id = WindowId::Group(chat_id);
@@ -1209,10 +1193,15 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
                     && let Some(msg) = model.add_system_message_to(
                         window_id,
                         ConsoleMessageType::Info,
-                        crate::model::MessageContent::Text(format!("* Topic changed to: {}", t)),
+                        crate::model::MessageContent::Text(
+                            match setter.filter(|s| !s.is_empty()) {
+                                Some(setter) => format!("* {setter} changed the topic to: {t}"),
+                                None => format!("* Topic changed to: {t}"),
+                            },
+                        ),
                     )
                 {
-                    cmds.push(Cmd::IO(IOAction::LogMessage(window_id, msg)));
+                    cmds.extend(model.record(window_id, &msg));
                 }
             }
         }
@@ -1244,7 +1233,7 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
                         )),
                     )
                 {
-                    cmds.push(Cmd::IO(IOAction::LogMessage(window_id, msg)));
+                    cmds.extend(model.record(window_id, &msg));
                 }
                 model.invalidate_sidebar_cache();
             }
@@ -1252,6 +1241,11 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
         ToxEvent::GroupSelfJoin(g) => {
             if let Some(chat_id) = model.session.group_numbers.get(&g).cloned() {
                 model.ensure_group_window(chat_id);
+            }
+        }
+        ToxEvent::GroupSettings(g, settings) => {
+            if let Some(chat_id) = model.session.group_numbers.get(&g) {
+                model.session.group_settings.insert(*chat_id, settings);
             }
         }
         ToxEvent::GroupSelfRole(g, r) => {
@@ -1266,19 +1260,19 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
                 }
             }
         }
-        ToxEvent::ConferenceTitle(c, t) => {
+        ToxEvent::ConferenceTitle(c, t, setter) => {
             if let Some(cid) = model.session.conference_numbers.get(&c).cloned() {
                 model.ensure_conference_window(cid);
                 let window_id = WindowId::Conference(cid);
 
+                // A conference has a title, its name, and no topic. It's empty
+                // while the conference reconnects.
                 let mut changed = false;
                 if let Some(conv) = model.domain.conversations.get_mut(&window_id)
-                    && conv.topic.as_ref() != Some(&t)
+                    && !t.is_empty()
+                    && conv.name != t
                 {
-                    if !t.is_empty() {
-                        conv.name = t.clone();
-                    }
-                    conv.topic = Some(t.clone());
+                    conv.name = t.clone();
                     changed = true;
                 }
 
@@ -1286,16 +1280,21 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
                     && let Some(msg) = model.add_system_message_to(
                         window_id,
                         ConsoleMessageType::Info,
-                        crate::model::MessageContent::Text(format!("* Topic changed to: {}", t)),
+                        crate::model::MessageContent::Text(
+                            match setter.filter(|s| !s.is_empty()) {
+                                Some(setter) => format!("* {setter} changed the title to: {t}"),
+                                None => format!("* Title changed to: {t}"),
+                            },
+                        ),
                     )
                 {
-                    cmds.push(Cmd::IO(IOAction::LogMessage(window_id, msg)));
+                    cmds.extend(model.record(window_id, &msg));
                 }
                 model.invalidate_sidebar_cache();
             }
         }
         ToxEvent::GroupPeerJoin(g, p, n, r, pk) => {
-            if pk == model.domain.self_public_key {
+            if pk == model.domain.self_public_key() {
                 return vec![];
             }
             model.session.group_peer_numbers.insert((g, p), pk);
@@ -1312,7 +1311,7 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
                         ConsoleMessageType::Info,
                         crate::model::MessageContent::Text(format!("* {} joined the group", n)),
                     ) {
-                        cmds.push(Cmd::IO(IOAction::LogMessage(window_id, msg)));
+                        cmds.extend(model.record(window_id, &msg));
                     }
                 }
                 if let Some(conv) = model
@@ -1362,7 +1361,7 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
                         ConsoleMessageType::Info,
                         crate::model::MessageContent::Text(format!("* {} left the group", name)),
                     ) {
-                        cmds.push(Cmd::IO(IOAction::LogMessage(window_id, msg)));
+                        cmds.extend(model.record(window_id, &msg));
                     }
                 }
 
@@ -1381,7 +1380,7 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
 
             if let Some(chat_id) = model.session.group_numbers.get(&g).cloned() {
                 let mut old_name = None;
-                if pk == model.domain.self_public_key {
+                if pk == model.domain.self_public_key() {
                     if let Some(conv) = model
                         .domain
                         .conversations
@@ -1424,7 +1423,7 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
                             old, n
                         )),
                     ) {
-                        cmds.push(Cmd::IO(IOAction::LogMessage(window_id, msg)));
+                        cmds.extend(model.record(window_id, &msg));
                     }
                 }
                 model.invalidate_sidebar_cache();
@@ -1453,7 +1452,7 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
             );
         }
         ToxEvent::ConferencePeerJoin(c, _p, n, pk) => {
-            if pk == model.domain.self_public_key {
+            if pk == model.domain.self_public_key() {
                 return vec![];
             }
             if let Some(cid) = model.session.conference_numbers.get(&c).cloned()
@@ -1503,6 +1502,12 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
             // We need PK to index friends.
             let pk_opt = model.session.friend_numbers.get(&friend).cloned();
 
+            if kind == BLOB_FILE_KIND
+                && let Some(pk) = pk_opt
+            {
+                return files::offered(model, pk, file_id, size);
+            }
+
             if kind != 0 {
                 model.add_console_message(
                     ConsoleMessageType::Info,
@@ -1538,8 +1543,6 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
                         transferred: 0,
                         is_receiving: true,
                         status: TransferStatus::Active,
-                        file_kind: kind,
-                        file_path: None,
                         speed: 0.0,
                         last_update: model.time_provider.now(),
                         last_transferred: 0,
@@ -1549,10 +1552,11 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
 
                 // Add inline message
                 let window_id = WindowId::Friend(pk);
+                model.ensure_friend_window(pk);
                 if let Some(msg) =
                     model.add_file_transfer_message(window_id, false, file_id, filename, size, true)
                 {
-                    cmds.push(Cmd::IO(IOAction::LogMessage(window_id, msg)));
+                    cmds.extend(model.record(window_id, &msg));
                 }
             } else {
                 model.add_console_message(
@@ -1572,6 +1576,13 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
 
             let pk_opt = model.session.friend_numbers.get(&friend).cloned();
 
+            if control == ToxFileControl::TOX_FILE_CONTROL_CANCEL
+                && let Some(pk) = pk_opt
+                && let Some(stopped) = files::stopped(model, pk, file_id)
+            {
+                return stopped;
+            }
+
             match control {
                 ToxFileControl::TOX_FILE_CONTROL_CANCEL => {
                     if let Some(pk) = pk_opt {
@@ -1580,7 +1591,7 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
                         if let Some(msg) =
                             model.update_file_status(pk, file_id, MessageStatus::Failed)
                         {
-                            cmds.push(Cmd::IO(IOAction::LogMessage(WindowId::Friend(pk), msg)));
+                            cmds.extend(model.record(WindowId::Friend(pk), &msg));
                         }
                     }
                 }
@@ -1605,6 +1616,13 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
             let pk_opt = model.session.friend_numbers.get(&friend).cloned();
 
             if let Some(pk) = pk_opt
+                && let Some(progressed) =
+                    files::progressed(model, pk, file_id, position + len as u64)
+            {
+                return progressed;
+            }
+
+            if let Some(pk) = pk_opt
                 && let Some(p) = model.domain.file_transfers.get_mut(&file_id)
             {
                 p.update_speed(model.time_provider.now(), position + len as u64);
@@ -1615,7 +1633,8 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
                     crate::utils::format_speed(p.speed),
                 ));
                 if p.transferred >= p.total_size {
-                    cmds.push(Cmd::IO(IOAction::CloseFile(pk, file_id)));
+                    model.session.finishing.insert(file_id);
+                    cmds.push(Cmd::IO(IOAction::FinishFile(pk, file_id)));
                 }
             }
             if let Some((transferred, total_size, speed)) = update
@@ -1624,10 +1643,30 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
                 model.update_file_progress(pk, file_id, transferred, total_size, speed);
             }
         }
-        ToxEvent::FileChunkRequest(friend, file, position, len) => {
+        // Only an empty file is asked for nothing from its start, as it's sent.
+        ToxEvent::FileChunkRequest(friend, file, 0, 0) => {
+            cmds.extend(handle_tox_event(
+                model,
+                ToxEvent::FileChunkSent(friend, file, 0, 0),
+            ));
+        }
+        // A request for nothing ends a file that has all gone.
+        ToxEvent::FileChunkRequest(friend, file, position, len) if len > 0 => {
             if let Some(pk) = model.session.friend_numbers.get(&friend).cloned() {
                 cmds.push(Cmd::IO(IOAction::ReadChunk(pk, file, position, len)));
             }
+        }
+        ToxEvent::Started => {
+            // A new Tox numbers messages from the start, so the last one's
+            // receipts never come.
+            for conv in model.domain.conversations.values_mut() {
+                for m in &mut conv.messages {
+                    if let MessageStatus::Sent(_) = m.status {
+                        m.status = MessageStatus::Sent(0);
+                    }
+                }
+            }
+            cmds.extend(crate::sync::started(model));
         }
         ToxEvent::Address(addr) => {
             model.domain.tox_id = addr;
@@ -1640,16 +1679,13 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
 fn handle_io_event(model: &mut Model, event: IOEvent) -> Vec<Cmd> {
     let mut cmds = Vec::new();
     match event {
-        IOEvent::ProfileSaved => {
-            model.add_console_message(
-                ConsoleMessageType::Status,
-                "Profile saved successfully.".to_owned(),
-            );
-        }
         IOEvent::Error(e) => {
             model.add_console_message(ConsoleMessageType::Error, format!("I/O Error: {}", e));
         }
         IOEvent::FileStarted(pk, file_id, path, size) => {
+            if let Some(started) = files::started(model, pk, file_id, path.clone(), size) {
+                return started;
+            }
             let filename = std::path::Path::new(&path)
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -1664,8 +1700,6 @@ fn handle_io_event(model: &mut Model, event: IOEvent) -> Vec<Cmd> {
                     transferred: 0,
                     is_receiving: false,
                     status: TransferStatus::Active,
-                    file_kind: 0,
-                    file_path: Some(path.clone()),
                     speed: 0.0,
                     last_update: model.time_provider.now(),
                     last_transferred: 0,
@@ -1673,12 +1707,19 @@ fn handle_io_event(model: &mut Model, event: IOEvent) -> Vec<Cmd> {
                 },
             );
 
-            // Add inline message for outgoing transfer
+            // Add inline message for outgoing transfer, unless it's a
+            // device's, which has one.
+            // One sent again after it ended, as when resumed, is new.
             let window_id = WindowId::Friend(pk);
-            if let Some(msg) =
+            if model.file_message(pk, file_id).is_none_or(|msg| {
+                matches!(
+                    msg.status,
+                    MessageStatus::Failed | MessageStatus::Sent(_) | MessageStatus::Received
+                )
+            }) && let Some(msg) =
                 model.add_file_transfer_message(window_id, true, file_id, filename, size, false)
             {
-                cmds.push(Cmd::IO(IOAction::LogMessage(window_id, msg)));
+                cmds.extend(model.record(window_id, &msg));
             }
 
             cmds.push(Cmd::IO(IOAction::OpenFileForSending(pk, file_id, path)));
@@ -1699,6 +1740,9 @@ fn handle_io_event(model: &mut Model, event: IOEvent) -> Vec<Cmd> {
             }
         }
         IOEvent::FileChunkWritten(pk, file_id, position, len) => {
+            if let Some(progressed) = files::progressed(model, pk, file_id, position + len as u64) {
+                return progressed;
+            }
             let mut update = None;
             if let Some(p) = model.domain.file_transfers.get_mut(&file_id) {
                 p.update_speed(model.time_provider.now(), position + len as u64);
@@ -1709,14 +1753,24 @@ fn handle_io_event(model: &mut Model, event: IOEvent) -> Vec<Cmd> {
                     crate::utils::format_speed(p.speed),
                 ));
                 if p.transferred >= p.total_size {
-                    cmds.push(Cmd::IO(IOAction::CloseFile(pk, file_id)));
+                    model.session.finishing.insert(file_id);
+                    cmds.push(Cmd::IO(IOAction::FinishFile(pk, file_id)));
                 }
             }
             if let Some((transferred, total_size, speed)) = update {
                 model.update_file_progress(pk, file_id, transferred, total_size, speed);
             }
         }
-        IOEvent::FileFinished(pk, file_id) => {
+        IOEvent::FileFinished(pk, file_id, blob) => {
+            model.session.finishing.remove(&file_id);
+            if let Some(blob) = blob {
+                model.blobs.insert(blob);
+                if let Some(crate::model::MessageContent::FileTransfer { blob: held, .. }) =
+                    model.file_message(pk, file_id).map(|msg| &mut msg.content)
+                {
+                    *held = Some(blob);
+                }
+            }
             let is_receiving = model
                 .domain
                 .file_transfers
@@ -1734,7 +1788,7 @@ fn handle_io_event(model: &mut Model, event: IOEvent) -> Vec<Cmd> {
             };
 
             if let Some(msg) = model.update_file_status(pk, file_id, status) {
-                cmds.push(Cmd::IO(IOAction::LogMessage(WindowId::Friend(pk), msg)));
+                cmds.extend(model.record(WindowId::Friend(pk), &msg));
             }
 
             model.add_console_message(
@@ -1744,12 +1798,16 @@ fn handle_io_event(model: &mut Model, event: IOEvent) -> Vec<Cmd> {
         }
         IOEvent::FileError(pk, file_id, err) => {
             model.add_console_message(ConsoleMessageType::Error, format!("File error: {}", err));
+            if let Some(stopped) = files::stopped(model, pk, file_id) {
+                return stopped;
+            }
             model.domain.file_transfers.remove(&file_id);
             if let Some(msg) = model.update_file_status(pk, file_id, MessageStatus::Failed) {
-                cmds.push(Cmd::IO(IOAction::LogMessage(WindowId::Friend(pk), msg)));
+                cmds.extend(model.record(WindowId::Friend(pk), &msg));
             }
         }
-        _ => {}
+        IOEvent::BlobMissing(pk, blob) => cmds.extend(files::missing(model, pk, blob)),
+        IOEvent::BlobStored(pk, blob, ok) => cmds.extend(files::stored(model, pk, blob, ok)),
     }
     cmds
 }
@@ -1774,52 +1832,23 @@ fn handle_system_event(model: &mut Model, event: SystemEvent) -> Vec<Cmd> {
                 for (&window_id, conv) in &model.domain.conversations {
                     for msg in &conv.messages {
                         if msg.status == MessageStatus::Pending
-                            && let Some(content) = msg.content.as_text()
+                            && let Some(bytes) = model.tox_bytes(window_id, msg)
                         {
-                            resends.push((
-                                window_id,
-                                msg.internal_id,
-                                msg.message_type,
-                                content.to_owned(),
-                            ));
+                            resends.push((window_id, msg.internal_id, msg.message_type, bytes));
                         }
                     }
                 }
 
                 for (window_id, internal_id, message_type, content) in resends {
-                    if let Some(msg) =
-                        model.mark_message_status(window_id, internal_id, MessageStatus::Sending)
-                    {
-                        cmds.push(Cmd::IO(IOAction::LogMessage(window_id, msg)));
-                    }
-                    match window_id {
-                        WindowId::Friend(pk) => {
-                            cmds.push(Cmd::Tox(ToxAction::SendMessage(
-                                pk,
-                                message_type,
-                                content,
-                                internal_id,
-                            )));
-                        }
-                        WindowId::Group(chat_id) => {
-                            cmds.push(Cmd::Tox(ToxAction::SendGroupMessage(
-                                chat_id,
-                                message_type,
-                                content,
-                                internal_id,
-                            )));
-                        }
-                        WindowId::Conference(conf_id) => {
-                            cmds.push(Cmd::Tox(ToxAction::SendConferenceMessage(
-                                conf_id,
-                                message_type,
-                                content,
-                                internal_id,
-                            )));
-                        }
-                        _ => {}
-                    }
+                    cmds.extend(send_pending(
+                        model,
+                        window_id,
+                        internal_id,
+                        message_type,
+                        content,
+                    ));
                 }
+                cmds.extend(files::send_pending(model));
             }
         }
         SystemEvent::Log {
@@ -1848,11 +1877,10 @@ fn handle_system_event(model: &mut Model, event: SystemEvent) -> Vec<Cmd> {
                         crate::model::MessageContent::Text(message),
                     )
                 {
-                    cmds.push(Cmd::IO(IOAction::LogMessage(wid, msg)));
+                    cmds.extend(model.record(wid, &msg));
                 }
             }
         }
-        _ => {}
     }
     cmds
 }
@@ -1897,12 +1925,7 @@ pub fn handle_enter(model: &mut Model, input_line: &str) -> Vec<Cmd> {
             );
             vec![]
         } else {
-            let limit = match window_id {
-                WindowId::Group(_) => GROUP_MAX_MESSAGE_LENGTH,
-                _ => MAX_MESSAGE_LENGTH,
-            };
-
-            let parts = split_message(input_line, limit);
+            let parts = split_message(input_line, message_limit(window_id));
             let mut cmds = Vec::new();
 
             for part in parts {
@@ -1911,18 +1934,18 @@ pub fn handle_enter(model: &mut Model, input_line: &str) -> Vec<Cmd> {
                     MessageType::TOX_MESSAGE_TYPE_NORMAL,
                     part.to_string(),
                 );
-                cmds.push(Cmd::IO(IOAction::LogMessage(window_id, msg)));
+                cmds.extend(model.record(window_id, &msg));
                 if let Some(updated_msg) =
                     model.mark_message_status(window_id, internal_id, MessageStatus::Sending)
                 {
-                    cmds.push(Cmd::IO(IOAction::LogMessage(window_id, updated_msg)));
+                    cmds.extend(model.record(window_id, &updated_msg));
                 }
                 match window_id {
                     WindowId::Friend(pk) => {
                         cmds.push(Cmd::Tox(ToxAction::SendMessage(
                             pk,
                             MessageType::TOX_MESSAGE_TYPE_NORMAL,
-                            part,
+                            part.into_bytes(),
                             internal_id,
                         )));
                     }
@@ -1930,7 +1953,7 @@ pub fn handle_enter(model: &mut Model, input_line: &str) -> Vec<Cmd> {
                         cmds.push(Cmd::Tox(ToxAction::SendGroupMessage(
                             chat_id,
                             MessageType::TOX_MESSAGE_TYPE_NORMAL,
-                            part,
+                            part.into_bytes(),
                             internal_id,
                         )));
                     }
@@ -1938,7 +1961,7 @@ pub fn handle_enter(model: &mut Model, input_line: &str) -> Vec<Cmd> {
                         cmds.push(Cmd::Tox(ToxAction::SendConferenceMessage(
                             conf_id,
                             MessageType::TOX_MESSAGE_TYPE_NORMAL,
-                            part,
+                            part.into_bytes(),
                             internal_id,
                         )));
                     }
@@ -1989,4 +2012,49 @@ fn update_typing_status(model: &mut Model) -> Vec<Cmd> {
         }
     }
     vec![]
+}
+
+/// The most bytes Tox takes in a message in `window_id`.
+fn message_limit(window_id: WindowId) -> usize {
+    match window_id {
+        WindowId::Group(_) => GROUP_MAX_MESSAGE_LENGTH,
+        _ => MAX_MESSAGE_LENGTH,
+    }
+}
+
+/// Sends a pending message, which stays `Sending` until Tox takes it.
+pub fn send_pending(
+    model: &mut Model,
+    window_id: WindowId,
+    internal_id: InternalMessageId,
+    message_type: MessageType,
+    content: Vec<u8>,
+) -> Vec<Cmd> {
+    let mut cmds = Vec::new();
+    if let Some(msg) = model.mark_message_status(window_id, internal_id, MessageStatus::Sending) {
+        cmds.extend(model.record(window_id, &msg));
+    }
+    // A device's message can be longer than Tox takes. Its parts go as the
+    // one message, delivered once the last part is.
+    let limit = message_limit(window_id);
+    let parts: Vec<Vec<u8>> = match String::from_utf8(content) {
+        Ok(text) => split_message(&text, limit)
+            .into_iter()
+            .map(String::into_bytes)
+            .collect(),
+        Err(e) => e.into_bytes().chunks(limit).map(<[u8]>::to_vec).collect(),
+    };
+    for part in parts {
+        cmds.push(Cmd::Tox(match window_id {
+            WindowId::Friend(pk) => ToxAction::SendMessage(pk, message_type, part, internal_id),
+            WindowId::Group(chat_id) => {
+                ToxAction::SendGroupMessage(chat_id, message_type, part, internal_id)
+            }
+            WindowId::Conference(conf_id) => {
+                ToxAction::SendConferenceMessage(conf_id, message_type, part, internal_id)
+            }
+            WindowId::Console | WindowId::Logs | WindowId::Files => return cmds,
+        }));
+    }
+    cmds
 }

@@ -2,26 +2,16 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, Ke
 use ratatui::{Terminal, backend::TestBackend};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
-use toxcore::tox::{Address, ToxConnection, ToxUserStatus};
+use toxcore::tox::ToxConnection;
 use toxcore::types::{MessageType, PublicKey};
-use toxxi::config::Config;
-use toxxi::model::{DomainState, InputMode, Model};
+use toxxi::model::{InputMode, Model};
 use toxxi::msg::Msg;
-use toxxi::testing::{buffer_to_string, configure_insta};
+use toxxi::testing::{self, buffer_to_string, configure_insta};
 use toxxi::time::FakeTimeProvider;
 use toxxi::ui::draw;
 use toxxi::update::update;
 
 fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "I am a test".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-
     // Fixed time: 2023-01-01 12:00:00 UTC (1672574400)
     let fixed_system_time = UNIX_EPOCH + Duration::from_secs(1672574400);
     // Use actual Instant::now() as base, it doesn't matter for display as long as it's consistent within run
@@ -29,7 +19,7 @@ fn create_test_model() -> Model {
 
     let tp = Arc::new(FakeTimeProvider::new(fixed_instant, fixed_system_time));
 
-    Model::new(domain, config.clone(), config).with_time_provider(tp)
+    testing::create_test_model().with_time_provider(tp)
 }
 
 #[test]
@@ -68,8 +58,6 @@ fn test_ui_chat_interaction_snapshot() {
             public_key: Some(pk),
             status_message: "Happy".to_string(),
             connection: ToxConnection::TOX_CONNECTION_TCP,
-            last_sent_message_id: None,
-            last_read_receipt: None,
             is_typing: false,
         },
     );
@@ -117,8 +105,6 @@ fn test_ui_input_lorem_ipsum_snapshot() {
             public_key: Some(pk),
             status_message: "Reading".to_string(),
             connection: ToxConnection::TOX_CONNECTION_TCP,
-            last_sent_message_id: None,
-            last_read_receipt: None,
             is_typing: false,
         },
     );
@@ -179,8 +165,6 @@ fn test_ui_multiline_mode_snapshot() {
             public_key: Some(pk),
             status_message: "Reading".to_string(),
             connection: ToxConnection::TOX_CONNECTION_TCP,
-            last_sent_message_id: None,
-            last_read_receipt: None,
             is_typing: false,
         },
     );
@@ -257,8 +241,6 @@ fn test_ui_multiple_friends_snapshot() {
             public_key: Some(pk_bob),
             status_message: "".to_string(),
             connection: ToxConnection::TOX_CONNECTION_TCP,
-            last_sent_message_id: None,
-            last_read_receipt: None,
             is_typing: false,
         },
     );
@@ -275,8 +257,6 @@ fn test_ui_multiple_friends_snapshot() {
             public_key: Some(pk_charlie),
             status_message: "Busy".to_string(),
             connection: ToxConnection::TOX_CONNECTION_UDP,
-            last_sent_message_id: None,
-            last_read_receipt: None,
             is_typing: false,
         },
     );
@@ -293,8 +273,6 @@ fn test_ui_multiple_friends_snapshot() {
             public_key: Some(pk_dave),
             status_message: "".to_string(),
             connection: ToxConnection::TOX_CONNECTION_NONE,
-            last_sent_message_id: None,
-            last_read_receipt: None,
             is_typing: false,
         },
     );
@@ -311,8 +289,6 @@ fn test_ui_multiple_friends_snapshot() {
             public_key: Some(pk_eve),
             status_message: "".to_string(),
             connection: ToxConnection::TOX_CONNECTION_TCP,
-            last_sent_message_id: None,
-            last_read_receipt: None,
             is_typing: false,
         },
     );
@@ -329,8 +305,6 @@ fn test_ui_multiple_friends_snapshot() {
             public_key: Some(pk_frank),
             status_message: "".to_string(),
             connection: ToxConnection::TOX_CONNECTION_TCP,
-            last_sent_message_id: None,
-            last_read_receipt: None,
             is_typing: false,
         },
     );
@@ -466,8 +440,6 @@ fn test_ui_command_menu_popup_snapshot() {
             public_key: Some(pk),
             status_message: "Happy".to_string(),
             connection: ToxConnection::TOX_CONNECTION_TCP,
-            last_sent_message_id: None,
-            last_read_receipt: None,
             is_typing: false,
         },
     );
@@ -522,8 +494,6 @@ fn test_ui_popup_completion_position_snapshot() {
             public_key: Some(pk),
             status_message: "Happy".to_string(),
             connection: ToxConnection::TOX_CONNECTION_TCP,
-            last_sent_message_id: None,
-            last_read_receipt: None,
             is_typing: false,
         },
     );

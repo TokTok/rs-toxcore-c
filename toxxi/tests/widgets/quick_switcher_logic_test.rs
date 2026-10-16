@@ -1,19 +1,23 @@
+use toxxi::model::WindowId;
 use toxxi::widgets::{QuickSwitcherItem, QuickSwitcherState};
 
 #[test]
 fn test_quick_switcher_filtering_basics() {
     let items = vec![
         QuickSwitcherItem {
+            window: WindowId::Console,
             name: "Alice".to_string(),
             description: "Friend".to_string(),
             prefix: "f".to_string(),
         },
         QuickSwitcherItem {
+            window: WindowId::Console,
             name: "Bob".to_string(),
             description: "Friend".to_string(),
             prefix: "f".to_string(),
         },
         QuickSwitcherItem {
+            window: WindowId::Console,
             name: "Rust Group".to_string(),
             description: "Group".to_string(),
             prefix: "g".to_string(),
@@ -50,16 +54,19 @@ fn test_quick_switcher_filtering_basics() {
 fn test_quick_switcher_navigation() {
     let items = vec![
         QuickSwitcherItem {
+            window: WindowId::Console,
             name: "Alice".to_string(),
             description: "Friend".to_string(),
             prefix: "f".to_string(),
         },
         QuickSwitcherItem {
+            window: WindowId::Console,
             name: "Bob".to_string(),
             description: "Friend".to_string(),
             prefix: "f".to_string(),
         },
         QuickSwitcherItem {
+            window: WindowId::Console,
             name: "Charlie".to_string(),
             description: "Friend".to_string(),
             prefix: "f".to_string(),
@@ -86,16 +93,19 @@ fn test_quick_switcher_navigation() {
 fn test_quick_switcher_navigation_with_filter() {
     let items = vec![
         QuickSwitcherItem {
+            window: WindowId::Console,
             name: "Alice".to_string(),
             description: "Friend".to_string(),
             prefix: "f".to_string(),
         },
         QuickSwitcherItem {
+            window: WindowId::Console,
             name: "Bob".to_string(),
             description: "Friend".to_string(),
             prefix: "f".to_string(),
         },
         QuickSwitcherItem {
+            window: WindowId::Console,
             name: "Rust Group".to_string(),
             description: "Group".to_string(),
             prefix: "g".to_string(),
@@ -117,6 +127,7 @@ fn test_quick_switcher_navigation_with_filter() {
 #[test]
 fn test_quick_switcher_invalid_prefix() {
     let items = vec![QuickSwitcherItem {
+        window: WindowId::Console,
         name: "Alice".to_string(),
         description: "Friend".to_string(),
         prefix: "f".to_string(),
@@ -138,11 +149,13 @@ fn test_quick_switcher_invalid_prefix() {
 fn test_quick_switcher_history_search() {
     let items = vec![
         QuickSwitcherItem {
+            window: WindowId::Console,
             name: "Alice".to_string(),
             description: "I want pizza".to_string(),
             prefix: "h".to_string(),
         },
         QuickSwitcherItem {
+            window: WindowId::Console,
             name: "Bob".to_string(),
             description: "Pizza is good".to_string(),
             prefix: "h".to_string(),

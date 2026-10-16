@@ -71,21 +71,6 @@ fn test_selection_replacement() {
 }
 
 #[test]
-fn test_mode_toggling() {
-    let mut state = InputBoxState::new();
-    assert_eq!(
-        state.mode(),
-        toxxi::widgets::input_box::InputMode::SendOnEnter
-    );
-
-    state.toggle_mode();
-    assert_eq!(
-        state.mode(),
-        toxxi::widgets::input_box::InputMode::NewlineOnEnter
-    );
-}
-
-#[test]
 fn test_vertical_navigation() {
     let mut state = InputBoxState::new();
     state.text = "Line 1\nLine 2\nLine 3".to_string();

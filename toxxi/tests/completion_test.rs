@@ -1,21 +1,11 @@
-use toxcore::tox::{
-    Address, ConferenceNumber, FriendNumber, GroupNumber, ToxConnection, ToxUserStatus,
-};
+use toxcore::tox::{ConferenceNumber, FriendNumber, GroupNumber, ToxConnection, ToxUserStatus};
 use toxcore::types::PublicKey;
 use toxxi::completion::{self, complete_command_arguments, complete_text};
-use toxxi::config::Config;
-use toxxi::model::{DomainState, FriendInfo, Model, PeerId, PeerInfo, WindowId};
+use toxxi::model::{FriendInfo, Model, PeerId, PeerInfo, WindowId};
+use toxxi::testing;
 
 fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "I am a test".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    let mut model = Model::new(domain, config.clone(), config);
+    let mut model = testing::create_test_model();
 
     let pk_alice = PublicKey([10u8; 32]);
     let pk_bob = PublicKey([11u8; 32]);
@@ -27,8 +17,6 @@ fn create_test_model() -> Model {
             public_key: Some(pk_alice),
             status_message: "".to_string(),
             connection: ToxConnection::TOX_CONNECTION_NONE,
-            last_sent_message_id: None,
-            last_read_receipt: None,
             is_typing: false,
         },
     );
@@ -44,8 +32,6 @@ fn create_test_model() -> Model {
             public_key: Some(pk_bob),
             status_message: "".to_string(),
             connection: ToxConnection::TOX_CONNECTION_NONE,
-            last_sent_message_id: None,
-            last_read_receipt: None,
             is_typing: false,
         },
     );
@@ -91,6 +77,18 @@ fn test_set_completion() {
 }
 
 #[test]
+fn test_set_completion_only_offers_settable_keys() {
+    let model = create_test_model();
+    let keys: Vec<String> = complete_command_arguments("/set ", &model)
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+    // blocked_strings is managed by /block, and /set rejects it.
+    assert!(!keys.contains(&"blocked_strings".to_owned()));
+    assert!(keys.contains(&"ipv6_enabled".to_owned()));
+}
+
+#[test]
 fn test_friend_command_completion() {
     let mut model = create_test_model();
 
@@ -117,8 +115,6 @@ fn test_friend_command_completion() {
             public_key: Some(pk_charlie),
             status_message: "".to_string(),
             connection: ToxConnection::TOX_CONNECTION_NONE,
-            last_sent_message_id: None,
-            last_read_receipt: None,
             is_typing: false,
         },
     );

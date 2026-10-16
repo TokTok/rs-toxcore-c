@@ -1,44 +1,10 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use toxcore::tox::Address;
-use toxcore::tox::{FriendNumber, ToxConnection, ToxUserStatus};
+use toxcore::tox::FriendNumber;
 use toxcore::types::{FileId, PublicKey};
-use toxxi::config::Config;
-use toxxi::model::{DomainState, FriendInfo, Model, WindowId};
+use toxxi::model::WindowId;
 use toxxi::msg::{Cmd, Msg, ToxAction, ToxEvent};
+use toxxi::testing::{add_test_friend, create_test_model, send_key};
 use toxxi::update::{handle_enter, update};
-
-fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "I am a test".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    Model::new(domain, config.clone(), config)
-}
-
-fn add_test_friend(model: &mut Model, fid: FriendNumber, pk: PublicKey) {
-    model.session.friend_numbers.insert(fid, pk);
-    model.domain.friends.insert(
-        pk,
-        FriendInfo {
-            name: format!("Friend {}", fid.0),
-            public_key: Some(pk),
-            status_message: "".to_string(),
-            connection: ToxConnection::TOX_CONNECTION_TCP,
-            last_sent_message_id: None,
-            last_read_receipt: None,
-            is_typing: false,
-        },
-    );
-    model.ensure_friend_window(pk);
-}
-
-fn key_event(code: KeyCode) -> Msg {
-    Msg::Input(Event::Key(KeyEvent::new(code, KeyModifiers::empty())))
-}
 
 #[test]
 fn test_file_list_command_opens_window() {
@@ -92,17 +58,17 @@ fn test_file_manager_navigation() {
     );
 
     handle_enter(&mut model, "/file list");
-    update(&mut model, key_event(KeyCode::Esc)); // Navigation mode
+    send_key(&mut model, KeyCode::Esc, KeyModifiers::NONE); // Navigation mode
 
     let state = model.ui.window_state.get(&WindowId::Files).unwrap();
     assert_eq!(state.msg_list_state.selected_index, Some(2)); // Last item selected by default
 
-    update(&mut model, key_event(KeyCode::Up));
+    send_key(&mut model, KeyCode::Up, KeyModifiers::NONE);
     let state = model.ui.window_state.get(&WindowId::Files).unwrap();
     assert_eq!(state.msg_list_state.selected_index, Some(1));
 
     // Test 'p' in File Manager
-    let cmds = update(&mut model, key_event(KeyCode::Char('p')));
+    let cmds = send_key(&mut model, KeyCode::Char('p'), KeyModifiers::NONE);
     assert!(
         cmds.iter()
             .any(|c| matches!(c, Cmd::Tox(ToxAction::FileControl(..))))

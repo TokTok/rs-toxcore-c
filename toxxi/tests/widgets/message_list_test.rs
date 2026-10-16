@@ -6,37 +6,23 @@ use toxxi::widgets::{ChatMessage, MessageContent, MessageList, MessageListState,
 fn test_render_message_list_rich_content() {
     let backend = TestBackend::new(80, 15);
     let mut terminal = Terminal::new(backend).unwrap();
-    let messages = vec![
-        ChatMessage {
-            sender: "Alice".to_string(),
-            timestamp: "12:00".to_string(),
-            unix_timestamp: 1736251200,
-            content: MessageContent::FileTransfer {
-                name: "vacation.jpg".to_string(),
-                size: 2 * 1024 * 1024,
-                progress: 0.5,
-                speed: "1.2 MB/s".to_string(),
-                is_incoming: true,
-                paused: false,
-                eta: "1s".to_string(),
-            },
-            status: MessageStatus::Delivered,
-            is_me: false,
-            highlighted: false,
+    let messages = vec![ChatMessage {
+        sender: "Alice".to_string(),
+        timestamp: "12:00".to_string(),
+        unix_timestamp: 1736251200,
+        content: MessageContent::FileTransfer {
+            name: "vacation.jpg".to_string(),
+            size: 2 * 1024 * 1024,
+            progress: 0.5,
+            speed: "1.2 MB/s".to_string(),
+            is_incoming: true,
+            paused: false,
+            eta: "1s".to_string(),
         },
-        ChatMessage {
-            sender: "Bob".to_string(),
-            timestamp: "12:01".to_string(),
-            unix_timestamp: 1736251260,
-            content: MessageContent::GameInvite {
-                game_type: "Chess".to_string(),
-                challenger: "Bob".to_string(),
-            },
-            status: MessageStatus::Delivered,
-            is_me: false,
-            highlighted: false,
-        },
-    ];
+        status: MessageStatus::Delivered,
+        is_me: false,
+        highlighted: false,
+    }];
     let mut state = MessageListState::default();
 
     terminal
@@ -168,7 +154,7 @@ fn test_render_message_list_wide() {
             timestamp: "12:01".to_string(),
             unix_timestamp: 1736251260,
             content: MessageContent::Text("Hey Alice, how are you?".to_string()),
-            status: MessageStatus::Read,
+            status: MessageStatus::Delivered,
             is_me: true,
             highlighted: false,
         },
@@ -218,7 +204,7 @@ fn test_render_message_list_narrow() {
             timestamp: "12:01".to_string(),
             unix_timestamp: 1736251260,
             content: MessageContent::Text("Hey Alice!".to_string()),
-            status: MessageStatus::Read,
+            status: MessageStatus::Delivered,
             is_me: true,
             highlighted: false,
         },

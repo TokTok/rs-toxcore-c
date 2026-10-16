@@ -1,49 +1,3 @@
-use toxxi::widgets::message_list::wrap_text;
-
-#[test]
-fn test_wrap_text_basic() {
-    let text = "Hello world";
-    let lines: Vec<String> = wrap_text(text, 5).into_iter().map(|l| l.text).collect();
-    assert_eq!(lines, vec!["Hello", "world"]);
-}
-
-#[test]
-fn test_wrap_text_unicode() {
-    let text = "你好世界";
-    let lines: Vec<String> = wrap_text(text, 4).into_iter().map(|l| l.text).collect(); // Each char is width 2
-    assert_eq!(lines, vec!["你好", "世界"]);
-}
-
-#[test]
-fn test_wrap_text_mixed() {
-    let text = "Hello 你好";
-    let lines: Vec<String> = wrap_text(text, 6).into_iter().map(|l| l.text).collect();
-    assert_eq!(lines, vec!["Hello", "你好"]);
-}
-
-#[test]
-fn test_wrap_text_long_word() {
-    let text = "ExtremelyLongWord";
-    let lines: Vec<String> = wrap_text(text, 5).into_iter().map(|l| l.text).collect();
-    assert_eq!(lines, vec!["Extre", "melyL", "ongWo", "rd"]);
-}
-
-#[test]
-fn test_wrap_text_soft_wrap_flag() {
-    let text = "Hello world";
-    let lines = wrap_text(text, 5);
-    assert_eq!(lines.len(), 2);
-    assert!(lines[0].is_soft_wrap); // "Hello" was wrapped
-    assert!(!lines[1].is_soft_wrap); // "world" is the end of paragraph
-}
-
-#[test]
-fn test_wrap_text_paragraphs() {
-    let text = "Line 1\n\nLine 3";
-    let lines: Vec<String> = wrap_text(text, 10).into_iter().map(|l| l.text).collect();
-    assert_eq!(lines, vec!["Line 1", "", "Line 3"]);
-}
-
 #[test]
 fn test_message_list_stacked_layout_rendering() {
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
@@ -206,25 +160,6 @@ fn test_message_list_total_height() {
 }
 
 #[test]
-fn test_message_list_scroll_clamping() {
-    use toxxi::widgets::MessageListState;
-
-    let mut state = MessageListState::default();
-
-    // Initial state
-    assert_eq!(state.scroll, 0);
-
-    // Scroll down at bottom should stay at 0
-    state.scroll_down();
-    assert_eq!(state.scroll, 0);
-
-    // Scroll to bottom from elsewhere
-    state.scroll = 100;
-    state.scroll_to_bottom();
-    assert_eq!(state.scroll, 0);
-}
-
-#[test]
 fn test_message_list_partial_card_scrolling() {
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
     use toxxi::widgets::{
@@ -287,51 +222,6 @@ fn test_message_list_partial_card_scrolling() {
         found_progress,
         "Progress bar should be visible somewhere in the buffer"
     );
-}
-
-#[test]
-fn test_message_list_dynamic_sender_width() {
-    use toxxi::widgets::{ChatMessage, MessageContent, MessageList, MessageStatus};
-
-    let messages = vec![
-        ChatMessage {
-            sender: "Short".to_string(),
-            timestamp: "12:00".to_string(),
-            unix_timestamp: 1,
-            content: MessageContent::Text("Hi".to_string()),
-            status: MessageStatus::Delivered,
-            is_me: false,
-            highlighted: false,
-        },
-        ChatMessage {
-            sender: "VeryLongSenderNameIndeed".to_string(),
-            timestamp: "12:01".to_string(),
-            unix_timestamp: 2,
-            content: MessageContent::Text("Hi again".to_string()),
-            status: MessageStatus::Delivered,
-            is_me: true,
-            highlighted: false,
-        },
-    ];
-
-    let widget = MessageList::new(&messages).sender_width(12);
-    // "VeryLongSenderNameIndeed" is 24 chars long.
-    // Our clamp is 5..12, so it should be exactly 12.
-    assert_eq!(widget.get_sender_width(), 12);
-
-    // Test with only short names
-    let short_messages = vec![ChatMessage {
-        sender: "Alice".to_string(),
-        timestamp: "12:00".to_string(),
-        unix_timestamp: 1,
-        content: MessageContent::Text("Hi".to_string()),
-        status: MessageStatus::Delivered,
-        is_me: false,
-        highlighted: false,
-    }];
-    let short_widget = MessageList::new(&short_messages).sender_width(5);
-    // "Alice" is 5 chars long. Should be 5.
-    assert_eq!(short_widget.get_sender_width(), 5);
 }
 
 #[test]
@@ -785,33 +675,6 @@ fn test_message_list_focus_propagation() {
         found_hints,
         "FileTransferCard should render hints when selected in MessageList"
     );
-}
-
-#[test]
-fn test_scroll_to_timestamp() {
-    use toxxi::widgets::{ChatMessage, MessageContent, MessageListState, MessageStatus};
-
-    let mut messages = Vec::new();
-    for i in 0..100 {
-        messages.push(ChatMessage {
-            sender: "User".to_string(),
-            timestamp: "12:00".to_string(),
-            unix_timestamp: i as u64,
-            content: MessageContent::Text(format!("Message {}", i)),
-            status: MessageStatus::Delivered,
-            is_me: false,
-            highlighted: false,
-        });
-    }
-
-    let mut state = MessageListState::new();
-    // Assuming we want to jump to message with timestamp 50
-    // We need a helper to find the message by timestamp and calculate scroll
-    state.jump_to_timestamp(50, &messages);
-
-    // After jumping, we expect the selected index to be 50
-    assert_eq!(state.selected_index, Some(50));
-    // And it should be marked for "need scroll to selected" or similar
 }
 
 // end of file

@@ -1,23 +1,11 @@
 use ratatui::{Terminal, backend::TestBackend};
-use toxcore::tox::{Address, FriendMessageId, ToxUserStatus};
+use toxcore::tox::FriendMessageId;
 use toxcore::types::{MessageType, PublicKey};
-use toxxi::config::Config;
-use toxxi::model::{ConsoleMessageType, DomainState, Model, WindowId};
+use toxxi::model::{ConsoleMessageType, WindowId};
 use toxxi::msg::{Msg, ToxEvent};
+use toxxi::testing::create_test_model;
 use toxxi::ui::draw;
 use toxxi::update::update;
-
-fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "I am a test".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    Model::new(domain, config.clone(), config)
-}
 
 #[test]
 fn test_ui_read_receipt_suffix() {
@@ -236,7 +224,7 @@ fn test_ui_scrollbar_visibility() {
 
     // 1. Add few messages (less than area height of 5)
     for i in 0..3 {
-        model.add_console_message(ConsoleMessageType::Log, format!("log {}", i));
+        model.add_console_message(ConsoleMessageType::Info, format!("log {}", i));
     }
 
     let backend = TestBackend::new(80, 10);
@@ -252,7 +240,7 @@ fn test_ui_scrollbar_visibility() {
 
     // 2. Add many messages
     for i in 3..20 {
-        model.add_console_message(ConsoleMessageType::Log, format!("log {}", i));
+        model.add_console_message(ConsoleMessageType::Info, format!("log {}", i));
     }
 
     terminal.draw(|f| draw(f, &mut model)).unwrap();
@@ -394,7 +382,7 @@ fn test_ui_scrollbar_consistency() {
     // Thumb ratio = 55/800 = 0.068.
     // Thumb size = 55 * 0.068 = ~3.7 lines.
     for i in 0..800 {
-        model.add_console_message(ConsoleMessageType::Log, format!("log {}", i));
+        model.add_console_message(ConsoleMessageType::Info, format!("log {}", i));
     }
 
     let height = 60;
@@ -492,8 +480,6 @@ fn test_ui_sidebar_friend_name_fallback() {
             public_key: Some(pk),
             status_message: "I am a potato".to_string(),
             connection: toxcore::tox::ToxConnection::TOX_CONNECTION_TCP,
-            last_sent_message_id: None,
-            last_read_receipt: None,
             is_typing: false,
         },
     );
@@ -556,8 +542,6 @@ fn test_ui_sidebar_selection_highlight() {
             public_key: Some(pk),
             status_message: "".into(),
             connection: toxcore::tox::ToxConnection::TOX_CONNECTION_TCP,
-            last_sent_message_id: None,
-            last_read_receipt: None,
             is_typing: false,
         },
     );

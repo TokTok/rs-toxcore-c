@@ -1,42 +1,11 @@
 use ratatui::{Terminal, backend::TestBackend};
-use toxcore::tox::{Address, FriendNumber, ToxConnection, ToxUserStatus};
+use toxcore::tox::FriendNumber;
 use toxcore::types::{FileId, MessageType, PublicKey};
-use toxxi::config::Config;
-use toxxi::model::{
-    DomainState, FileTransferProgress, FriendInfo, MessageStatus, Model, TransferStatus, WindowId,
-};
+use toxxi::model::{FileTransferProgress, MessageStatus, TransferStatus, WindowId};
 use toxxi::msg::{IOEvent, Msg, ToxEvent};
+use toxxi::testing::{add_test_friend, create_test_model};
 use toxxi::ui::draw;
 use toxxi::update::update;
-
-fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "I am a test".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    Model::new(domain, config.clone(), config)
-}
-
-fn add_test_friend(model: &mut Model, fid: FriendNumber, pk: PublicKey) {
-    model.session.friend_numbers.insert(fid, pk);
-    model.domain.friends.insert(
-        pk,
-        FriendInfo {
-            name: format!("Friend {}", fid.0),
-            public_key: Some(pk),
-            status_message: "".to_string(),
-            connection: ToxConnection::TOX_CONNECTION_TCP,
-            last_sent_message_id: None,
-            last_read_receipt: None,
-            is_typing: false,
-        },
-    );
-    model.ensure_friend_window(pk);
-}
 
 #[test]
 fn test_ui_file_transfer_sidebar_removed() {
@@ -57,8 +26,6 @@ fn test_ui_file_transfer_sidebar_removed() {
             transferred: 512, // 50%
             is_receiving: true,
             status: TransferStatus::Active,
-            file_kind: 0,
-            file_path: None,
             speed: 0.0,
             last_update: model.time_provider.now(),
             last_transferred: 512,
@@ -120,6 +87,7 @@ fn test_ui_inline_file_transfer_card() {
                 progress: 0.75,
                 speed: "10 KB/s".to_string(),
                 is_incoming: true,
+                blob: None,
             },
             timestamp: model.time_provider.now_local(),
             status: MessageStatus::Incoming,
@@ -329,7 +297,10 @@ fn test_ui_file_transfer_reuse() {
     );
 
     // Simulate finish
-    update(&mut model, Msg::IO(IOEvent::FileFinished(pk, file_id)));
+    update(
+        &mut model,
+        Msg::IO(IOEvent::FileFinished(pk, file_id, None)),
+    );
 
     // 2. Second transfer: Reuse ID 100 for testing purposes.
     // In production, IDs are 32-byte hashes and are unlikely to collide.
@@ -398,7 +369,10 @@ fn test_ui_ignore_finished_transfer_interaction() {
             "old_file.txt".to_string(),
         )),
     );
-    update(&mut model, Msg::IO(IOEvent::FileFinished(pk, file_id)));
+    update(
+        &mut model,
+        Msg::IO(IOEvent::FileFinished(pk, file_id, None)),
+    );
 
     // 2. Second transfer (ID 100 reused) -> Active
     update(

@@ -1,33 +1,10 @@
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
-use toxcore::tox::{Address, FriendNumber, GroupNumber, ToxUserStatus};
+use toxcore::tox::{FriendNumber, GroupNumber};
 use toxcore::types::PublicKey;
-use toxxi::config::Config;
-use toxxi::model::{DomainState, Model, WindowId};
-use toxxi::msg::Msg;
+use toxxi::model::WindowId;
+use toxxi::testing::{create_test_model, send_key};
 use toxxi::ui::draw;
-use toxxi::update::update;
-
-fn create_test_model() -> Model {
-    let config = Config::default();
-    let domain = DomainState::new(
-        Address([0u8; 38]),
-        PublicKey([0u8; 32]),
-        "Tester".to_string(),
-        "I am a test".to_string(),
-        ToxUserStatus::TOX_USER_STATUS_NONE,
-    );
-    Model::new(domain, config.clone(), config)
-}
-
-fn create_key_event(code: KeyCode, modifiers: KeyModifiers) -> Event {
-    Event::Key(KeyEvent {
-        code,
-        modifiers,
-        kind: KeyEventKind::Press,
-        state: KeyEventState::empty(),
-    })
-}
 
 #[test]
 fn test_ui_navigation_rendering() {
@@ -47,8 +24,6 @@ fn test_ui_navigation_rendering() {
             public_key: Some(f1_pk),
             status_message: "".to_string(),
             connection: toxcore::tox::ToxConnection::TOX_CONNECTION_NONE,
-            last_sent_message_id: None,
-            last_read_receipt: None,
             is_typing: false,
         },
     );
@@ -86,10 +61,7 @@ fn test_ui_navigation_rendering() {
     );
 
     // 2. Next Window (Ctrl-n) -> Friend 1 ("Alice")
-    update(
-        &mut model,
-        Msg::Input(create_key_event(KeyCode::Char('n'), KeyModifiers::CONTROL)),
-    );
+    send_key(&mut model, KeyCode::Char('n'), KeyModifiers::CONTROL);
     terminal.draw(|f| draw(f, &mut model)).unwrap();
 
     let buffer = terminal.backend().buffer();
@@ -101,10 +73,7 @@ fn test_ui_navigation_rendering() {
     );
 
     // 3. Next Window (Ctrl-n) -> Group 1 ("Rustacean Station")
-    update(
-        &mut model,
-        Msg::Input(create_key_event(KeyCode::Char('n'), KeyModifiers::CONTROL)),
-    );
+    send_key(&mut model, KeyCode::Char('n'), KeyModifiers::CONTROL);
     terminal.draw(|f| draw(f, &mut model)).unwrap();
 
     let buffer = terminal.backend().buffer();
@@ -116,10 +85,7 @@ fn test_ui_navigation_rendering() {
     );
 
     // 4. Previous Window (Ctrl-p) -> Back to Alice
-    update(
-        &mut model,
-        Msg::Input(create_key_event(KeyCode::Char('p'), KeyModifiers::CONTROL)),
-    );
+    send_key(&mut model, KeyCode::Char('p'), KeyModifiers::CONTROL);
 
     terminal.draw(|f| draw(f, &mut model)).unwrap();
 
@@ -132,10 +98,7 @@ fn test_ui_navigation_rendering() {
     );
 
     // 5. Jump to Console (Alt-0)
-    update(
-        &mut model,
-        Msg::Input(create_key_event(KeyCode::Char('0'), KeyModifiers::ALT)),
-    );
+    send_key(&mut model, KeyCode::Char('0'), KeyModifiers::ALT);
     terminal.draw(|f| draw(f, &mut model)).unwrap();
 
     let buffer = terminal.backend().buffer();

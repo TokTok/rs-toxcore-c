@@ -9,7 +9,7 @@ use toxcore::tox::ToxConnection;
 use toxcore::types::{FileId, MAX_FILENAME_LENGTH, PublicKey, ToxFileControl};
 
 use super::event::BlobId;
-use super::protocol::SessionMessage;
+use super::protocol::{BLOB_FILE_KIND, SessionMessage};
 use crate::model::{
     FileTransferProgress, InternalMessageId, MessageContent, MessageStatus, Model, TransferStatus,
     WindowId,
@@ -98,25 +98,30 @@ pub fn wanted(model: &mut Model, device: PublicKey, blob: BlobId) -> Vec<Cmd> {
     if !model.blobs.holds(&blob) {
         return vec![to_device(device, SessionMessage::NoBlob(blob))];
     }
+    send(model, device, blob, BLOB_FILE_KIND)
+}
+
+/// Sends `pk` a blob toxxi holds.
+pub fn send(model: &mut Model, pk: PublicKey, blob: BlobId, kind: u32) -> Vec<Cmd> {
     let sending = model
         .session
         .blob_transfers
         .values()
-        .filter(|t| t.device == device && !t.incoming)
+        .filter(|t| t.device == pk && !t.incoming)
         .count();
     if model.session.blob_transfers.contains_key(&blob) || sending >= MAX_BLOB_SENDS {
-        model.session.blob_queue.push((device, blob));
+        model.session.blob_queue.push((pk, blob, kind));
         return Vec::new();
     }
     model.session.blob_transfers.insert(
         blob,
         BlobTransfer {
-            device,
+            device: pk,
             incoming: false,
             size: None,
         },
     );
-    vec![Cmd::IO(IOAction::SendBlob(device, blob))]
+    vec![Cmd::IO(IOAction::SendBlob(pk, blob, kind))]
 }
 
 /// The file that `wanted` asked Tox for has started.
@@ -138,16 +143,18 @@ pub fn started(
     ))])
 }
 
-/// The blob `wanted` was to send is gone from disk.
+/// The blob `send` was to send is gone from disk.
 pub fn missing(model: &mut Model, device: PublicKey, blob: BlobId) -> Vec<Cmd> {
     model.blobs.forget(&blob);
     let mut cmds = ended(model, blob);
-    cmds.push(to_device(device, SessionMessage::NoBlob(blob)));
+    if model.session.sync_sessions.contains(&device) {
+        cmds.push(to_device(device, SessionMessage::NoBlob(blob)));
+    }
     cmds
 }
 
 /// Asks `device` for `blob`, unless it's on its way.
-fn want(model: &mut Model, device: PublicKey, blob: BlobId) -> Vec<Cmd> {
+pub fn want(model: &mut Model, device: PublicKey, blob: BlobId) -> Vec<Cmd> {
     if model.session.blob_transfers.contains_key(&blob) {
         return Vec::new();
     }
@@ -165,8 +172,9 @@ fn want(model: &mut Model, device: PublicKey, blob: BlobId) -> Vec<Cmd> {
 /// `pk` sends a blob, which is taken only if it was asked of them.
 pub fn offered(model: &mut Model, pk: PublicKey, file_id: FileId, size: u64) -> Vec<Cmd> {
     let blob = BlobId(file_id.0);
+    let too_big = model.session.avatar_wish == Some(blob) && size > super::avatars::MAX_SIZE;
     match model.session.blob_transfers.get_mut(&blob) {
-        Some(t) if t.device == pk && t.incoming && t.size.is_none() => {
+        Some(t) if t.device == pk && t.incoming && t.size.is_none() && !too_big => {
             t.size = Some(size);
             vec![Cmd::IO(IOAction::ReceiveBlob(pk, blob, size))]
         }
@@ -206,7 +214,7 @@ pub fn stopped(model: &mut Model, pk: PublicKey, file_id: FileId) -> Option<Vec<
     }
     let mut cmds = ended(model, blob);
     if transfer.incoming {
-        cmds.extend(unavailable(model, pk, blob));
+        cmds.extend(stored(model, pk, blob, false));
     }
     Some(cmds)
 }
@@ -225,10 +233,14 @@ fn ended(model: &mut Model, blob: BlobId) -> Vec<Cmd> {
         .session
         .blob_queue
         .iter()
-        .position(|(device, b)| *b == blob || *device == transfer.device)
+        .position(|(device, b, _)| *b == blob || *device == transfer.device)
     {
-        let (device, blob) = model.session.blob_queue.remove(i);
-        cmds.extend(wanted(model, device, blob));
+        let (device, blob, kind) = model.session.blob_queue.remove(i);
+        if model.blobs.holds(&blob) {
+            cmds.extend(send(model, device, blob, kind));
+        } else {
+            cmds.extend(wanted(model, device, blob));
+        }
     }
     cmds
 }
@@ -259,10 +271,15 @@ pub fn unavailable(model: &mut Model, device: PublicKey, blob: BlobId) -> Vec<Cm
 
 /// A blob from `device` has all come, and was kept if it's the one asked for.
 pub fn stored(model: &mut Model, device: PublicKey, blob: BlobId, ok: bool) -> Vec<Cmd> {
+    if ok {
+        model.blobs.insert(blob);
+    }
+    if let Some(cmds) = super::avatars::stored(model, device, blob, ok) {
+        return cmds;
+    }
     if !ok {
         return unavailable(model, device, blob);
     }
-    model.blobs.insert(blob);
     send_pending(model)
 }
 
@@ -416,7 +433,11 @@ pub fn offline(model: &mut Model, pk: PublicKey) -> Vec<Cmd> {
             cmds.extend(model.record(WindowId::Friend(pk), &msg));
         }
     }
-    model.session.blob_queue.retain(|(device, _)| *device != pk);
+    model
+        .session
+        .blob_queue
+        .retain(|(device, ..)| *device != pk);
+    model.session.avatar_offers.remove(&pk);
     let blobs: Vec<BlobId> = model
         .session
         .blob_transfers

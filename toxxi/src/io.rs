@@ -2,7 +2,6 @@ use crate::config;
 use crate::msg::{IOAction, IOEvent, Msg, ToxAction};
 use crate::sync::event::BlobId;
 use crate::sync::files::{blob_path, blobs_dir, file_id, part_path};
-use crate::sync::protocol::BLOB_FILE_KIND;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -226,13 +225,13 @@ pub fn spawn_io_worker(
                         let _ = tx_msg.send(Msg::IO(IOEvent::FileFinished(pk, file_id, blob)));
                     });
                 }
-                IOAction::SendBlob(pk, blob) => {
+                IOAction::SendBlob(pk, blob, kind) => {
                     let path = blob_path(&blobs, &blob);
                     match fs::metadata(&path) {
                         Ok(meta) => {
                             let _ = tx_tox.send(ToxAction::FileSend(
                                 pk,
-                                BLOB_FILE_KIND,
+                                kind,
                                 meta.len(),
                                 String::new(),
                                 path.to_string_lossy().into_owned(),

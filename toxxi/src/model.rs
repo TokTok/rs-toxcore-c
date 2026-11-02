@@ -408,8 +408,13 @@ pub struct SessionState {
     pub hellos: HashMap<PublicKey, Features>,
     pub pairing: Pairing,
     pub blob_transfers: HashMap<BlobId, BlobTransfer>,
-    // Devices waiting for a blob that's on its way to another.
-    pub blob_queue: Vec<(PublicKey, BlobId)>,
+    // Friends waiting for a blob that's on its way to another, with the kind
+    // of file it goes as.
+    pub blob_queue: Vec<(PublicKey, BlobId, u32)>,
+    /// The avatars friends are sending.
+    pub avatar_offers: HashMap<PublicKey, BlobId>,
+    /// The account's avatar a device wished for, while its blob comes.
+    pub avatar_wish: Option<BlobId>,
     /// The calls going on, by friend.
     pub calls: HashMap<PublicKey, crate::sync::calls::Call>,
     /// Invites whose chats are being joined.
@@ -624,7 +629,12 @@ impl Model {
             .chain(self.invite_changes())
             .chain(self.read_changes())
             .collect();
+        let mut cmds = self.record_in_account(contents);
+        cmds.extend(crate::sync::facts::push(self, live));
+        cmds
+    }
 
+    pub fn record_in_account(&mut self, contents: Vec<Content>) -> Vec<Cmd> {
         let author = self.domain.self_public_key();
         let graph = GraphId::account(&author);
         let time = self.time_provider.now_local().timestamp_millis();
@@ -634,9 +644,7 @@ impl Model {
             self.account.apply(id, &content);
             records.push(bytes);
         }
-        let mut cmds = self.persist(records);
-        cmds.extend(crate::sync::facts::push(self, live));
-        cmds
+        self.persist(records)
     }
 
     fn friend_changes(&self) -> Vec<Content> {

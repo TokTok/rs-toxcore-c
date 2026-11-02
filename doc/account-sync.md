@@ -222,6 +222,7 @@ Subject = Account                 -- tag 0
 | 16 | `Call(CallState)` | Friend, their call with the account | live | |
 | 17 | `CallRelay(bool)` | Account: the home connects devices to its calls | live | |
 | 18 | `SelfKey(bin)` | Chat, groups only: our key in it, which is its own | yes | |
+| 19 | `Avatar(bin?)` | Account, Friend: the blob of their avatar image, none when they have none | yes | Account |
 
 Tox's own values: `UserStatus` 0 online, 1 away, 2 busy; `Connection` 0 none,
 1 TCP, 2 UDP; `Role` 0 founder, 1 moderator, 2 user, 3 observer; `Privacy`
@@ -266,6 +267,13 @@ The home makes toxcore match the account state:
     all live facts.
 -   **Wishes**: carried out with the matching Tox call (`tox_self_set_name`,
     `tox_group_set_topic`, `tox_group_set_role`, `tox_group_kick_peer`, ...).
+-   **Avatars** are Tox file transfers of kind 1 (`TOX_FILE_KIND_AVATAR`)
+    whose file ID is the image's SHA-256, its blob ID. The home takes a
+    friend's avatar unless it holds that blob, keeps it only if the SHA-256
+    matches, and records `Avatar` for the friend; size 0 records none. It
+    sends the account's avatar, or size 0 for none, to each friend that comes
+    online and again when it changes. For an `Avatar` wish it fetches the blob
+    from the device first.
 
 ## Files
 
@@ -281,7 +289,7 @@ blobs but never carry them. Files are only sent in friend chats.
     `FileEnded`.
 -   **To a device**: it fetches the blob named in `File` or `FileEnded`. bTox
     fetches up to its auto-accept size as they come, files it accepted, and
-    the rest on request.
+    the rest on request. Devices fetch the blobs `Avatar` facts name.
 
 Blob transfer, either direction within a session:
 
@@ -340,6 +348,7 @@ frames.
 |---|---|
 | Message | 1 MiB |
 | Event | 64 KiB |
+| Avatar | 64 KiB |
 | Events per `Events` | Whatever fits in one message |
 
 A `Want` is answered for its first 64 hashes only.
@@ -394,14 +403,15 @@ and each conversation joins up with what it holds.
     `state.json` keeps everything else but messages: the profile, friends,
     conversations (peers, topic, ignored peers), pending requests and invites,
     file transfers, console, Tox logs, windows, input history and log filters.
-    Snapshots are deferred. Blobs are in `blobs/`,
+    Snapshots are deferred. Blobs, avatars included, are in `blobs/`,
     named by hex ID; received files are also in the downloads directory.
 -   **bTox**: a linked account is a profile with a `home` device. Events are in
     `sync_events` (`profile`, `id`, `graph`, `rank`, `bytes`), live facts in
     `live_facts` (a device running its own Tox fills them the same way).
     Chats and messages are derived from them when shown, not copied into
     bTox's own contacts and messages. Backups leave them out. Blobs are
-    attachments; sent and fetched files are in `transfers`.
+    attachments, except avatars, which are in `avatars`; sent and fetched
+    files are in `transfers`.
 
 ## Encoding
 
@@ -447,5 +457,6 @@ The cases in `sync/conformance` are checked against both implementations.
 -   Events aren't signed; replicas trust events relayed through the home.
 -   Limits are enforced before decoding or storage.
 -   A blob is taken only from the friend asked, and only with the ID asked.
+-   Avatars come from any friend, so clients decode them with a pixel limit.
 -   Nothing is encrypted at rest. Group passwords (kept facts, invite answers)
     are in plaintext in the account graph on every device and in `events.log`.

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use tox_proto::ToxProto;
 use toxcore::types::PublicKey;
 
-use crate::event::ChatId;
+use crate::event::{BlobId, ChatId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ToxProto)]
 #[repr(u8)]
@@ -129,6 +129,8 @@ pub enum Value {
     CallRelay(bool) = 17,
     /// Our key in a group, which is its own.
     SelfKey(PublicKey) = 18,
+    /// None for no avatar.
+    Avatar(Option<BlobId>) = 19,
     /// From a newer version: kept and passed on, but not understood.
     #[tox(catch_all)]
     Unknown {
@@ -161,7 +163,7 @@ pub fn is_wishable(subject: &Subject, value: &Value) -> bool {
     match subject {
         Subject::Account => matches!(
             value,
-            Value::Name(_) | Value::StatusMessage(_) | Value::Status(_)
+            Value::Name(_) | Value::StatusMessage(_) | Value::Status(_) | Value::Avatar(_)
         ),
         Subject::Chat(ChatId::Conference(_)) => {
             matches!(value, Value::Name(_) | Value::Joined(false))

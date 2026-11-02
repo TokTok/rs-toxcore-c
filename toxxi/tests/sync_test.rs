@@ -1108,7 +1108,10 @@ fn test_devices_fetch_blobs() {
         vec![SessionMessage::NoBlob(missing)]
     );
     let cmds = from(&mut model, DEVICE, SessionMessage::WantBlob(blob));
-    assert_eq!(cmds, vec![Cmd::IO(IOAction::SendBlob(DEVICE, blob))]);
+    assert_eq!(
+        cmds,
+        vec![Cmd::IO(IOAction::SendBlob(DEVICE, blob, BLOB_FILE_KIND))]
+    );
     let cmds = update(
         &mut model,
         Msg::IO(IOEvent::FileStarted(
@@ -1626,7 +1629,7 @@ fn test_a_device_is_sent_a_few_blobs_at_once() {
     for blob in &blobs {
         model.blobs.insert(*blob);
         for cmd in from(&mut model, DEVICE, SessionMessage::WantBlob(*blob)) {
-            if let Cmd::IO(IOAction::SendBlob(DEVICE, blob)) = cmd {
+            if let Cmd::IO(IOAction::SendBlob(DEVICE, blob, _)) = cmd {
                 sent.push(blob);
             }
         }
@@ -1652,7 +1655,11 @@ fn test_a_device_is_sent_a_few_blobs_at_once() {
             3,
         )),
     );
-    assert!(cmds.contains(&Cmd::IO(IOAction::SendBlob(DEVICE, blobs[8]))));
+    assert!(cmds.contains(&Cmd::IO(IOAction::SendBlob(
+        DEVICE,
+        blobs[8],
+        BLOB_FILE_KIND
+    ))));
 
     // A device removed gets none it was waiting for.
     model.blobs.insert(BlobId([9; 32]));
@@ -1770,4 +1777,113 @@ fn test_an_event_another_device_let_through_reaches_the_first() {
     };
     assert!(ids(DEVICE).contains(&first) && !ids(DEVICE).contains(&second));
     assert!(ids(other).contains(&second) && !ids(other).contains(&first));
+}
+
+fn avatar_of(model: &Model, subject: &Subject) -> Option<Option<BlobId>> {
+    model.account.facts.find(subject, |value| match value {
+        Value::Avatar(avatar) => Some(*avatar),
+        _ => None,
+    })
+}
+
+#[test]
+fn test_a_friends_avatar_is_kept() {
+    let mut model = with_device_and_bob();
+    let blob = BlobId([9u8; 32]);
+    let offer = |size| {
+        Msg::Tox(ToxEvent::FileRecv(
+            FriendNumber(1),
+            file_id(&blob),
+            toxxi::sync::avatars::FILE_KIND,
+            size,
+            String::new(),
+        ))
+    };
+
+    let cmds = update(&mut model, offer(3));
+    assert!(cmds.contains(&Cmd::IO(IOAction::ReceiveBlob(BOB, blob, 3))));
+    let cmds = update(
+        &mut model,
+        Msg::IO(IOEvent::FileChunkWritten(BOB, file_id(&blob), 0, 3)),
+    );
+    assert!(cmds.contains(&Cmd::IO(IOAction::StoreBlob(BOB, blob))));
+    update(&mut model, Msg::IO(IOEvent::BlobStored(BOB, blob, true)));
+    assert_eq!(avatar_of(&model, &Subject::Friend(BOB)), Some(Some(blob)));
+
+    // An avatar toxxi holds isn't taken again, and an empty one is none.
+    let cancel = Cmd::Tox(ToxAction::FileControl(
+        BOB,
+        file_id(&blob),
+        toxcore::types::ToxFileControl::TOX_FILE_CONTROL_CANCEL,
+    ));
+    assert!(update(&mut model, offer(3)).contains(&cancel));
+    assert!(update(&mut model, offer(0)).contains(&cancel));
+    assert_eq!(avatar_of(&model, &Subject::Friend(BOB)), Some(None));
+    // Nor one bigger than Tox's avatars are.
+    let cmds = update(&mut model, offer(toxxi::sync::avatars::MAX_SIZE + 1));
+    assert_eq!(cmds, vec![cancel]);
+}
+
+#[test]
+fn test_devices_wish_for_the_accounts_avatar() {
+    let mut model = with_device_and_bob();
+    let blob = BlobId([9u8; 32]);
+    let (_, bytes) = EventStore::default().create(
+        GraphId::account(&ME),
+        DEVICE,
+        0,
+        Content::Want {
+            subject: Subject::Account,
+            value: Value::Avatar(Some(blob)),
+        },
+    );
+
+    // toxxi fetches the blob from the device first.
+    let cmds = from(&mut model, DEVICE, SessionMessage::Events(vec![bytes]));
+    assert!(sent_to(&cmds, DEVICE).contains(&SessionMessage::WantBlob(blob)));
+    update(
+        &mut model,
+        Msg::Tox(ToxEvent::FileRecv(
+            FriendNumber(0),
+            file_id(&blob),
+            BLOB_FILE_KIND,
+            3,
+            String::new(),
+        )),
+    );
+    update(
+        &mut model,
+        Msg::IO(IOEvent::FileChunkWritten(DEVICE, file_id(&blob), 0, 3)),
+    );
+
+    // Then makes it the account's and sends it to Bob, who is online.
+    let cmds = update(&mut model, Msg::IO(IOEvent::BlobStored(DEVICE, blob, true)));
+    assert_eq!(avatar_of(&model, &Subject::Account), Some(Some(blob)));
+    assert!(cmds.contains(&Cmd::IO(IOAction::SendBlob(
+        BOB,
+        blob,
+        toxxi::sync::avatars::FILE_KIND
+    ))));
+}
+
+#[test]
+fn test_friends_coming_online_are_told_there_is_no_avatar() {
+    let mut model = with_device_and_bob();
+    let cmds = update(
+        &mut model,
+        Msg::Tox(ToxEvent::FriendStatus(
+            FriendNumber(1),
+            ToxConnection::TOX_CONNECTION_UDP,
+            Some(BOB),
+        )),
+    );
+    assert!(cmds.iter().any(|cmd| matches!(
+        cmd,
+        Cmd::Tox(ToxAction::FileSend(
+            BOB,
+            toxxi::sync::avatars::FILE_KIND,
+            0,
+            ..
+        ))
+    )));
 }

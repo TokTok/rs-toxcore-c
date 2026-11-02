@@ -1508,6 +1508,12 @@ fn handle_tox_event(model: &mut Model, event: ToxEvent) -> Vec<Cmd> {
                 return files::offered(model, pk, file_id, size);
             }
 
+            if kind == crate::sync::avatars::FILE_KIND
+                && let Some(pk) = pk_opt
+            {
+                return crate::sync::avatars::offered(model, pk, file_id, size);
+            }
+
             if kind != 0 {
                 model.add_console_message(
                     ConsoleMessageType::Info,
@@ -1685,6 +1691,9 @@ fn handle_io_event(model: &mut Model, event: IOEvent) -> Vec<Cmd> {
         IOEvent::FileStarted(pk, file_id, path, size) => {
             if let Some(started) = files::started(model, pk, file_id, path.clone(), size) {
                 return started;
+            }
+            if crate::sync::avatars::is_none_file(&file_id, size) {
+                return cmds;
             }
             let filename = std::path::Path::new(&path)
                 .file_name()

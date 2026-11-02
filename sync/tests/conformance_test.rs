@@ -397,6 +397,7 @@ fn value(j: &J) -> Value {
         }),
         "call_relay" => Value::CallRelay(flag(v)),
         "self_key" => Value::SelfKey(pk(v)),
+        "avatar" => Value::Avatar(opt(v, |b| BlobId(b32(b)))),
         other => panic!("not a value: {other}"),
     }
 }
@@ -455,6 +456,7 @@ fn value_json(value: &Value) -> J {
         },
         Value::CallRelay(v) => json!({"call_relay": v}),
         Value::SelfKey(v) => json!({"self_key": hex(&v.0)}),
+        Value::Avatar(v) => json!({"avatar": v.map(|b| hex(&b.0))}),
         Value::Unknown { .. } => unknown,
     }
 }

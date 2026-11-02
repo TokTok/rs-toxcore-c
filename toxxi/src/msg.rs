@@ -173,7 +173,7 @@ pub enum IOAction {
     /// Closes a file that has all come or gone, and keeps it as a blob.
     FinishFile(PublicKey, FileId),
     /// Sends a blob as a file, or tells it's missing.
-    SendBlob(PublicKey, BlobId),
+    SendBlob(PublicKey, BlobId, u32),
     /// Receives a blob of the given size, after the part already here.
     ReceiveBlob(PublicKey, BlobId, u64),
     StoreBlob(PublicKey, BlobId),

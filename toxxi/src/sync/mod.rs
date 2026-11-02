@@ -1,5 +1,6 @@
 //! toxxi's side of account sync. The protocol itself is in `tox_sync`.
 
+pub mod avatars;
 pub mod calls;
 pub mod facts;
 pub mod files;
@@ -20,8 +21,8 @@ use crate::model::{ConsoleMessageType, Model, WindowId};
 use crate::msg::{Cmd, IOAction, ToxAction};
 use account::AccountState;
 use event::{Content, Event, EventId, GraphId};
-use fact::Subject;
 use fact::is_wishable;
+use fact::{Subject, Value};
 use protocol::{Features, SessionMessage};
 use setting::Scope;
 
@@ -38,7 +39,10 @@ pub fn set_device(model: &mut Model, pk: PublicKey, allowed: bool) -> Vec<Cmd> {
     }
     if !allowed {
         model.session.sync_sessions.remove(&pk);
-        model.session.blob_queue.retain(|(device, _)| *device != pk);
+        model
+            .session
+            .blob_queue
+            .retain(|(device, ..)| *device != pk);
         forget_held(model, pk);
     }
     let mut cmds = vec![Cmd::IO(IOAction::SaveConfig(None))];
@@ -119,6 +123,7 @@ pub fn friend_status(model: &mut Model, pk: PublicKey, status: ToxConnection) ->
         cmds.extend(greet(model, pk));
         // Tox joins invited chats through the friend who invited.
         cmds.extend(invites::join(model));
+        cmds.extend(avatars::send(model, pk));
     }
     cmds
 }
@@ -393,6 +398,13 @@ fn apply(model: &mut Model, allowed: Allowed, event: Event, id: EventId) -> Vec<
         (Content::FileAnswered { file, accepted }, Some(window_id)) => {
             crate::update::answer_file(model, window_id, &file, accepted)
         }
+        (
+            Content::Want {
+                subject: Subject::Account,
+                value: Value::Avatar(avatar),
+            },
+            Some(_),
+        ) => avatars::wish(model, event.author, avatar),
         (Content::Want { subject, value }, Some(_)) => facts::wish(model, subject, value),
         (Content::File { .. }, Some(window_id)) => {
             model.add_device_message(window_id, id);

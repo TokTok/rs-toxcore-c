@@ -5,7 +5,7 @@ use toxxi::testing::{add_test_friend, create_test_model};
 use toxxi::update::update;
 
 #[test]
-fn test_ignores_non_data_file_transfers() {
+fn test_ignores_unknown_file_transfers() {
     let mut model = create_test_model();
     let fid = FriendNumber(1);
     let pk = PublicKey([1u8; 32]);
@@ -13,14 +13,7 @@ fn test_ignores_non_data_file_transfers() {
 
     add_test_friend(&mut model, fid, pk);
 
-    // Simulate Avatar transfer (kind = 1)
-    let event = ToxEvent::FileRecv(
-        fid,
-        file_id,
-        1, // Avatar
-        1024,
-        "avatar.png".to_string(),
-    );
+    let event = ToxEvent::FileRecv(fid, file_id, 2, 1024, "unknown".to_string());
 
     let cmds = update(&mut model, Msg::Tox(event));
 
@@ -32,7 +25,10 @@ fn test_ignores_non_data_file_transfers() {
     let has_cancel = cmds.iter().any(|c| matches!(c, Cmd::Tox(ToxAction::FileControl(f, n, control))
         if *f == pk && *n == file_id && *control == toxcore::types::ToxFileControl::TOX_FILE_CONTROL_CANCEL));
 
-    assert!(has_cancel, "Should send CANCEL for avatar transfer");
+    assert!(
+        has_cancel,
+        "Should send CANCEL for a file of an unknown kind"
+    );
 }
 
 #[test]
